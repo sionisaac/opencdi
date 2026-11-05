@@ -32,6 +32,17 @@ impl Timekeeper {
         Ok(())
     }
 
+    pub fn load_or_initialize<P: AsRef<Path>>(&mut self, path: P) -> std::io::Result<()> {
+        let path = path.as_ref();
+        if path.is_file() { return self.load_from_file(path); }
+        self.save_path = path.to_path_buf();
+        self.ram.fill(0);
+        self.init_default();
+        self.dirty = false;
+        self.dirty_frames = 0;
+        Ok(())
+    }
+
     pub fn save_to_file(&mut self) -> std::io::Result<()> {
         if let Some(parent) = self.save_path.parent() {
             if !parent.as_os_str().is_empty() {

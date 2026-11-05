@@ -12,6 +12,13 @@ fn find_file_in_globs(patterns: &[&str]) -> Option<PathBuf> {
     None
 }
 
+fn find_in_path(file_name: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path)
+        .map(|directory| directory.join(file_name))
+        .find(|candidate| candidate.is_file())
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=icon.ico");
@@ -33,16 +40,16 @@ fn main() {
             );
             std::fs::write(&rc_path, rc_content).unwrap();
 
-            let rc_exe = find_file_in_globs(&[
+            let rc_exe = find_in_path("rc.exe").or_else(|| find_file_in_globs(&[
                 r"C:\Program Files (x86)\Windows Kits\10\bin\10.0.19041.0\x64\rc.exe",
                 r"C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\rc.exe",
                 r"C:\Program Files (x86)\Windows Kits\10\bin\10.0.22000.0\x64\rc.exe",
-            ]);
+            ]));
 
-            let cvtres_exe = find_file_in_globs(&[
+            let cvtres_exe = find_in_path("cvtres.exe").or_else(|| find_file_in_globs(&[
                 r"C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Tools\MSVC\14.29.30133\bin\Hostx64\x64\cvtres.exe",
                 r"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.38.33130\bin\Hostx64\x64\cvtres.exe",
-            ]);
+            ]));
 
             if let (Some(rc), Some(cvtres)) = (rc_exe, cvtres_exe) {
                 let rc_status = Command::new(&rc)

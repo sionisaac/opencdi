@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use log::info;
 
-use crate::frontend::{push_action, GuiAction, InputDeviceMode, InputProfile};
+use crate::frontend::{push_action, ArtworkPathKind, DisplayMode, GuiAction, InputDeviceMode, InputProfile, NvramMode};
 
 pub const ID_FILE_INSERT: usize = 1000;
 pub const ID_FILE_OPEN: usize = 1001;
@@ -21,6 +21,7 @@ pub const ID_PROFILE_NUMPAD: usize = 1012;
 pub const ID_PROFILE_CUSTOM: usize = 1015;
 pub const ID_CONTROLS_EDIT_INI: usize = 1016;
 pub const ID_CONTROLS_RELOAD_INI: usize = 1017;
+pub const ID_CONTROLS_CONFIGURE: usize = 1018;
 pub const ID_CONTROLS_INFO: usize = 1013;
 pub const ID_CONTROLS_RELEASE_MOUSE: usize = 1014;
 pub const ID_INPUT_DEVICE_GAMEPAD: usize = 1060;
@@ -34,6 +35,10 @@ pub const ID_VIDEO_FULLSCREEN: usize = 1030;
 pub const ID_VIDEO_SCREENSHOT: usize = 1031;
 pub const ID_VIDEO_PAL: usize = 1032;
 pub const ID_VIDEO_NTSC: usize = 1033;
+pub const ID_DISPLAY_BORDERLESS: usize = 1034;
+pub const ID_DISPLAY_DECORATED: usize = 1035;
+pub const ID_DISPLAY_WINDOWED: usize = 1036;
+pub const ID_SKIP_SHELL: usize = 1037;
 pub const ID_EMU_WAITSTATES: usize = 1050;
 pub const ID_EMU_DVC: usize = 1051;
 
@@ -41,6 +46,14 @@ pub const ID_HELP_CONTROLS: usize = 1040;
 pub const ID_HELP_ABOUT: usize = 1041;
 pub const ID_HELP_FEEDBACK: usize = 1042;
 pub const ID_FILE_CLEAR_NVRAM: usize = 1005;
+pub const ID_NVRAM_GLOBAL: usize = 1006;
+pub const ID_NVRAM_PER_DISC: usize = 1007;
+pub const ID_PATH_ADD_DISCS: usize = 1220;
+pub const ID_PATH_COVERS: usize = 1221;
+pub const ID_PATH_CD_ART: usize = 1222;
+pub const ID_PATH_BEZELS: usize = 1223;
+pub const ID_PATH_RESCAN: usize = 1224;
+pub const ID_PATH_EDIT_INI: usize = 1225;
 
 pub const ID_STATE_QUICK_SAVE: usize = 1070;
 pub const ID_STATE_QUICK_LOAD: usize = 1071;
@@ -115,6 +128,32 @@ pub struct OPENFILENAMEW {
     pub FlagsEx: u32,
 }
 
+#[repr(C)]
+#[allow(non_snake_case)]
+struct BROWSEINFOW {
+    hwndOwner: *mut std::ffi::c_void,
+    pidlRoot: *mut std::ffi::c_void,
+    pszDisplayName: *mut u16,
+    lpszTitle: *const u16,
+    ulFlags: u32,
+    lpfn: *mut std::ffi::c_void,
+    lParam: isize,
+    iImage: i32,
+}
+
+const BFFM_INITIALIZED: u32 = 1;
+unsafe extern "system" fn activate_folder_picker(dialog: *mut std::ffi::c_void, message: u32, _lparam: isize, _data: isize) -> i32 {
+    if message == BFFM_INITIALIZED {
+        unsafe {
+            ShowWindow(dialog, 5);
+            BringWindowToTop(dialog);
+            SetForegroundWindow(dialog);
+            SetActiveWindow(dialog);
+        }
+    }
+    0
+}
+
 #[link(name = "user32")]
 unsafe extern "system" {
     fn CreateMenu() -> *mut std::ffi::c_void;
@@ -135,6 +174,10 @@ unsafe extern "system" {
     fn LoadImageW(hinst: *mut std::ffi::c_void, name: *const u16, utype: u32, cx: i32, cy: i32, fu_load: u32) -> *mut std::ffi::c_void;
     fn DeleteMenu(hmenu: *mut std::ffi::c_void, uposition: u32, uflags: u32) -> i32;
     fn GetMenuItemCount(hmenu: *mut std::ffi::c_void) -> i32;
+    fn ShowWindow(hwnd: *mut std::ffi::c_void, command: i32) -> i32;
+    fn BringWindowToTop(hwnd: *mut std::ffi::c_void) -> i32;
+    fn SetForegroundWindow(hwnd: *mut std::ffi::c_void) -> i32;
+    fn SetActiveWindow(hwnd: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
 }
 
 #[link(name = "comdlg32")]
@@ -159,7 +202,12 @@ unsafe extern "system" {
         lpdirectory: *const u16,
         nshowcmd: i32,
     ) -> *mut std::ffi::c_void;
+    fn SHBrowseForFolderW(info: *mut BROWSEINFOW) -> *mut std::ffi::c_void;
+    fn SHGetPathFromIDListW(pidl: *mut std::ffi::c_void, path: *mut u16) -> i32;
 }
+
+#[link(name = "ole32")]
+unsafe extern "system" { fn CoTaskMemFree(memory: *mut std::ffi::c_void); }
 
 pub fn to_wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
@@ -300,7 +348,7 @@ fn modal_end(hwnd: *mut std::ffi::c_void) {
 }
 
 // Runs a modal dialog with the modal timer active
-fn modal<R>(hwnd: *mut std::ffi::c_void, f: impl FnOnce() -> R) -> R {
+pub fn modal<R>(hwnd: *mut std::ffi::c_void, f: impl FnOnce() -> R) -> R {
     modal_begin(hwnd);
     let r = f();
     modal_end(hwnd);
@@ -518,12 +566,16 @@ unsafe extern "system" fn custom_wndproc(
                 return 0;
             }
             ID_CONTROLS_EDIT_INI => {
-                let _ = std::process::Command::new("notepad.exe").arg("opencdi_controls.ini").spawn();
+                let _ = std::process::Command::new("notepad.exe").arg(crate::frontend::settings_file_path()).spawn();
                 push_action(GuiAction::SetProfile(InputProfile::Custom));
                 return 0;
             }
             ID_CONTROLS_RELOAD_INI => {
                 push_action(GuiAction::ReloadControls);
+                return 0;
+            }
+            ID_CONTROLS_CONFIGURE => {
+                push_action(GuiAction::OpenControllerConfig);
                 return 0;
             }
             ID_CONTROLS_INFO => {
@@ -550,6 +602,10 @@ unsafe extern "system" fn custom_wndproc(
                 push_action(GuiAction::ToggleFullscreen);
                 return 0;
             }
+            ID_DISPLAY_BORDERLESS => { push_action(GuiAction::SetDisplayMode(DisplayMode::BorderlessFullscreen)); return 0; }
+            ID_DISPLAY_DECORATED => { push_action(GuiAction::SetDisplayMode(DisplayMode::DecoratedFullscreen)); return 0; }
+            ID_DISPLAY_WINDOWED => { push_action(GuiAction::SetDisplayMode(DisplayMode::Windowed)); return 0; }
+            ID_SKIP_SHELL => { push_action(GuiAction::ToggleSkipShell); return 0; }
             ID_VIDEO_SCREENSHOT => {
                 push_action(GuiAction::TakeScreenshot);
                 return 0;
@@ -586,6 +642,29 @@ unsafe extern "system" fn custom_wndproc(
                 if confirm == IDYES {
                     push_action(GuiAction::ClearNvram);
                 }
+                return 0;
+            }
+            ID_NVRAM_GLOBAL => { push_action(GuiAction::SetNvramMode(NvramMode::Global)); return 0; }
+            ID_NVRAM_PER_DISC => { push_action(GuiAction::SetNvramMode(NvramMode::PerDisc)); return 0; }
+            ID_PATH_ADD_DISCS => {
+                if let Some(path) = modal(hwnd, || select_folder_dialog(hwnd, "Choose a folder to scan for disc images")) { push_action(GuiAction::AddDiscPath(path)); }
+                return 0;
+            }
+            ID_PATH_COVERS => {
+                if let Some(path) = modal(hwnd, || select_folder_dialog(hwnd, "Choose the Covers artwork folder")) { push_action(GuiAction::SetArtworkPath(ArtworkPathKind::Covers, path)); }
+                return 0;
+            }
+            ID_PATH_CD_ART => {
+                if let Some(path) = modal(hwnd, || select_folder_dialog(hwnd, "Choose the CD artwork folder")) { push_action(GuiAction::SetArtworkPath(ArtworkPathKind::Cd, path)); }
+                return 0;
+            }
+            ID_PATH_BEZELS => {
+                if let Some(path) = modal(hwnd, || select_folder_dialog(hwnd, "Choose the bezels artwork folder")) { push_action(GuiAction::SetArtworkPath(ArtworkPathKind::Bezels, path)); }
+                return 0;
+            }
+            ID_PATH_RESCAN => { push_action(GuiAction::RescanLibrary); return 0; }
+            ID_PATH_EDIT_INI => {
+                let _ = std::process::Command::new("notepad.exe").arg(crate::frontend::settings_file_path()).spawn();
                 return 0;
             }
             ID_HELP_FEEDBACK => {
@@ -707,10 +786,24 @@ pub fn attach_gui_menu(
 
         AppendMenuW(file_menu, MF_SEPARATOR, 0, std::ptr::null());
         AppendMenuW(file_menu, MF_STRING, ID_FILE_CLEAR_NVRAM, to_wide("Clear Console Memory (Reset NVRAM)...").as_ptr());
+        let nvram_menu = CreatePopupMenu();
+        AppendMenuW(nvram_menu, MF_STRING, ID_NVRAM_GLOBAL, to_wide("One Global NVRAM File").as_ptr());
+        AppendMenuW(nvram_menu, MF_STRING, ID_NVRAM_PER_DISC, to_wide("Separate NVRAM per Disc").as_ptr());
+        AppendMenuW(file_menu, MF_POPUP, nvram_menu as usize, to_wide("NVRAM Storage Mode").as_ptr());
         AppendMenuW(file_menu, MF_STRING, ID_FILE_RESET, to_wide("Restart Console (Reset)\tF5 / H").as_ptr());
         AppendMenuW(file_menu, MF_SEPARATOR, 0, std::ptr::null());
         AppendMenuW(file_menu, MF_STRING, ID_FILE_EXIT, to_wide("Exit\tEsc").as_ptr());
         AppendMenuW(main_menu, MF_POPUP, file_menu as usize, to_wide("File").as_ptr());
+
+        let paths_menu = CreatePopupMenu();
+        AppendMenuW(paths_menu, MF_STRING, ID_PATH_ADD_DISCS, to_wide("Add Disc Scan Folder...").as_ptr());
+        AppendMenuW(paths_menu, MF_STRING, ID_PATH_COVERS, to_wide("Set Covers Artwork Folder...").as_ptr());
+        AppendMenuW(paths_menu, MF_STRING, ID_PATH_CD_ART, to_wide("Set CD Artwork Folder...").as_ptr());
+        AppendMenuW(paths_menu, MF_STRING, ID_PATH_BEZELS, to_wide("Set Bezels Artwork Folder...").as_ptr());
+        AppendMenuW(paths_menu, MF_SEPARATOR, 0, std::ptr::null());
+        AppendMenuW(paths_menu, MF_STRING, ID_PATH_RESCAN, to_wide("Rescan Disc Folders").as_ptr());
+        AppendMenuW(paths_menu, MF_STRING, ID_PATH_EDIT_INI, to_wide("Edit All Paths in Settings File...").as_ptr());
+        AppendMenuW(main_menu, MF_POPUP, paths_menu as usize, to_wide("Paths").as_ptr());
 
         // 2. Controls Menu
         let controls_menu = CreatePopupMenu();
@@ -726,6 +819,7 @@ pub fn attach_gui_menu(
         AppendMenuW(controls_menu, MF_STRING, ID_PROFILE_NUMPAD, to_wide("Key Profile: Numpad (8 4 6 2 + 1 / 0)").as_ptr());
         AppendMenuW(controls_menu, MF_STRING, ID_PROFILE_CUSTOM, to_wide("Key Profile: Custom (opencdi_controls.ini)").as_ptr());
         AppendMenuW(controls_menu, MF_SEPARATOR, 0, std::ptr::null());
+        AppendMenuW(controls_menu, MF_STRING, ID_CONTROLS_CONFIGURE, to_wide("Configure CD-i Controller...").as_ptr());
         AppendMenuW(controls_menu, MF_STRING, ID_CONTROLS_EDIT_INI, to_wide("Edit Controls in Notepad...").as_ptr());
         AppendMenuW(controls_menu, MF_STRING, ID_CONTROLS_RELOAD_INI, to_wide("Reload Controls from INI").as_ptr());
         AppendMenuW(controls_menu, MF_SEPARATOR, 0, std::ptr::null());
@@ -742,7 +836,14 @@ pub fn attach_gui_menu(
 
         // 4. Video Menu
         let video_menu = CreatePopupMenu();
-        AppendMenuW(video_menu, MF_STRING, ID_VIDEO_FULLSCREEN, to_wide("Fullscreen\tF11 / Alt+Enter").as_ptr());
+        AppendMenuW(video_menu, MF_STRING, ID_VIDEO_FULLSCREEN, to_wide("Cycle Display Mode\tF11 / Alt+Enter").as_ptr());
+        let display_menu = CreatePopupMenu();
+        AppendMenuW(display_menu, MF_STRING, ID_DISPLAY_BORDERLESS, to_wide("Borderless Fullscreen (Default)").as_ptr());
+        AppendMenuW(display_menu, MF_STRING, ID_DISPLAY_DECORATED, to_wide("Fullscreen with Border and Menu").as_ptr());
+        AppendMenuW(display_menu, MF_STRING, ID_DISPLAY_WINDOWED, to_wide("Windowed").as_ptr());
+        AppendMenuW(video_menu, MF_POPUP, display_menu as usize, to_wide("Display Mode").as_ptr());
+        AppendMenuW(video_menu, MF_SEPARATOR, 0, std::ptr::null());
+        AppendMenuW(video_menu, MF_STRING | MF_CHECKED, ID_SKIP_SHELL, to_wide("Skip Philips Shell and Auto-start Disc").as_ptr());
         AppendMenuW(video_menu, MF_STRING, ID_VIDEO_SCREENSHOT, to_wide("Save Screenshot\tF12").as_ptr());
         AppendMenuW(video_menu, MF_SEPARATOR, 0, std::ptr::null());
         AppendMenuW(video_menu, MF_STRING, ID_VIDEO_PAL, to_wide("PAL (50 Hz) [CD-i 220 Standard]").as_ptr());
@@ -761,7 +862,8 @@ pub fn attach_gui_menu(
         // 6. Prominent Top-Level Send Feedback Button
         AppendMenuW(main_menu, MF_STRING, ID_HELP_FEEDBACK, to_wide("Send Feedback (F1)").as_ptr());
 
-        SetMenu(hwnd, main_menu);
+        // The application draws its own toolbar; keep the native menu detached.
+        SetMenu(hwnd, std::ptr::null_mut());
         DrawMenuBar(hwnd);
         set_window_icon(hwnd);
 
@@ -773,6 +875,39 @@ pub fn attach_gui_menu(
         let prev = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, custom_wndproc as *const () as usize as isize);
         PREV_WNDPROC = prev;
         info!("Win32 Native Menu attached and window subclassed successfully.");
+    }
+}
+
+pub fn set_menu_visible(hwnd: *mut std::ffi::c_void, _visible: bool) {
+    if hwnd.is_null() { return; }
+    unsafe {
+        SetMenu(hwnd, std::ptr::null_mut());
+        DrawMenuBar(hwnd);
+    }
+}
+
+pub fn update_display_mode_menu(mode: DisplayMode) {
+    unsafe {
+        if MENU_HANDLE.is_null() { return; }
+        CheckMenuItem(MENU_HANDLE, ID_DISPLAY_BORDERLESS as u32, MF_BYCOMMAND | if mode == DisplayMode::BorderlessFullscreen { MF_CHECKED } else { MF_UNCHECKED });
+        CheckMenuItem(MENU_HANDLE, ID_DISPLAY_DECORATED as u32, MF_BYCOMMAND | if mode == DisplayMode::DecoratedFullscreen { MF_CHECKED } else { MF_UNCHECKED });
+        CheckMenuItem(MENU_HANDLE, ID_DISPLAY_WINDOWED as u32, MF_BYCOMMAND | if mode == DisplayMode::Windowed { MF_CHECKED } else { MF_UNCHECKED });
+    }
+}
+
+pub fn update_skip_shell_menu(enabled: bool) {
+    unsafe {
+        if !MENU_HANDLE.is_null() {
+            CheckMenuItem(MENU_HANDLE, ID_SKIP_SHELL as u32, MF_BYCOMMAND | if enabled { MF_CHECKED } else { MF_UNCHECKED });
+        }
+    }
+}
+
+pub fn update_nvram_mode_menu(mode: NvramMode) {
+    unsafe {
+        if MENU_HANDLE.is_null() { return; }
+        CheckMenuItem(MENU_HANDLE, ID_NVRAM_GLOBAL as u32, MF_BYCOMMAND | if mode == NvramMode::Global { MF_CHECKED } else { MF_UNCHECKED });
+        CheckMenuItem(MENU_HANDLE, ID_NVRAM_PER_DISC as u32, MF_BYCOMMAND | if mode == NvramMode::PerDisc { MF_CHECKED } else { MF_UNCHECKED });
     }
 }
 
@@ -813,6 +948,30 @@ pub fn open_file_dialog(owner: *mut std::ffi::c_void) -> Option<PathBuf> {
     }
 }
 
+pub fn select_folder_dialog(owner: *mut std::ffi::c_void, title: &str) -> Option<PathBuf> {
+    let title = to_wide(title);
+    let mut display_name = [0u16; 260];
+    unsafe { SetForegroundWindow(owner); }
+    let mut info = BROWSEINFOW {
+        hwndOwner: owner,
+        pidlRoot: std::ptr::null_mut(),
+        pszDisplayName: display_name.as_mut_ptr(),
+        lpszTitle: title.as_ptr(),
+        ulFlags: 0x0001 | 0x0010 | 0x0040, // filesystem folders, edit box, modern picker
+        lpfn: activate_folder_picker as *const () as *mut std::ffi::c_void,
+        lParam: 0,
+        iImage: 0,
+    };
+    let pidl = unsafe { SHBrowseForFolderW(&mut info) };
+    if pidl.is_null() { return None; }
+    let mut path = vec![0u16; 32768];
+    let ok = unsafe { SHGetPathFromIDListW(pidl, path.as_mut_ptr()) };
+    unsafe { CoTaskMemFree(pidl); }
+    if ok == 0 { return None; }
+    let len = path.iter().position(|&c| c == 0).unwrap_or(path.len());
+    Some(PathBuf::from(OsString::from_wide(&path[..len])))
+}
+
 pub fn show_controls_dialog(owner: *mut std::ffi::c_void) {
     let text = to_wide(
         "OpenCDi - Philips CD-i Controls Configuration\n\
@@ -841,7 +1000,7 @@ pub fn show_controls_dialog(owner: *mut std::ffi::c_void) {
            • Button B / Circle / X = Button 2\n\
            • Start Button = Action / Pause\n\n\
         KEYBOARD SHORTCUTS:\n\
-           • F11 or Alt+Enter: Fullscreen\n\
+           • F11 or Alt+Enter: Cycle display modes (borderless, decorated, windowed)\n\
            • F5 or H: Restart console (Reset)\n\
            • F6: Quick Save State (Slot 1)  |  F7: Quick Load State (Slot 1)\n\
            • F9: Switch Active Input Device (Gamepad <-> Mouse)\n\
