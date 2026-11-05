@@ -127,6 +127,8 @@ fn metadata_is_fresh(path: &Path) -> bool {
 }
 
 fn normalize_title(s: &str) -> String {
+    let s = s.trim();
+    let s = s.rsplit_once('.').filter(|(_, ext)| matches!(ext.to_ascii_lowercase().as_str(), "chd" | "cue" | "iso" | "bin")).map(|(stem, _)| stem).unwrap_or(s);
     let mut normalized = String::new();
     let mut chars = s.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -135,10 +137,16 @@ fn normalize_title(s: &str) -> String {
             let mut tag = String::new();
             while let Some(c) = chars.next() { if c == closing { break; } tag.push(c); }
             let tag_l = tag.to_ascii_lowercase();
-            let is_dump_tag = ["usa", "europe", "european", "japan", "japanese", "world", "disc", "disk", "cd", "track", "rev", "revision", "version", "beta", "proto", "demo", "pal", "ntsc", "en,", "fr,", "de,"]
+            let is_dump_tag = ["usa", "eur", "europe", "european", "japan", "japanese", "world", "disc", "disk", "cd", "dvc", "track", "rev", "revision", "version", "beta", "proto", "demo", "pal", "ntsc", "en,", "fr,", "de,"]
                 .iter().any(|needle| tag_l.contains(needle));
             if !is_dump_tag { normalized.extend(tag.chars().filter(|c| c.is_alphanumeric()).map(|c| c.to_ascii_lowercase())); }
         } else if ch.is_alphanumeric() { normalized.push(ch.to_ascii_lowercase()); }
+    }
+    // This dump-set subtitle is not part of LaunchBox's title.
+    if normalized == "7thguestthethegame" { return "the7thguest".into(); }
+    // Dump names commonly sort the article after the title ("7th Guest, The").
+    if s.to_ascii_lowercase().contains(", the") {
+        if normalized.ends_with("the") { normalized.truncate(normalized.len() - 3); normalized.insert_str(0, "the"); }
     }
     normalized
 }
@@ -173,7 +181,7 @@ fn choose_image<'a>(images: &[&'a ImageRecord], cover: bool, title: &str) -> Opt
     for kind in priorities {
         let candidates: Vec<_> = images.iter().copied().filter(|i| i.kind.eq_ignore_ascii_case(kind) && supported_image(&i.file)).collect();
         if candidates.is_empty() { continue; }
-        if region.contains("(europe") || region.contains("(uk") {
+        if region.contains("(eur") || region.contains("(uk") {
             if let Some(i) = candidates.iter().copied().find(|i| i.region.to_ascii_lowercase().contains("europe") || i.region.to_ascii_lowercase().contains("united kingdom")) { return Some(i); }
         } else if region.contains("(usa") || region.contains("(north america") {
             if let Some(i) = candidates.iter().copied().find(|i| i.region.to_ascii_lowercase().contains("north america") || i.region.to_ascii_lowercase().contains("united states")) { return Some(i); }
@@ -273,7 +281,7 @@ impl ZipEntry {
         let extra_len = read_u16(local, 28)? as usize;
         let start = 30usize.checked_add(name_len)?.checked_add(extra_len)?;
         let end = start.checked_add(self.compressed_size)?;
-        let compressed = zip.get(start..end)?;
+        let compressed = local.get(start..end)?;
         match self.method {
             0 => Some(ZipReader::Stored(Cursor::new(compressed))),
             8 => Some(ZipReader::Deflate(DeflateDecoder::new(Cursor::new(compressed)))),
@@ -311,6 +319,61 @@ fn zip_entries(zip: &[u8]) -> Option<Vec<ZipEntry>> {
 
 fn read_u16(data: &[u8], at: usize) -> Option<u16> { Some(u16::from_le_bytes(data.get(at..at + 2)?.try_into().ok()?)) }
 fn read_u32(data: &[u8], at: usize) -> Option<u32> { Some(u32::from_le_bytes(data.get(at..at + 4)?.try_into().ok()?)) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "Downloads current LaunchBox metadata and artwork; set OPENCDI_LIVE_ARTWORK_DIR"]
+    fn live_artwork_downloads() {
+        let root = std::path::PathBuf::from(std::env::var_os("OPENCDI_LIVE_ARTWORK_DIR").expect("isolated verification directory required"));
+        let titles = ["7th Guest, The - The Game (EUR) [DVC]", "Backgammon (EUR)", "Brain Dead 13 (EUR) [DVC]", "Burn - Cycle (EUR)"];
+        let targets: Vec<_> = titles.iter().map(|title| FetchTarget { title: (*title).into(), cover_missing: true, disc_missing: true, download_all: true }).collect();
+        let _ = env_logger::builder().is_test(true).filter_level(log::LevelFilter::Info).try_init();
+        let count = fetch_missing_artwork(&targets, &root.join("artwork"), &root.join("cache"));
+        println!("Downloaded {count} images");
+        for title in titles {
+            let found = fs::read_dir(root.join("artwork/Covers")).unwrap().flatten().any(|entry| entry.path().file_stem().unwrap().to_string_lossy() == safe_name(title));
+            assert!(found, "No cover downloaded for {title}");
+        }
+        assert!(count >= 4);
+    }
+
+    #[test]
+    fn dump_filenames_match_catalog_titles() {
+        for (filename, title) in [
+            ("7th Guest, The - The Game (EUR) [DVC].chd", "The 7th Guest"),
+            ("Backgammon (EUR).chd", "Backgammon"),
+            ("Brain Dead 13 (EUR) [DVC].chd", "Brain Dead 13"),
+            ("Burn - Cycle (EUR).chd", "Burn:Cycle"),
+            ("7th Guest, The (Europe).chd", "The 7th Guest"),
+        ] {
+            assert_eq!(normalize_title(filename), normalize_title(title), "{filename}");
+        }
+        assert_ne!(normalize_title("Backgammon"), normalize_title("Super Backgammon"));
+    }
+
+    #[test]
+    fn eur_prefers_european_artwork() {
+        let us = ImageRecord { region: "North America".into(), kind: "Box - Front".into(), file: "us.jpg".into(), ..Default::default() };
+        let eu = ImageRecord { region: "Europe".into(), file: "eu.jpg".into(), kind: "Box - Front".into(), ..Default::default() };
+        assert_eq!(choose_image(&[&us, &eu], true, "Backgammon (EUR)").unwrap().file, "eu.jpg");
+    }
+
+    #[test]
+    fn zip_entry_reads_data_relative_to_its_local_header() {
+        let payload = b"<Data/>";
+        let mut zip = vec![0u8; 47];
+        zip.extend_from_slice(&0x04034b50u32.to_le_bytes());
+        zip.resize(47 + 30, 0);
+        zip.extend_from_slice(payload);
+        let entry = ZipEntry { name: "metadata.xml".into(), method: 0, compressed_size: payload.len(), uncompressed_size: payload.len(), offset: 47 };
+        let mut actual = Vec::new();
+        entry.open(&zip).unwrap().read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, payload);
+    }
+}
 
 fn parse_xml<R: BufRead>(reader: &mut R, wanted_titles: &HashSet<String>, wanted_ids: &HashSet<String>, out: &mut ParsedRecords) {
     let mut xml = Reader::from_reader(reader);
