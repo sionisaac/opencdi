@@ -16,3 +16,6 @@ Invia_a_GitHub.bat
 *.png
 *.bin
 *.mon
+
+!assets/cover_missing.png
+!assets/disc_missing.png

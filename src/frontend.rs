@@ -673,7 +673,6 @@ pub enum GuiAction {
     SetNvramMode(NvramMode),
     AddDiscPath(PathBuf),
     SetArtworkPath(ArtworkPathKind, PathBuf),
-    RescanLibrary,
     StopToLibrary,
     TakeScreenshot,
     SetVideoMode(crate::mcd212::VideoMode),

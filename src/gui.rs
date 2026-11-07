@@ -52,7 +52,6 @@ pub const ID_PATH_ADD_DISCS: usize = 1220;
 pub const ID_PATH_COVERS: usize = 1221;
 pub const ID_PATH_CD_ART: usize = 1222;
 pub const ID_PATH_BEZELS: usize = 1223;
-pub const ID_PATH_RESCAN: usize = 1224;
 pub const ID_PATH_EDIT_INI: usize = 1225;
 
 pub const ID_STATE_QUICK_SAVE: usize = 1070;
@@ -662,7 +661,6 @@ unsafe extern "system" fn custom_wndproc(
                 if let Some(path) = modal(hwnd, || select_folder_dialog(hwnd, "Choose the bezels artwork folder")) { push_action(GuiAction::SetArtworkPath(ArtworkPathKind::Bezels, path)); }
                 return 0;
             }
-            ID_PATH_RESCAN => { push_action(GuiAction::RescanLibrary); return 0; }
             ID_PATH_EDIT_INI => {
                 let _ = std::process::Command::new("notepad.exe").arg(crate::frontend::settings_file_path()).spawn();
                 return 0;
@@ -801,7 +799,6 @@ pub fn attach_gui_menu(
         AppendMenuW(paths_menu, MF_STRING, ID_PATH_CD_ART, to_wide("Set CD Artwork Folder...").as_ptr());
         AppendMenuW(paths_menu, MF_STRING, ID_PATH_BEZELS, to_wide("Set Bezels Artwork Folder...").as_ptr());
         AppendMenuW(paths_menu, MF_SEPARATOR, 0, std::ptr::null());
-        AppendMenuW(paths_menu, MF_STRING, ID_PATH_RESCAN, to_wide("Rescan Disc Folders").as_ptr());
         AppendMenuW(paths_menu, MF_STRING, ID_PATH_EDIT_INI, to_wide("Edit All Paths in Settings File...").as_ptr());
         AppendMenuW(main_menu, MF_POPUP, paths_menu as usize, to_wide("Paths").as_ptr());
 

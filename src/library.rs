@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock};
 use opencdi::frontend::{ART_SIZE_MAX, ART_SIZE_MIN};
 use opencdi::frontend::DisplayMode;
 
@@ -9,10 +10,10 @@ const MAX_ITEMS: usize = 512;
 pub const TOOLBAR_HEIGHT: usize = 42;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ToolbarPopup { Paths, Display }
+pub enum ToolbarPopup { Paths, Display, About }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ToolbarAction { OpenDisc, Controller, Paths, Refresh, Display, Exit, AddDiscFolder, SetCovers, SetCd, SetBezels, DownloadArtwork, Borderless, Decorated, Windowed }
+pub enum ToolbarAction { OpenDisc, PlayDisc(char), Controller, Paths, Display, About, Exit, AddDiscFolder, SetCovers, SetCd, SetBezels, Borderless, Decorated, Windowed }
 #[derive(Clone, Copy)]
 pub struct LibraryLayout {
     pub columns: usize,
@@ -29,23 +30,26 @@ impl LibraryLayout {
 }
 
 pub fn layout(art_size: u8) -> LibraryLayout {
-    let scale = art_size.clamp(ART_SIZE_MIN, ART_SIZE_MAX) as f32 / 100.0;
+    let size = art_size.clamp(ART_SIZE_MIN, ART_SIZE_MAX);
+    let range = ART_SIZE_MAX - ART_SIZE_MIN;
+    let (columns, rows) = if size <= ART_SIZE_MIN + range / 3 {
+        (10, 4)
+    } else if size <= ART_SIZE_MIN + 2 * range / 3 {
+        (8, 3)
+    } else {
+        (6, 2)
+    };
     let gap = 10;
     let left = 14;
-    let available_w = W - left * 2;
-    let desired_w = (128.0 * scale).round() as usize;
-    let columns = ((available_w + gap) / (desired_w + gap)).clamp(3, 8);
-    let cell_w = (available_w - gap * (columns - 1)) / columns;
     let top = 108;
-    let bottom = 492;
-    let desired_h = (120.0 * scale + 24.0).round() as usize;
-    let rows = ((bottom - top + gap) / (desired_h + gap)).clamp(1, 4);
-    let cell_h = ((bottom - top - gap * (rows - 1)) / rows).min(desired_h);
+    let bottom = H - 69;
+    let cell_w = (W - 2 * left - gap * (columns - 1)) / columns;
+    let cell_h = (bottom - top - gap * (rows - 1)) / rows;
     LibraryLayout { columns, rows, cell_w, cell_h, gap, left, top }
 }
 
 #[derive(Clone)]
-pub struct Artwork { pub w: usize, pub h: usize, pub pixels: Vec<u32> }
+pub struct Artwork { pub w: usize, pub h: usize, pub pixels: Arc<[u32]> }
 
 /// Draws menu geometry on the window-sized surface while keeping layout coordinates
 /// in the emulator UI's reference space. This avoids enlarging a low-resolution menu.
@@ -55,7 +59,7 @@ pub struct NativeCanvas<'a> {
     labels: Vec<NativeLabel>,
 }
 
-struct NativeLabel { x: usize, y: usize, value: String, color: u32, scale: usize }
+struct NativeLabel { x: usize, y: usize, value: String, color: u32, scale: usize, bounds: Option<(usize, usize)>, centered: bool }
 
 impl<'a> NativeCanvas<'a> {
     pub fn new(dst: &'a mut [u32], width: usize, height: usize, view: (usize, usize, usize, usize)) -> Self {
@@ -72,7 +76,11 @@ impl<'a> NativeCanvas<'a> {
         for py in y0..y1 { let a=py*self.width+x0; let b=py*self.width+x1; if a<b && b<=self.dst.len() { self.dst[a..b].fill(color); } }
     }
     pub fn text(&mut self, x: usize, y: usize, value: &str, color: u32, scale: usize) {
-        self.labels.push(NativeLabel { x, y, value: value.chars().take(96).collect(), color, scale });
+        self.labels.push(NativeLabel { x, y, value: value.chars().take(96).collect(), color, scale, bounds: None, centered: false });
+    }
+    fn centered_text(&mut self, x: usize, y: usize, value: &str, color: u32, scale: usize) {
+        self.text(x, y, value, color, scale);
+        if let Some(label) = self.labels.last_mut() { label.centered = true; }
     }
     pub fn round_rect(&mut self,x:usize,y:usize,w:usize,h:usize,r:usize,color:u32){
         let r=r.min(w/2).min(h/2); if r==0 {self.rect(x,y,w,h,color);return;}
@@ -136,7 +144,29 @@ impl Drop for NativeCanvas<'_> {
 impl Drop for NativeCanvas<'_> {
     fn drop(&mut self) {
         let labels=std::mem::take(&mut self.labels);
-        for label in labels { self.legacy_text(label.x,label.y,&label.value,label.color,label.scale); }
+        for label in labels {
+            if let Some((right, bottom)) = label.bounds {
+                let max_chars = (right.saturating_sub(self.x(label.x)) / (self.view.2 * 6 / W).max(1)).max(1);
+                let mut y = label.y;
+                let mut line = String::new();
+                for word in label.value.split_whitespace() {
+                    if !line.is_empty() && line.chars().count() + word.chars().count() + 1 > max_chars {
+                        if self.y(y + 8) > bottom { break; }
+                        self.legacy_text(label.x, y, &line, label.color, label.scale);
+                        y += 12;
+                        line.clear();
+                    }
+                    if !line.is_empty() { line.push(' '); }
+                    line.push_str(&short_title(word, max_chars));
+                }
+                if self.y(y + 8) <= bottom && !line.is_empty() {
+                    self.legacy_text(label.x, y, &line, label.color, label.scale);
+                }
+            } else {
+                let x = if label.centered { label.x.saturating_sub(label.value.chars().count() * 3 * label.scale) } else { label.x };
+                self.legacy_text(x,label.y,&label.value,label.color,label.scale);
+            }
+        }
     }
 }
 
@@ -153,10 +183,21 @@ unsafe extern "system" {
     fn CreateFontW(height:i32,width:i32,esc:i32,orient:i32,weight:i32,italic:u32,underline:u32,strike:u32,charset:u32,out_precision:u32,clip_precision:u32,quality:u32,pitch:u32,face:*const u16)->*mut std::ffi::c_void;
     fn SetBkMode(dc:*mut std::ffi::c_void,mode:i32)->i32;
     fn SetTextColor(dc:*mut std::ffi::c_void,color:u32)->u32;
+    fn GetTextExtentPoint32W(dc:*mut std::ffi::c_void,text:*const u16,count:i32,size:*mut [i32;2])->i32;
     fn TextOutW(dc:*mut std::ffi::c_void,x:i32,y:i32,text:*const u16,count:i32)->i32;
     fn DeleteObject(obj:*mut std::ffi::c_void)->i32;
     fn DeleteDC(dc:*mut std::ffi::c_void)->i32;
 }
+#[cfg(windows)]
+#[repr(C)]
+struct TextRect { left: i32, top: i32, right: i32, bottom: i32 }
+
+#[cfg(windows)]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn DrawTextW(dc: *mut std::ffi::c_void, text: *const u16, count: i32, rect: *mut TextRect, format: u32) -> i32;
+}
+
 #[cfg(windows)]
 fn draw_labels_gdi(c:&mut NativeCanvas<'_>){
     if c.labels.is_empty()||c.width==0||c.height==0{return;}
@@ -180,7 +221,24 @@ fn draw_labels_gdi(c:&mut NativeCanvas<'_>){
             let text:Vec<u16>=label.value.encode_utf16().collect();
             let x=(c.view.0 as f32+label.x as f32*c.view.2 as f32/W as f32).round() as i32;
             let y=(c.view.1 as f32+label.y as f32*c.view.3 as f32/H as f32).round() as i32;
-            TextOutW(dc,x,y,text.as_ptr(),text.len() as i32);SelectObject(dc,old_font);
+            if let Some((right, bottom)) = label.bounds {
+                const WORD_BREAK: u32 = 0x10;
+                const EXTERNAL_LEADING: u32 = 0x200;
+                const NO_PREFIX: u32 = 0x800;
+                const EDIT_CONTROL: u32 = 0x2000;
+                const END_ELLIPSIS: u32 = 0x8000;
+                let mut rect = TextRect { left: x, top: y, right: right as i32, bottom: bottom as i32 };
+                let flags = WORD_BREAK | EXTERNAL_LEADING | NO_PREFIX | EDIT_CONTROL;
+                let mut measured = TextRect { left: x, top: y, right: right as i32, bottom: bottom as i32 };
+                let measured_height = DrawTextW(dc, text.as_ptr(), text.len() as i32, &mut measured, flags | 0x400);
+                rect.top += (rect.bottom - rect.top - measured_height).max(0) / 2;
+                DrawTextW(dc, text.as_ptr(), text.len() as i32, &mut rect, flags | END_ELLIPSIS);
+            } else {
+                let mut size = [0i32; 2];
+                if label.centered { GetTextExtentPoint32W(dc, text.as_ptr(), text.len() as i32, &mut size); }
+                TextOutW(dc,x - size[0] / 2,y,text.as_ptr(),text.len() as i32);
+            }
+            SelectObject(dc,old_font);
         }
         std::ptr::copy_nonoverlapping(bits as *const u32,c.dst.as_mut_ptr(),c.width*c.height);
         for (_,font) in fonts{DeleteObject(font);}SelectObject(dc,old_bitmap);DeleteObject(bitmap);DeleteDC(dc);
@@ -188,22 +246,63 @@ fn draw_labels_gdi(c:&mut NativeCanvas<'_>){
 }
 
 #[derive(Clone)]
-pub struct Item { pub path: PathBuf, pub title: String, pub cover: Option<Artwork>, pub disc: Option<Artwork> }
+pub struct Item { pub path: PathBuf, pub title: String, pub cover: Option<Artwork>, pub disc: Option<Artwork>, pub logo: Option<Artwork> }
 
-pub fn scan(roots: &[PathBuf], covers_root: &Path, cd_root: &Path, fallback_covers: &Path, fallback_cd: &Path) -> Vec<Item> {
+pub fn scan(roots: &[PathBuf], covers_root: &Path, cd_root: &Path, artwork_root: &Path) -> Vec<Item> {
+    load_items(scan_paths(roots), covers_root, cd_root, artwork_root)
+}
+
+pub fn scan_paths(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let mut seen = HashSet::new();
     for root in roots { scan_dir(root, 0, &mut seen, &mut paths); }
     let cue_stems: HashSet<String> = paths.iter().filter(|p| ext(p) == "cue")
         .filter_map(|p| p.file_stem()).map(|s| s.to_string_lossy().to_lowercase()).collect();
     paths.retain(|p| !(ext(p) == "bin" && p.file_stem().map(|s| cue_stems.contains(&s.to_string_lossy().to_lowercase())).unwrap_or(false)));
-    paths.sort_by_key(|p| p.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default());
-    paths.into_iter().take(MAX_ITEMS).map(|path| {
-        let title = path.file_stem().map(|s| s.to_string_lossy().replace('_', " ")).unwrap_or_else(|| "CD-i Disc".into());
-        let cover = load_cover_artwork(&path, covers_root).or_else(|| load_cover_artwork(&path, fallback_covers));
-        let disc = load_disc_artwork(&path, cd_root).or_else(|| load_disc_artwork(&path, fallback_cd));
-        Item { path, title, cover, disc }
+    paths.sort_by_cached_key(|p| (p.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default(), p.clone()));
+    paths.truncate(MAX_ITEMS);
+    paths
+}
+
+pub fn load_items(paths: Vec<PathBuf>, covers_root: &Path, cd_root: &Path, artwork_root: &Path) -> Vec<Item> {
+    let fallback_covers = artwork_root.join("Covers");
+    let fallback_cd = artwork_root.join("CD");
+    paths.into_iter().map(|path| {
+        let title = disc_title(&path);
+        let cover = load_cover_artwork(&path, covers_root).or_else(|| load_cover_artwork(&path, &fallback_covers));
+        let disc = load_disc_artwork(&path, cd_root).or_else(|| load_disc_artwork(&path, &fallback_cd));
+        let logo = managed_art_path(&path, artwork_root, crate::launchbox::ArtworkKind::Logo).and_then(|p| load_artwork(&p));
+        Item { path, title, cover, disc, logo }
     }).collect()
+}
+
+pub fn managed_art_path(disc: &Path, root: &Path, kind: crate::launchbox::ArtworkKind) -> Option<PathBuf> {
+    let folder = root.join(kind.folder());
+    let title = disc_title(disc);
+    if let Some(path) = crate::screenscraper::preferred_gallery_image(&folder, kind, &title) { return Some(path); }
+    let stem = disc.file_stem()?.to_string_lossy();
+    ["png", "jpg", "jpeg"].into_iter().flat_map(|extension| {
+        [folder.join(format!("{stem}.{extension}")), folder.join(kind.filename(&title, extension))]
+    }).find(|path| path.is_file())
+}
+
+#[derive(Default)]
+pub struct DiscDetails {
+    pub logo: Option<Artwork>,
+    pub boxart: Option<Artwork>,
+    pub back: Option<Artwork>,
+}
+
+impl DiscDetails {
+    pub fn load(disc: &Path, root: &Path) -> Self {
+        use crate::launchbox::ArtworkKind;
+        let image = |kind| managed_art_path(disc, root, kind).and_then(|path| load_artwork(&path));
+        Self { logo: image(ArtworkKind::Logo), boxart: image(ArtworkKind::Boxart), back: image(ArtworkKind::Back) }
+    }
+}
+
+pub fn disc_title(path: &Path) -> String {
+    path.file_stem().map(|stem| stem.to_string_lossy().replace('_', " ")).unwrap_or_else(|| "CD-i Disc".into())
 }
 
 fn ext(p: &Path) -> String { p.extension().unwrap_or_default().to_string_lossy().to_ascii_lowercase() }
@@ -248,26 +347,39 @@ fn sibling_art(disc: &Path, cover: bool) -> Option<PathBuf> {
 
 fn art_in_root(disc: &Path, root: &Path, cover: bool) -> Option<PathBuf> {
     let stem = disc.file_stem()?.to_string_lossy();
-    let names = if cover { vec![format!("{stem}"), format!("{stem}-cover"), format!("{stem}_cover")] }
-                else { vec![format!("{stem}"), format!("{stem}-disc"), format!("{stem}-cd"), format!("{stem}_disc")] };
-    for name in names {
-        for ext in ["png", "jpg", "jpeg"] {
-            let candidate = root.join(format!("{name}.{ext}"));
-            if candidate.is_file() { return Some(candidate); }
+    let downloaded_name = crate::launchbox::safe_name(&disc_title(disc));
+    let suffixes: &[&str] = if cover { &["", "-cover", "_cover"] } else { &["", "-disc", "-cd", "_disc"] };
+    for name in [stem.as_ref(), &downloaded_name] {
+        for suffix in suffixes {
+            for ext in ["png", "jpg", "jpeg"] {
+                let candidate = root.join(format!("{name}{suffix}.{ext}"));
+                if candidate.is_file() { return Some(candidate); }
+            }
         }
     }
     None
 }
 
+pub fn has_disc_image(disc: &Path, root: &Path, cover: bool) -> bool {
+    let kind = if cover { crate::launchbox::ArtworkKind::Cover } else { crate::launchbox::ArtworkKind::Disc };
+    crate::screenscraper::preferred_gallery_image(root, kind, &disc_title(disc)).is_some()
+        || art_in_root(disc, root, cover).is_some() || sibling_art(disc, cover).is_some()
+}
+
 pub fn load_cover_artwork(disc: &Path, root: &Path) -> Option<Artwork> {
-    art_in_root(disc, root, true).or_else(|| sibling_art(disc, true)).and_then(|p| load_png(&p))
+    crate::screenscraper::preferred_gallery_image(root, crate::launchbox::ArtworkKind::Cover, &disc_title(disc))
+        .and_then(|path| load_artwork(&path))
+        .or_else(|| art_in_root(disc, root, true).or_else(|| sibling_art(disc, true)).and_then(|p| load_artwork(&p)))
 }
 
 pub fn load_disc_artwork(disc: &Path, root: &Path) -> Option<Artwork> {
-    art_in_root(disc, root, false).or_else(|| sibling_art(disc, false)).and_then(|p| load_png(&p))
+    let kind = crate::launchbox::ArtworkKind::Disc;
+    crate::screenscraper::preferred_gallery_image(root, kind, &disc_title(disc))
+        .and_then(|path| load_artwork(&path))
+        .or_else(|| art_in_root(disc, root, false).or_else(|| sibling_art(disc, false)).and_then(|p| load_artwork(&p)))
 }
 
-fn load_png(path: &Path) -> Option<Artwork> {
+pub fn load_artwork(path: &Path) -> Option<Artwork> {
     let file = std::io::BufReader::new(std::fs::File::open(path).ok()?);
     decode_png(file).or_else(|| decode_wic(path))
 }
@@ -276,14 +388,22 @@ fn load_png(path: &Path) -> Option<Artwork> {
 fn decode_wic(path: &Path) -> Option<Artwork> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::GENERIC_READ;
+    use windows::Win32::Foundation::{GENERIC_READ, RPC_E_CHANGED_MODE};
     use windows::Win32::Graphics::Imaging::{CLSID_WICImagingFactory, GUID_WICPixelFormat32bppRGBA, IWICImagingFactory, WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand};
     use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize};
     struct ComInit;
     impl Drop for ComInit { fn drop(&mut self) { unsafe { CoUninitialize(); } } }
     unsafe {
-        if CoInitializeEx(None, COINIT_MULTITHREADED).is_err() { return None; }
-        let _com = ComInit;
+        let init = CoInitializeEx(None, COINIT_MULTITHREADED);
+        // The Windows UI thread may already own a single-threaded apartment.
+        // WIC works in that apartment. Only balance initializations we own.
+        let _com = if init.is_ok() {
+            Some(ComInit)
+        } else if init == RPC_E_CHANGED_MODE {
+            None
+        } else {
+            return None;
+        };
         let factory: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
         let decoder = factory.CreateDecoderFromFilename(PCWSTR(wide.as_ptr()), None, GENERIC_READ, WICDecodeMetadataCacheOnDemand).ok()?;
@@ -308,6 +428,13 @@ fn decode_wic(_path: &Path) -> Option<Artwork> { None }
 pub fn load_png_bytes(bytes: &[u8]) -> Option<Artwork> {
     decode_png(std::io::Cursor::new(bytes))
 }
+
+static MISSING_COVER: LazyLock<Artwork> = LazyLock::new(|| {
+    load_png_bytes(include_bytes!("../assets/cover_missing.png")).expect("embedded cover placeholder")
+});
+static MISSING_DISC: LazyLock<Artwork> = LazyLock::new(|| {
+    load_png_bytes(include_bytes!("../assets/disc_missing.png")).expect("embedded disc placeholder")
+});
 
 fn decode_png<R: std::io::BufRead + std::io::Seek>(file: R) -> Option<Artwork> {
     let mut decoder = png::Decoder::new(file);
@@ -350,8 +477,7 @@ pub fn render(dst: &mut [u32], items: &[Item], selected: usize, art_size: u8) {
             let art_y = y + 2;
             let art_w = layout.cell_w.saturating_sub(6);
             let art_h = layout.cell_h.saturating_sub(42);
-            if let Some(cover) = &items[i].cover { blit_fit(dst, cover, art_x, art_y, art_w, art_h); }
-            else { fallback_cover(dst, art_x + art_w / 6, art_y, art_w * 2 / 3, art_h); }
+            blit_fit(dst, items[i].cover.as_ref().unwrap_or(&MISSING_COVER), art_x, art_y, art_w, art_h);
             let title: String = items[i].title.chars().take(24).collect();
             text(dst, x + 4, y + layout.cell_h - 30, &title, if active { 0xFFFFD98A } else { 0xFFE6EAF0 }, 1);
             let format = ext(&items[i].path).to_ascii_uppercase();
@@ -365,12 +491,107 @@ pub fn render(dst: &mut [u32], items: &[Item], selected: usize, art_size: u8) {
     }
 }
 
-pub fn render_native(dst: &mut [u32], width: usize, height: usize, view: (usize,usize,usize,usize), items: &[Item], selected: usize, art_size: u8, toolbar_visible: bool, mode: DisplayMode, popup: Option<ToolbarPopup>) {
+#[derive(Default)]
+pub struct Search {
+    pub query: String,
+    pub focused: bool,
+    pub caret: usize,
+    pub select_all: bool,
+    matches: Vec<usize>,
+}
+
+fn search_key(text: &str) -> String {
+    text.chars().flat_map(char::to_lowercase).filter(|c| c.is_alphanumeric()).collect()
+}
+
+impl Search {
+    pub fn rebuild(&mut self, items: &[Item]) {
+        self.matches.clear();
+        if self.query.is_empty() { return; }
+        let terms: Vec<_> = self.query.split_whitespace().map(search_key).filter(|term| !term.is_empty()).collect();
+        self.matches.extend(items.iter().enumerate().filter_map(|(index, item)| {
+            let title = search_key(&item.title);
+            let file = search_key(&item.path.file_name().unwrap_or_default().to_string_lossy());
+            terms.iter().all(|term| title.contains(term) || file.contains(term)).then_some(index)
+        }));
+    }
+
+    pub fn len(&self, items: &[Item]) -> usize {
+        if self.query.is_empty() { items.len() } else { self.matches.len() }
+    }
+
+    pub fn get<'a>(&self, items: &'a [Item], index: usize) -> Option<&'a Item> {
+        items.get(if self.query.is_empty() { index } else { *self.matches.get(index)? })
+    }
+
+    pub fn position(&self, items: &[Item], path: &Path) -> Option<usize> {
+        (0..self.len(items)).find(|&index| self.get(items, index).is_some_and(|item| item.path == path))
+    }
+
+    pub fn insert(&mut self, text: &str) -> bool {
+        let room = if self.select_all { 120 } else { 120usize.saturating_sub(self.query.chars().count()) };
+        let value: String = text.chars().filter(|ch| !ch.is_control()).take(room).collect();
+        if value.is_empty() { return false; }
+        if self.select_all { self.clear(); }
+        self.query.insert_str(self.caret, &value);
+        self.caret += value.len();
+        true
+    }
+
+    pub fn clear(&mut self) {
+        self.query.clear();
+        self.caret = 0;
+        self.select_all = false;
+    }
+
+    pub fn move_caret(&mut self, right: bool) {
+        if self.select_all {
+            self.caret = if right { self.query.len() } else { 0 };
+        } else if right {
+            self.caret += self.query[self.caret..].chars().next().map_or(0, char::len_utf8);
+        } else {
+            self.caret = self.query[..self.caret].char_indices().next_back().map_or(0, |(index, _)| index);
+        }
+        self.select_all = false;
+    }
+
+    pub fn delete(&mut self, backwards: bool) -> bool {
+        if self.query.is_empty() { return false; }
+        if self.select_all { self.clear(); return true; }
+        let original = self.caret;
+        self.move_caret(!backwards);
+        let end = original.max(self.caret);
+        self.caret = original.min(self.caret);
+        self.query.replace_range(self.caret..end, "");
+        end != self.caret
+    }
+}
+
+pub fn search_hit(x: i32, y: i32) -> Option<bool> {
+    ((455..710).contains(&x) && (58..87).contains(&y)).then_some(x >= 681)
+}
+
+pub fn render_native(dst: &mut [u32], width: usize, height: usize, view: (usize,usize,usize,usize), items: &[Item], selected: usize, art_size: u8, toolbar_visible: bool, mode: DisplayMode, popup: Option<ToolbarPopup>, optical_disc: Option<char>, search: &Search) {
     let mut c=NativeCanvas::new(dst,width,height,view);
     for y in 0..H { let t=y as u32*10/H as u32; let color=0xFF000000|((10+t)<<16)|((20+t)<<8)|(34+t*2); c.rect(0,y,W,1,color); }
     c.round_rect(12,50,W-24,45,10,0xFF101D2C);
     c.text(25,64,"CD-I LIBRARY",0xFFF1F5FA,2);
-    c.round_rect(455,58,255,29,8,0xFF1A293B); c.ring(472,72,5,0xFF91A9C2); c.line(476,76,6,0xFF91A9C2); c.text(486,67,"Search library...",0xFF8295AA,1);
+    if search.focused { c.round_rect(454,57,257,31,8,0xFF59B2F5); }
+    c.round_rect(455,58,255,29,8,0xFF1A293B);
+    c.ring(472,72,5,0xFF91A9C2);
+    c.line(476,76,6,0xFF91A9C2);
+    if search.query.is_empty() {
+        c.text(486,67,"Search library...",0xFFA3B6CB,1);
+    } else {
+        let mut chars: Vec<_> = search.query.chars().collect();
+        let caret = search.query[..search.caret].chars().count();
+        let start = if search.focused { caret.saturating_sub(21) } else { 0 };
+        if search.focused && !search.select_all { chars.insert(caret, '|'); }
+        let shown: String = chars.into_iter().skip(start).take(23).collect();
+        if search.focused && search.select_all { c.round_rect(483,64,194,18,3,0xFF324F72); }
+        c.text(486,67,&shown,0xFFF1F5FA,1);
+        c.text(689,66,"×",0xFFD6E2EF,1);
+    }
     c.rect(0,H-64,W,64,0xFF0D1725); c.rect(0,H-64,W,1,0xFF26374A);
     c.text(18,H-48,"ARTWORK SIZE",0xFFB7C5D4,1);
     let track_x=125; let track_w=145; let track_y=H-35;
@@ -379,95 +600,142 @@ pub fn render_native(dst: &mut [u32], width: usize, height: usize, view: (usize,
     let filled=(value-ART_SIZE_MIN) as usize*track_w/(ART_SIZE_MAX-ART_SIZE_MIN) as usize;
     c.round_rect(track_x,track_y,filled,4,2,0xFF57AEF5);
     c.round_rect(track_x+filled.saturating_sub(5),track_y.saturating_sub(5),12,14,6,0xFFF4F7FB);
-    c.text(282,H-42,&format!("{}%",value),0xFFD5DFEA,1);
-    c.round_rect(326,H-51,26,28,6,0xFF243B55); c.rect(333,H-44,5,5,0xFF72BBF7);c.rect(340,H-44,5,5,0xFF72BBF7);c.rect(333,H-37,5,5,0xFF72BBF7);c.rect(340,H-37,5,5,0xFF72BBF7);
-    c.round_rect(359,H-51,26,28,6,0xFF172638); c.rect(366,H-44,12,2,0xFF9FB1C5);c.rect(366,H-39,12,2,0xFF9FB1C5);c.rect(366,H-34,12,2,0xFF9FB1C5);
-    c.text(660,H-42,&format!("{} ITEMS",items.len()),0xFF9AAFC4,1);
-    let l=layout(value); let per_page=l.visible_count();
-    if items.is_empty() {
+    let l = layout(value);
+    c.text(282,H-42,&format!("{} × {}", l.columns, l.rows),0xFFD5DFEA,1);
+    let count = search.len(items);
+    if let Some(item) = search.get(items, selected) {
+        c.text(338, H - 42, &short_title(&item.title, 46), 0xFFB7C5D4, 1);
+    }
+    let count_label = if search.query.is_empty() { format!("{count} ITEMS") }
+        else { format!("{count} OF {}", items.len()) };
+    c.text(660,H-42,&count_label,0xFF9AAFC4,1);
+    let per_page = l.visible_count();
+    if count == 0 && !search.query.is_empty() {
+        c.centered_text(W / 2, 242, "No discs match your search", 0xFFF1F5FA, 2);
+    } else if count == 0 {
         c.text(205,210,"NO DISC IMAGES FOUND",0xFFF1F5FA,2);
         c.text(135,250,"ADD A DISC FOLDER FROM PATHS TO BEGIN",0xFF9AAFC4,1);
         c.text(180,290,"OR CHOOSE OPEN DISC",0xFF78BDF5,1);
     } else {
         let page_start=(selected/per_page)*per_page;
         for slot in 0..per_page {
-            let i=page_start+slot; if i>=items.len(){break;}
+            let i=page_start+slot; let Some(item) = search.get(items, i) else { break; };
             let col=slot%l.columns; let row=slot/l.columns;
             let x=l.left+col*(l.cell_w+l.gap); let y=l.top+row*(l.cell_h+l.gap);
-            let art_x=x+4; let art_y=y+2; let art_w=l.cell_w.saturating_sub(8); let art_h=l.cell_h.saturating_sub(34);
-            c.round_rect(art_x-2,art_y-2,art_w+4,art_h+4,7,0xFF25364A);
-            if let Some(cover)=&items[i].cover { c.art_fit(cover,art_x,art_y,art_w,art_h); }
-            else { native_missing_cover(&mut c,art_x+art_w/6,art_y,art_w*2/3,art_h); }
-            let title_cap=l.cell_w.saturating_sub(12)/6;
-            let title:String=items[i].title.chars().take(title_cap.max(1)*2).collect();
-            let active=i==selected;
-            let (one,two)=wrap_title(&title,title_cap.max(1));
-            let color=if active{0xFF80C4FF}else{0xFFE8EEF5};
-            c.text(x+4,y+l.cell_h-26,&one,color,1);
-            if !two.is_empty(){c.text(x+4,y+l.cell_h-13,&two,if active{0xFF80C4FF}else{0xFFB5C3D1},1);}
+            let art_x=x+4; let art_y=y+2; let art_w=l.cell_w.saturating_sub(8); let art_h=l.cell_h.saturating_sub(31);
+            c.art_fit(item.cover.as_ref().unwrap_or(&MISSING_COVER), art_x, art_y, art_w, art_h);
+            let active = i == selected;
+            if let Some(logo) = &item.logo {
+                c.art_fit(logo, x + 3, y + l.cell_h - 28, l.cell_w - 6, 22);
+            } else {
+                let title_cap = (l.cell_w.saturating_sub(6) / 6).max(1);
+                let (one, two) = wrap_title(&item.title, title_cap);
+                let color = if active { 0xFF80C4FF } else { 0xFFE8EEF5 };
+                for (line, offset) in [(&one, 26), (&two, 14)] {
+                    let inset = l.cell_w.saturating_sub(line.chars().count() * 6) / 2;
+                    c.text(x + inset, y + l.cell_h - offset, line, color, 1);
+                }
+            }
             if active { c.round_rect(x+3,y+l.cell_h-4,l.cell_w.saturating_sub(6),2,1,0xFF56B1F7); }
         }
-        let pages=(items.len()+per_page-1)/per_page;
+        let pages=count.div_ceil(per_page);
         c.text(18,H-18,"MOUSE: SELECT  ·  DOUBLE CLICK: PLAY    D-PAD / STICK: MOVE",0xFF778DA5,1);
         c.text(686,H-18,&format!("{}/{}",selected/per_page+1,pages),0xFFB7C5D4,1);
     }
     // Draw popovers over the grid so they remain legible when they extend below the toolbar.
-    if toolbar_visible { render_toolbar_native(&mut c,mode,popup); }
+    if toolbar_visible { render_toolbar_native(&mut c,mode,popup,optical_disc); }
 }
 
-fn wrap_title(title:&str,width:usize)->(String,String){
-    if title.chars().count()<=width{return(title.to_string(),String::new());}
-    let mut one=String::new();let mut two=String::new();
-    for word in title.split_whitespace(){
-        if one.is_empty(){one=word.to_string();continue;}
-        if one.chars().count()+1+word.chars().count()<=width{one.push(' ');one.push_str(word);}
-        else if two.is_empty(){two=word.to_string();}
-        else if two.chars().count()+1+word.chars().count()<=width{two.push(' ');two.push_str(word);}
-    }
-    (one.chars().take(width).collect(),two.chars().take(width).collect())
+fn short_title(title: &str, width: usize) -> String {
+    if title.chars().count() <= width { return title.to_owned(); }
+    title.chars().take(width.saturating_sub(1)).chain(['…']).collect()
 }
 
-fn native_missing_cover(c:&mut NativeCanvas<'_>,x:usize,y:usize,w:usize,h:usize){
-    c.rect(x,y,w,h,0xFF263343); c.rect(x+5,y+5,w.saturating_sub(10),h.saturating_sub(10),0xFF1D2A39);
-    let r=(w.min(h)*29/100).max(8); let cx=x+w/2; let cy=y+h*43/100;
-    for dy in -(r as isize)..=(r as isize) {
-        let dx=((r*r) as f64-(dy*dy) as f64).max(0.0).sqrt() as isize;
-        let mut sx=-(dx as isize);
-        while sx<=dx {
-            let stripe=(sx+dy).rem_euclid(14)<5;
-            let mut end=sx+1;
-            while end<=dx && ((end+dy).rem_euclid(14)<5)==stripe {end+=1;}
-            if stripe {c.rect((cx as isize+sx) as usize,(cy as isize+dy) as usize,(end-sx) as usize,1,0xFF8290A0);}
-            sx=end;
-        }
-    }
-    c.ring(cx,cy,r,0xFFA8B3C0); c.ring(cx,cy,(r/4).max(3),0xFF263343);
-    c.text(x+w/4,y+h*75/100,"NO COVER",0xFFB7C3D0,1);
+fn wrap_title(title: &str, width: usize) -> (String, String) {
+    let Some((limit, _)) = title.char_indices().nth(width) else {
+        return (title.to_owned(), String::new());
+    };
+    let split = title[..limit].rfind(' ').filter(|&i| i > 0).unwrap_or(limit);
+    (title[..split].to_owned(), short_title(title[split..].trim_start(), width))
 }
 
-fn render_toolbar_native(c:&mut NativeCanvas<'_>,mode:DisplayMode,popup:Option<ToolbarPopup>){
+fn render_toolbar_native(c:&mut NativeCanvas<'_>,mode:DisplayMode,popup:Option<ToolbarPopup>, optical_disc: Option<char>){
     c.rect(0,0,W,TOOLBAR_HEIGHT,0xFF0C1726); c.rect(0,TOOLBAR_HEIGHT-1,W,1,0xFF26374A);
-    let buttons=[(12,100,"Open Disc"),(116,108,"Controller"),(229,92,"Paths"),(326,96,"Refresh"),(427,112,"Settings"),(676,80,"Exit")];
+    let buttons=[(12,100,"Open Disc"),(116,108,"Controller"),(229,92,"Paths"),(326,96,"Settings"),(427,112,"About"),(676,80,"Exit")];
     for (i,(x,w,label)) in buttons.iter().enumerate(){
-        let active=matches!((i,popup),(2,Some(ToolbarPopup::Paths))|(4,Some(ToolbarPopup::Display)));
+        let active=matches!((i,popup),(2,Some(ToolbarPopup::Paths))|(3,Some(ToolbarPopup::Display))|(4,Some(ToolbarPopup::About)));
         if active { c.round_rect(*x,5,*w,31,7,0xFF1B2D42); }
         let cx=*x+13;let cy=15;let color=if i==5{0xFFFF7777}else{0xFFB6C7DA};
         match i {
             0=>{c.round_rect(cx-7,cy-5,14,11,3,0xFF334B65);c.rect(cx-5,cy-1,10,5,0xFF0C1726);c.rect(cx-4,cy-5,6,3,0xFF334B65);}
             1=>{c.round_rect(cx-8,cy-5,16,11,4,0xFF344D67);c.rect(cx-5,cy-1,3,2,0xFF0C1726);c.rect(cx+3,cy-1,3,2,0xFF0C1726);c.rect(cx-1,cy+2,3,2,0xFF0C1726);}
             2=>{c.round_rect(cx-7,cy-6,14,13,2,0xFF344D67);c.rect(cx-4,cy-3,8,1,0xFF0C1726);c.rect(cx-4,cy,8,1,0xFF0C1726);c.rect(cx-4,cy+3,6,1,0xFF0C1726);}
-            3=>{c.ring(cx,cy,7,0xFFB6C7DA);c.rect(cx+3,cy-7,5,2,0xFF0C1726);c.rect(cx+5,cy-5,2,5,0xFF0C1726);}
-            4=>{c.ring(cx,cy,7,0xFFB6C7DA);c.ring(cx,cy,3,0xFFB6C7DA);for(dx,dy)in[(0,-10),(0,8),(-10,0),(8,0)]{c.rect((cx as isize+dx)as usize,(cy as isize+dy)as usize,2,2,0xFFB6C7DA);}}
+            3=>{c.ring(cx,cy,7,color);c.ring(cx,cy,3,color);for(dx,dy)in[(0,-10),(0,8),(-10,0),(8,0)]{c.rect((cx as isize+dx)as usize,(cy as isize+dy)as usize,2,2,color);}}
+            4=>{c.ring(cx,cy,8,color);c.rect(cx-1,cy-4,2,2,color);c.rect(cx-1,cy,2,5,color);}
             _=>{c.rect(cx-1,cy-8,3,12,color);c.rect(cx+2,cy+2,6,3,color);c.rect(cx+7,cy+4,2,4,color);}
         }
         c.text(*x+31,14,label,if i==5{0xFFFF808A}else{0xFFE0E8F1},1);
         if i!=5 { c.rect(*x+*w,11,1,18,0xFF213247); }
     }
+    if let Some(letter) = optical_disc {
+        c.round_rect(550, 5, 115, 31, 7, 0xFF1B2D42);
+        c.ring(563, 17, 7, 0xFFB6C7DA);
+        c.ring(563, 17, 2, 0xFFB6C7DA);
+        c.text(577, 14, &format!("Play Disc ({letter}:)"), 0xFFE0E8F1, 1);
+    }
     let _=mode;
-    match popup{
-        Some(ToolbarPopup::Paths)=>{c.round_rect(229,TOOLBAR_HEIGHT+4,228,144,9,0xFF17263A);for(n,label)in["Add Disc Folder","Set Cover Artwork","Set CD Artwork","Set Bezels","Download Full Artwork","Rescan Library"].iter().enumerate(){let y=TOOLBAR_HEIGHT+10+n*22;if n==0{c.round_rect(235,y-3,216,22,5,0xFF213650);}c.text(245,y+2,label,0xFFE6EDF5,1);}},
-        Some(ToolbarPopup::Display)=>{c.round_rect(427,TOOLBAR_HEIGHT+4,206,78,9,0xFF17263A);for(n,label)in["Borderless Fullscreen","Decorated Fullscreen","Windowed"].iter().enumerate(){c.text(440,TOOLBAR_HEIGHT+10+n*22,label,0xFFE6EDF5,1);}},
-        None=>{}
+    match popup {
+        Some(ToolbarPopup::Paths) => {
+            c.round_rect(229, TOOLBAR_HEIGHT + 4, 228, 100, 9, 0xFF17263A);
+            for (row, label) in ["Add Disc Folder", "Set Cover Artwork", "Set CD Artwork", "Set Bezels"].iter().enumerate() {
+                c.text(245, TOOLBAR_HEIGHT + 12 + row * 22, label, 0xFFE6EDF5, 1);
+            }
+        }
+        Some(ToolbarPopup::Display) => {
+            c.round_rect(326, TOOLBAR_HEIGHT + 4, 206, 78, 9, 0xFF17263A);
+            for (row, label) in ["Borderless Fullscreen", "Decorated Fullscreen", "Windowed"].iter().enumerate() {
+                c.text(339, TOOLBAR_HEIGHT + 10 + row * 22, label, 0xFFE6EDF5, 1);
+            }
+        }
+        Some(ToolbarPopup::About) => {
+            for pixel in &mut *c.dst {
+                *pixel = (*pixel & 0xFF000000) | ((*pixel & 0x00FCFCFC) >> 2);
+            }
+            c.labels.retain_mut(|label| {
+                let width = label.value.chars().count() * 9 * label.scale;
+                let overlaps = label.x < 635 && label.x + width > 133 && label.y < 415 && label.y + 16 > 145;
+                label.color = (label.color & 0xFF000000) | ((label.color & 0x00FCFCFC) >> 2);
+                !overlaps
+            });
+            c.round_rect(133, 145, 502, 270, 10, 0xFF17263A);
+            c.text(157, 165, "About OpenCDi", 0xFFF1F5FA, 2);
+            for (row, line) in [
+                "OpenCDi is a modern, standalone, open-source Philips CD-i",
+                "emulator written in Rust. The goal of the project is to accurately",
+                "preserve and run the software and multimedia library of the",
+                "Philips CD-i system with a clean, modular, and fast architecture.",
+            ].iter().enumerate() {
+                c.text(157, 207 + row * 17, line, 0xFFE6EDF5, 1);
+            }
+            for (row, line) in ["Emulator Core by sigsantilio", "User Interface by sionisaac", "App Version 1"].iter().enumerate() {
+                c.text(157, 295 + row * 19, line, 0xFFE6EDF5, 1);
+            }
+            c.round_rect(535, 365, 76, 30, 6, 0xFF243B55);
+            c.text(557, 373, "Close", 0xFFF1F5FA, 1);
+        }
+        None => {}
+    }
+}
+
+pub fn about_close_hit(x: usize, y: usize) -> bool {
+    (535..611).contains(&x) && (365..395).contains(&y)
+}
+
+pub fn toolbar_popup_hit(x: usize, y: usize, popup: Option<ToolbarPopup>) -> bool {
+    match popup {
+        Some(ToolbarPopup::Paths) => (229..457).contains(&x) && (TOOLBAR_HEIGHT + 4..TOOLBAR_HEIGHT + 104).contains(&y),
+        Some(ToolbarPopup::Display) => (326..532).contains(&x) && (TOOLBAR_HEIGHT + 4..TOOLBAR_HEIGHT + 82).contains(&y),
+        _ => false,
     }
 }
 
@@ -480,7 +748,7 @@ pub fn draw_covers_high_res(dst: &mut [u32], dst_w: usize, dst_h: usize, view: (
     for slot in 0..per_page {
         let index = page_start + slot;
         if index >= items.len() { break; }
-        let Some(art) = &items[index].cover else { continue; };
+        let art = items[index].cover.as_ref().unwrap_or(&MISSING_COVER);
         let col = slot % layout.columns; let row = slot / layout.columns;
         let x = layout.left + col * (layout.cell_w + layout.gap) + 3;
         let y = layout.top + row * (layout.cell_h + layout.gap) + 2;
@@ -534,103 +802,57 @@ pub fn size_from_slider_x(x: usize) -> u8 {
     value as u8
 }
 
-pub fn render_boot(dst: &mut [u32], title: &str, disc_art: Option<&Artwork>, frame: u64) {
+pub fn render_boot(dst: &mut [u32], disc_art: Option<&Artwork>, frame: u64) {
     dst[..W * H].fill(0xFF000000);
     let angle = frame as f32 * 0.055;
-    if let Some(art) = disc_art { blit_rotated(dst, art, W as i32 / 2, 254, 212, angle); }
-    else { fallback_spinner(dst, W as i32 / 2, 254, 104, angle); }
-    let clean: String = title.chars().take(38).collect();
-    text(dst, 270, 410, &clean, 0xFFE6E6E6, 1);
-    text(dst, 240, 444, "STARTING DISC PLEASE WAIT", 0xFF9B9B9B, 1);
+    blit_rotated(dst, disc_art.unwrap_or(&MISSING_DISC), W as i32 / 2, 254, 212, angle);
 }
 
-pub fn render_toolbar(dst: &mut [u32], visible: bool, mode: DisplayMode, popup: Option<ToolbarPopup>) {
-    if !visible { return; }
-    rect(dst, 0, 0, W, TOOLBAR_HEIGHT, 0xFF0C1421);
-    rect(dst, 0, TOOLBAR_HEIGHT - 1, W, 1, 0xFF354357);
-    text(dst, 12, 12, "OPENCDI", 0xFFF2F4F7, 1);
-    toolbar_button(dst, 84, 8, 96, "OPEN DISC", 0);
-    toolbar_button(dst, 181, 8, 122, "CONTROLLER", 1);
-    toolbar_button(dst, 304, 8, 82, "PATHS", 2);
-    toolbar_button(dst, 387, 8, 88, "REFRESH", 3);
-    toolbar_button(dst, 476, 8, 96, "DISPLAY", 4);
-    toolbar_button(dst, 690, 8, 70, "EXIT", 5);
-    let mode_label = match mode { DisplayMode::BorderlessFullscreen => "BORDERLESS", DisplayMode::DecoratedFullscreen => "FULLSCREEN", DisplayMode::Windowed => "WINDOWED" };
-    text(dst, 590, 19, mode_label, 0xFF91A2B7, 1);
-    match popup {
-        Some(ToolbarPopup::Paths) => {
-            rect(dst, 304, TOOLBAR_HEIGHT, 244, 132, 0xFF172334);
-            rect(dst, 304, TOOLBAR_HEIGHT, 244, 1, 0xFF4A607C);
-            for (n, label) in ["ADD DISC FOLDER", "SET COVER ART", "SET CD ART", "SET BEZELS", "DOWNLOAD FULL ART", "RESCAN LIBRARY"].iter().enumerate() {
-                let y = TOOLBAR_HEIGHT + 5 + n * 21;
-                text(dst, 314, y, label, 0xFFE2E8F0, 1);
-            }
-        }
-        Some(ToolbarPopup::Display) => {
-            rect(dst, 476, TOOLBAR_HEIGHT, 190, 71, 0xFF172334);
-            rect(dst, 476, TOOLBAR_HEIGHT, 190, 1, 0xFF4A607C);
-            for (n, label) in ["BORDERLESS FULLSCREEN", "DECORATED FULLSCREEN", "WINDOWED"].iter().enumerate() {
-                text(dst, 486, TOOLBAR_HEIGHT + 7 + n * 21, label, 0xFFE2E8F0, 1);
-            }
-        }
-        None => {}
+pub fn render_boot_details(
+    dst: &mut [u32], width: usize, height: usize, view: (usize, usize, usize, usize),
+    title: &str, details: &DiscDetails, synopsis: Option<&str>,
+) {
+    let mut canvas = NativeCanvas::overlay(dst, width, height, view);
+    if let Some(logo) = &details.logo {
+        canvas.art_fit(logo, 270, 32, 228, 76);
+    } else {
+        canvas.centered_text(W / 2, 53, &short_title(title, 32), 0xFFF1F5FA, 2);
     }
+    if let Some(boxart) = &details.boxart { canvas.art_fit(boxart, 25, 34, 211, 235); }
+    if let Some(back) = &details.back { canvas.art_fit(back, 25, 288, 211, 232); }
+    let Some(synopsis) = synopsis else { return; };
+    let x = 514;
+    let right = width.saturating_sub((view.2 * 24 / W).max(12)).min(canvas.x(x + 420));
+    let bottom = canvas.y(486).min(height);
+    if right.saturating_sub(canvas.x(x)) < 72 || bottom <= canvas.y(73) { return; }
+    canvas.labels.push(NativeLabel {
+        x,
+        y: 73,
+        value: format!("Synopsis\n\n{synopsis}"),
+        color: 0xFFD8E2EE,
+        scale: 1,
+        bounds: Some((right, bottom)),
+        centered: false,
+    });
 }
 
-fn toolbar_button(dst: &mut [u32], x: usize, y: usize, w: usize, label: &str, kind: usize) {
-    let icon_x = x + w / 2 - 7;
-    let icon_y = y;
-    let color = if kind == 5 { 0xFFFF7777 } else { 0xFF9ECFFF };
-    match kind {
-        0 | 2 => {
-            rect(dst, icon_x, icon_y + 3, 14, 9, color);
-            rect(dst, icon_x + 1, icon_y + 1, 6, 3, color);
-            rect(dst, icon_x + 2, icon_y + 6, 10, 4, 0xFF0C1421);
-        }
-        1 => {
-            rect(dst, icon_x + 1, icon_y + 3, 12, 8, color);
-            rect(dst, icon_x + 3, icon_y + 5, 2, 2, 0xFF0C1421);
-            rect(dst, icon_x + 10, icon_y + 5, 2, 2, 0xFF0C1421);
-            rect(dst, icon_x + 5, icon_y + 7, 4, 2, 0xFF0C1421);
-        }
-        3 => {
-            rect(dst, icon_x + 3, icon_y + 1, 8, 2, color);
-            rect(dst, icon_x + 11, icon_y + 3, 2, 5, color);
-            rect(dst, icon_x + 4, icon_y + 9, 8, 2, color);
-            rect(dst, icon_x + 1, icon_y + 5, 2, 5, color);
-        }
-        4 => {
-            rect(dst, icon_x + 1, icon_y + 1, 12, 9, color);
-            rect(dst, icon_x + 3, icon_y + 3, 8, 5, 0xFF0C1421);
-            rect(dst, icon_x + 6, icon_y + 10, 3, 2, color);
-        }
-        _ => {
-            rect(dst, icon_x + 2, icon_y + 1, 2, 11, color);
-            rect(dst, icon_x + 4, icon_y + 1, 8, 2, color);
-            rect(dst, icon_x + 8, icon_y + 4, 2, 7, color);
-            rect(dst, icon_x + 5, icon_y + 8, 5, 2, color);
-        }
-    }
-    text(dst, x + w / 2 - label.len() * 3, y + 17, label, if kind == 5 { 0xFFFF9A9A } else { 0xFFD2DCE8 }, 1);
-}
-
-pub fn toolbar_hit(x: usize, y: usize, popup: Option<ToolbarPopup>) -> Option<ToolbarAction> {
+pub fn toolbar_hit(x: usize, y: usize, popup: Option<ToolbarPopup>, optical_disc: Option<char>) -> Option<ToolbarAction> {
     if let Some(popup) = popup {
-        if popup == ToolbarPopup::Paths && (229..457).contains(&x) && (TOOLBAR_HEIGHT..TOOLBAR_HEIGHT + 148).contains(&y) {
+        if popup == ToolbarPopup::Paths && toolbar_popup_hit(x, y, Some(popup)) {
             return match y.saturating_sub(TOOLBAR_HEIGHT + 10) / 22 {
                 0 => Some(ToolbarAction::AddDiscFolder), 1 => Some(ToolbarAction::SetCovers), 2 => Some(ToolbarAction::SetCd),
-                3 => Some(ToolbarAction::SetBezels), 4 => Some(ToolbarAction::DownloadArtwork), 5 => Some(ToolbarAction::Refresh), _ => None,
+                3 => Some(ToolbarAction::SetBezels), _ => None,
             };
         }
-        if popup == ToolbarPopup::Display && (427..633).contains(&x) && (TOOLBAR_HEIGHT..TOOLBAR_HEIGHT + 82).contains(&y) {
+        if popup == ToolbarPopup::Display && toolbar_popup_hit(x, y, Some(popup)) {
             return match y.saturating_sub(TOOLBAR_HEIGHT + 8) / 22 { 0 => Some(ToolbarAction::Borderless), 1 => Some(ToolbarAction::Decorated), 2 => Some(ToolbarAction::Windowed), _ => None };
         }
     }
     if y >= TOOLBAR_HEIGHT { return None; }
     match x {
         12..=111 => Some(ToolbarAction::OpenDisc), 116..=224 => Some(ToolbarAction::Controller),
-        229..=321 => Some(ToolbarAction::Paths), 326..=422 => Some(ToolbarAction::Refresh),
-        427..=539 => Some(ToolbarAction::Display), 676..=760 => Some(ToolbarAction::Exit), _ => None,
+        229..=321 => Some(ToolbarAction::Paths), 326..=422 => Some(ToolbarAction::Display),
+        427..=539 => Some(ToolbarAction::About), 550..=664 => optical_disc.map(ToolbarAction::PlayDisc), 676..=760 => Some(ToolbarAction::Exit), _ => None,
     }
 }
 
@@ -648,7 +870,7 @@ pub fn pause_menu_hit_full(x: usize, y: usize, width: usize, height: usize) -> O
     (0..5).find(|row|{let top=start+row*step;(top..top+row_h).contains(&by)})
 }
 
-pub fn render_pause_menu_full(dst: &mut [u32], width: usize, height: usize, title: &str, selected: usize) {
+pub fn render_pause_menu_full(dst: &mut [u32], width: usize, height: usize, title: &str, logo: Option<&Artwork>, selected: usize) {
     if width == 0 || height == 0 || dst.len() < width.saturating_mul(height) { return; }
     let src=dst[..width*height].to_vec();
     for by in (0..height).step_by(8){for bx in (0..width).step_by(8){
@@ -661,11 +883,14 @@ pub fn render_pause_menu_full(dst: &mut [u32], width: usize, height: usize, titl
     c.round_rect(145,89,478,390,17,0x99000000);
     c.round_rect(140,84,478,390,17,0xFF111D2B);
     c.round_rect(140,84,478,3,2,0xFF63B6F5);
-    c.ring(166,119,10,0xFF80C6F8);c.rect(163,113,3,12,0xFF80C6F8);c.rect(169,113,3,12,0xFF80C6F8);
-    c.text(186,101,"Game Paused",0xFFF1F5FA,2);
-    let clean:String=title.chars().take(40).collect();c.text(186,132,&clean,0xFFB6C9DD,1);
-    c.text(163,160,"Press the pause button again to resume",0xFF91A6BC,1);
-    let labels=["Resume","Save State","Load State","Controller Settings","Stop and Return to Library"];
+    c.centered_text(W / 2, 100, "Game Paused", 0xFFF1F5FA, 2);
+    if let Some(logo) = logo {
+        c.art_fit(logo, 270, 124, 228, 39);
+    } else {
+        c.centered_text(W / 2, 132, &short_title(title, 40), 0xFFB6C9DD, 1);
+    }
+    c.centered_text(W / 2, 176, "Press the pause button again to resume", 0xFF91A6BC, 1);
+    let labels = ["Info", "Save State", "Load State", "Controller Settings", "Stop and Return to Library"];
     let icons=[0usize,1,2,3,4];
     for(row,label)in labels.iter().enumerate(){
         let y=205+row*48;let active=row==selected;
@@ -673,7 +898,7 @@ pub fn render_pause_menu_full(dst: &mut [u32], width: usize, height: usize, titl
         else{c.round_rect(154,y,450,40,8,0xFF1B2A3C);}
         let ic=if active{0xFFF4F9FE}else{0xFFB9CBE0};let ix=174;let iy=y+15;
         match icons[row]{
-            0=>{c.rect(ix,iy-7,3,14,ic);c.rect(ix+7,iy-7,3,14,ic);},
+            0=>{c.ring(ix+4,iy,8,ic);c.rect(ix+3,iy-4,2,2,ic);c.rect(ix+3,iy,2,5,ic);},
             1=>{c.round_rect(ix-5,iy-7,16,15,3,ic);c.rect(ix-2,iy-4,10,5,0xFF1B2A3C);c.rect(ix-2,iy+4,10,4,0xFF1B2A3C);},
             2=>{c.round_rect(ix-5,iy-7,16,15,3,ic);c.rect(ix-2,iy-4,10,9,0xFF1B2A3C);c.rect(ix,iy-2,2,6,ic);c.rect(ix+4,iy-2,2,6,ic);},
             3=>{c.round_rect(ix-6,iy-6,18,13,6,ic);c.rect(ix-3,iy-1,3,2,0xFF1B2A3C);c.rect(ix+5,iy-1,3,2,0xFF1B2A3C);},
@@ -681,7 +906,6 @@ pub fn render_pause_menu_full(dst: &mut [u32], width: usize, height: usize, titl
         }
         c.text(201,y+12,label,if active{0xFFFFFFFF}else{0xFFE1E8F1},1);
     }
-    c.line(160,455,438,0xFF2A3A4D);c.text(165,461,"Press Guide / Home again to resume",0xFF91A6BC,1);
 }
 
 fn rect_full(dst: &mut [u32], width: usize, height: usize, x: usize, y: usize, w: usize, h: usize, color: u32) {
@@ -738,21 +962,6 @@ fn blit_rotated(dst: &mut [u32], art: &Artwork, cx: i32, cy: i32, size: i32, ang
     }}
 }
 
-fn fallback_spinner(dst: &mut [u32], cx: i32, cy: i32, radius: i32, angle: f32) {
-    for y in -radius..radius { for x in -radius..radius {
-        let d2 = x*x + y*y; if d2 > radius*radius || d2 < 11*11 { continue; }
-        let a = (y as f32).atan2(x as f32); let diff = (a-angle).sin().abs();
-        let radial = ((d2 as f32).sqrt() as i32 / 9) % 2;
-        let shade = if diff < 0.14 { 220 } else if radial == 0 { 132 } else { 76 };
-        let px=cx+x; let py=cy+y;
-        if px >= 0 && py >= 0 && (px as usize) < W && (py as usize) < H {
-            dst[py as usize * W + px as usize] = 0xFF000000 | (shade << 16) | (shade << 8) | shade;
-        }
-    }}
-    rect(dst, (cx-12) as usize, (cy-12) as usize, 24, 24, 0xFF555B62);
-    rect(dst, (cx-5) as usize, (cy-5) as usize, 10, 10, 0xFF000000);
-}
-
 pub(crate) fn blit_fit(dst: &mut [u32], art: &Artwork, x: usize, y: usize, w: usize, h: usize) {
     let scale = (w as f32 / art.w as f32).min(h as f32 / art.h as f32);
     let rw = (art.w as f32 * scale).max(1.0) as usize; let rh = (art.h as f32 * scale).max(1.0) as usize;
@@ -788,23 +997,6 @@ fn sample_bilinear(art: &Artwork, x: f32, y: f32) -> u32 {
     let g = (green / alpha).round().clamp(0.0, 255.0) as u32;
     let b = (blue / alpha).round().clamp(0.0, 255.0) as u32;
     (a << 24) | (r << 16) | (g << 8) | b
-}
-
-fn fallback_cover(dst: &mut [u32], x: usize, y: usize, w: usize, h: usize) {
-    rect(dst, x, y, w, h, 0xFF303B49);
-    rect(dst, x + 4, y + 4, w - 8, h - 8, 0xFF202B39);
-    rect(dst, x + 10, y + 10, 3, h - 20, 0xFF596675);
-    let cx = x + w / 2;
-    let cy = y + h / 2 - 8;
-    let r = 30i32;
-    for dy in -r..=r { for dx in -r..=r {
-        let d = dx * dx + dy * dy;
-        if d <= r * r && d >= 9 * 9 {
-            let px = (cx as i32 + dx) as usize; let py = (cy as i32 + dy) as usize;
-            dst[py * W + px] = if (dx + dy).rem_euclid(9) < 2 { 0xFF96A3B0 } else { 0xFF536170 };
-        }
-    }}
-    text(dst, x + 18, y + h - 29, "NO COVER", 0xFFB9C3CF, 1);
 }
 
 pub(crate) fn blend(src: u32, dst: u32, a: u32) -> u32 {
@@ -857,4 +1049,124 @@ pub fn slot_at(x: usize, y: usize, art_size: u8) -> Option<usize> {
     let dx = x.checked_sub(l.left)?;
     let col = dx / (l.cell_w + l.gap);
     if col >= l.columns || dx % (l.cell_w + l.gap) >= l.cell_w { None } else { Some(row * l.columns + col) }
+}
+
+#[cfg(test)]
+mod library_tests {
+    use super::*;
+
+    #[test]
+    fn search_filters_titles_and_filenames_without_losing_source_items() {
+        let items = [
+            Item { path: "Shadoan (Europe).chd".into(), title: "Kingdom II".into(), cover: None, disc: None, logo: None },
+            Item { path: "Dragons Lair (EUR).chd".into(), title: "Dragon’s Lair".into(), cover: None, disc: None, logo: None },
+            Item { path: "Flashback (Europe).chd".into(), title: "Flashback".into(), cover: None, disc: None, logo: None },
+        ];
+        let mut search = Search::default();
+        assert!(search.insert("SHADOAN kingdom"));
+        search.rebuild(&items);
+        assert_eq!(search.len(&items), 1);
+        assert_eq!(search.get(&items, 0).unwrap().path, items[0].path);
+        search.clear();
+        assert!(search.insert("dragon's-lair"));
+        search.rebuild(&items);
+        assert_eq!(search.position(&items, &items[1].path), Some(0));
+        search.clear();
+        assert!(search.insert("does not exist"));
+        search.rebuild(&items);
+        assert!(search.get(&items, 0).is_none());
+        search.clear();
+        search.rebuild(&items);
+        assert_eq!(search.len(&items), 3);
+    }
+
+    #[test]
+    fn search_editing_handles_multibyte_text() {
+        let mut search = Search::default();
+        assert!(search.insert("Café"));
+        search.move_caret(false);
+        assert!(search.delete(false));
+        assert_eq!(search.query, "Caf");
+        search.select_all = true;
+        assert!(search.insert("CD-i"));
+        assert_eq!(search.query, "CD-i");
+        assert_eq!(search_hit(689, 70), Some(true));
+        assert_eq!(search_hit(500, 70), Some(false));
+        assert_eq!(search_hit(500, 90), None);
+    }
+
+    #[test]
+    fn smallest_grid_exposes_forty_clickable_slots() {
+        let l = layout(ART_SIZE_MIN);
+        assert_eq!((l.columns, l.rows), (10, 4));
+        for slot in 0..40 {
+            let x = l.left + (slot % l.columns) * (l.cell_w + l.gap);
+            let y = l.top + (slot / l.columns) * (l.cell_h + l.gap);
+            assert_eq!(slot_at(x, y, ART_SIZE_MIN), Some(slot));
+        }
+        assert!(l.top + l.rows * l.cell_h + (l.rows - 1) * l.gap < H - 64);
+    }
+
+    #[test]
+    fn play_disc_toolbar_action_requires_detected_media() {
+        assert!(toolbar_hit(575, 16, None, None).is_none());
+        assert!(toolbar_hit(575, 16, None, Some('F')) == Some(ToolbarAction::PlayDisc('F')));
+    }
+
+    #[test]
+    fn toolbar_uses_new_positions_and_paths_has_four_actions() {
+        assert!(toolbar_hit(350, 16, None, None) == Some(ToolbarAction::Display));
+        assert!(toolbar_hit(455, 16, None, None) == Some(ToolbarAction::About));
+        for (row, action) in [ToolbarAction::AddDiscFolder, ToolbarAction::SetCovers,
+            ToolbarAction::SetCd, ToolbarAction::SetBezels].into_iter().enumerate() {
+            assert!(toolbar_hit(250, TOOLBAR_HEIGHT + 12 + row * 22, Some(ToolbarPopup::Paths), None) == Some(action));
+        }
+        assert!(toolbar_hit(250, TOOLBAR_HEIGHT + 12 + 4 * 22, Some(ToolbarPopup::Paths), None).is_none());
+        assert!(about_close_hit(560, 378));
+    }
+
+    #[test]
+    fn rescan_detects_discs_added_and_removed_in_subfolders() {
+        let root = std::env::temp_dir().join(format!("opencdi-library-scan-{}", std::process::id()));
+        let discs = root.join("Discs");
+        let path = discs.join("Example.chd");
+        std::fs::create_dir_all(&discs).unwrap();
+        assert!(scan_paths(std::slice::from_ref(&root)).is_empty());
+        std::fs::write(&path, []).unwrap();
+        assert_eq!(scan_paths(std::slice::from_ref(&root)), [path.clone()]);
+        std::fs::remove_file(path).unwrap();
+        assert!(scan_paths(std::slice::from_ref(&root)).is_empty());
+        std::fs::remove_dir(discs).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn boot_synopsis_wraps_to_the_right_in_windowed_and_wide_views() {
+        let summary = "Conrad must travel across four planets and return to Earth to stop the aliens. ".repeat(8);
+        for (width, height, view) in [(W, H, (0, 0, W, H)), (1920, 1080, (219, 0, 1481, 1080))] {
+            let mut pixels = vec![0; width * height];
+            render_boot_details(&mut pixels, width, height, view, "", &DiscDetails::default(), Some(&summary));
+            let disc_right = view.0 + 490 * view.2 / W;
+            let text_middle = view.1 + 279 * view.3 / H;
+            assert!(pixels.chunks_exact(width).all(|row| row[..disc_right].iter().all(|&pixel| pixel == 0)));
+            assert!(pixels.chunks_exact(width).skip(text_middle.saturating_sub(35)).take(70).any(|row| row.iter().any(|&pixel| pixel != 0)));
+        }
+    }
+
+    #[test]
+    fn missing_cover_keeps_its_title_without_a_box() {
+        let mut pixels = vec![0; W * H];
+        let item = Item { path: "Example.chd".into(), title: "Example".into(), cover: None, disc: None, logo: None };
+        render_native(&mut pixels, W, H, (0, 0, W, H), &[item], 0, ART_SIZE_MIN, true, DisplayMode::Windowed, None, None, &Search::default());
+        let l = layout(ART_SIZE_MIN);
+        assert_eq!(pixels[(l.top + 5) * W + l.left + 1], pixels[(l.top + 5) * W + l.left - 1]);
+        assert_eq!(MISSING_COVER.w, 680);
+        assert_eq!(MISSING_DISC.w, 635);
+        assert_eq!(MISSING_DISC.pixels[0] >> 24, 0);
+        assert!(pixels.iter().any(|&pixel| pixel & 0xFFFFFF == 0xFFFFFF));
+        render_boot(&mut pixels, None, 0);
+        assert_eq!(pixels[254 * W + W / 2], 0xFF000000);
+        assert_ne!(pixels[254 * W + W / 2 + 70], 0xFF000000);
+        assert_eq!(wrap_title("Brain Dead 13", 9), ("Brain".into(), "Dead 13".into()));
+    }
 }

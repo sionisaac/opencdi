@@ -142,7 +142,7 @@ pub fn render_native(dst:&mut [u32],width:usize,height:usize,view:(usize,usize,u
     let mut c=library::NativeCanvas::new(dst,width,height,view);
     for y in 0..library::H { let t=y as u32*8/library::H as u32;c.rect(0,y,library::W,1,0xFF000000|((11+t)<<16)|((20+t)<<8)|(34+t*2)); }
     c.rect(0,0,library::W,42,0xFF0C1726);c.rect(0,41,library::W,1,0xFF26374A);
-    c.round_rect(12,8,112,26,7,0xFF1D2D40);c.text(21,15,"<  Back to Library",0xFFD9E4EF,1);
+    c.round_rect(12,8,112,26,7,0xFF1D2D40);c.text(21,15,"<  Back",0xFFD9E4EF,1);
     c.text(20,54,"Controller Settings",0xFFF1F5FA,2);
     c.round_rect(14,92,338,300,12,0xFF131F2E);c.round_rect(364,92,390,300,12,0xFF131F2E);
     c.text(28,106,if mode==InputDeviceMode::Mouse{"CD-i Mouse"}else{"CD-i Gamepad"},0xFFEAF0F6,1);

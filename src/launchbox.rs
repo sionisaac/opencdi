@@ -18,13 +18,13 @@ const IMAGE_MAX_BYTES: usize = 24 * 1024 * 1024;
 #[derive(Clone)]
 pub struct FetchTarget {
     pub title: String,
-    pub cover_missing: bool,
-    pub disc_missing: bool,
+    pub missing: HashSet<ArtworkKind>,
     pub download_all: bool,
+    pub synopsis_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Default)]
-struct GameRecord { id: String, title: String, platform: String }
+struct GameRecord { id: String, title: String, platform: String, overview: String }
 
 #[derive(Default)]
 struct ImageRecord { id: String, file: String, kind: String, region: String }
@@ -32,50 +32,101 @@ struct ImageRecord { id: String, file: String, kind: String, region: String }
 #[derive(Default)]
 struct ParsedRecords { games: Vec<GameRecord>, images: Vec<ImageRecord> }
 
-pub fn fetch_missing_artwork(targets: &[FetchTarget], artwork_root: &Path, cache_dir: &Path) -> usize {
-    let pending: Vec<_> = targets.iter().filter(|t| t.cover_missing || t.disc_missing || t.download_all).cloned().collect();
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ArtworkKind { Cover, Disc, Boxart, Back, Logo }
+
+impl ArtworkKind {
+    pub const ALL: [Self; 5] = [Self::Cover, Self::Disc, Self::Boxart, Self::Back, Self::Logo];
+
+    pub fn folder(self) -> &'static str {
+        match self {
+            Self::Cover => "Covers",
+            Self::Disc => "CD",
+            Self::Boxart => "Boxart",
+            Self::Back => "Back",
+            Self::Logo => "Logo",
+        }
+    }
+
+    pub fn filename(self, title: &str, extension: &str) -> String {
+        let suffix = if self == Self::Disc { "-disc" } else { "" };
+        format!("{}{suffix}.{extension}", safe_name(title))
+    }
+}
+
+pub fn fetch_missing_artwork(
+    targets: &[FetchTarget],
+    artwork_root: &Path,
+    cache_dir: &Path,
+    mut image_ready: impl FnMut(&str, ArtworkKind, &Path),
+    prefer_artwork: impl FnOnce(&mut [FetchTarget], &mut dyn FnMut(&str, ArtworkKind, &Path)),
+) -> usize {
+    let media_marks = cache_dir.join("LaunchBox-Media");
+    let marker = |title: &str| media_marks.join(format!("{}.done", safe_name(title)));
+    let needs_media = |target: &FetchTarget| !marker(&target.title).is_file();
+    let mut pending: Vec<_> = targets.iter().filter(|t| !t.missing.is_empty() || t.download_all || t.synopsis_path.is_some() || needs_media(t)).cloned().collect();
     if pending.is_empty() { return 0; }
-    let covers_dir = artwork_root.join("Covers");
-    let discs_dir = artwork_root.join("CD");
     let bezels_dir = artwork_root.join("Bezels");
     let media_dir = artwork_root.join("LaunchBox");
-    if fs::create_dir_all(&covers_dir).is_err() || fs::create_dir_all(&discs_dir).is_err() || fs::create_dir_all(&bezels_dir).is_err() || fs::create_dir_all(&media_dir).is_err() || fs::create_dir_all(cache_dir).is_err() { return 0; }
-    let archive = cache_dir.join("LaunchBox-Metadata.zip");
-    if !metadata_is_fresh(&archive) {
-        let Some(bytes) = http_get(METADATA_URL, METADATA_MAX_BYTES) else { log::warn!("LaunchBox artwork lookup could not reach its metadata archive"); return 0; };
-        let tmp = archive.with_extension("zip.download");
-        if fs::write(&tmp, bytes).is_err() || fs::rename(&tmp, &archive).is_err() {
-            let _ = fs::remove_file(&tmp);
-            log::warn!("LaunchBox metadata archive could not be cached");
-            return 0;
-        }
-    }
-    let Ok(zip) = fs::read(&archive) else { return 0 };
-    let Some(entries) = zip_entries(&zip) else { log::warn!("LaunchBox metadata archive could not be read"); return 0; };
-    let wanted: HashSet<String> = HashSet::new();
-    let mut records = ParsedRecords::default();
-    for entry in &entries {
-        if !entry.name.to_ascii_lowercase().ends_with(".xml") || entry.uncompressed_size > 512 * 1024 * 1024 { continue; }
-        let Some(stream) = entry.open(&zip) else { continue; };
-        parse_xml(&mut io::BufReader::new(stream), &wanted, &HashSet::new(), &mut records);
-    }
-    records.games.retain(|g| g.platform.to_ascii_lowercase().contains("philips cd-i"));
-    let mut matched: HashMap<String, Vec<String>> = HashMap::new();
-    for target in &pending {
-        let key = normalize_title(&target.title);
-        let mut exact: Vec<String> = records.games.iter().filter(|g| normalize_title(&g.title) == key).map(|g| g.id.clone()).filter(|id| !id.is_empty()).collect();
-        exact.sort(); exact.dedup();
-        if exact.is_empty() {
-            let mut scored: Vec<(f32, &GameRecord)> = records.games.iter().filter(|g| !g.id.is_empty()).map(|g| (title_similarity(&key, &normalize_title(&g.title)), g)).collect();
-            scored.sort_by(|a, b| b.0.total_cmp(&a.0));
-            if let Some((score, game)) = scored.first().copied() {
-                let next = scored.get(1).map(|v| v.0).unwrap_or(0.0);
-                if score >= 0.90 && score - next >= 0.04 { exact.push(game.id.clone()); }
+    // Resolve and publish synopsis text before any network-heavy artwork work.
+    let prepared = (|| {
+        if fs::create_dir_all(&bezels_dir).is_err() || fs::create_dir_all(&media_dir).is_err() || fs::create_dir_all(cache_dir).is_err() { return None; }
+        let archive = cache_dir.join("LaunchBox-Metadata.zip");
+        if !metadata_is_fresh(&archive) {
+            if let Some(bytes) = http_get(METADATA_URL, METADATA_MAX_BYTES) {
+                let tmp = archive.with_extension("zip.download");
+                if fs::write(&tmp, bytes).and_then(|_| fs::rename(&tmp, &archive)).is_err() {
+                    let _ = fs::remove_file(&tmp);
+                    log::warn!("LaunchBox metadata archive could not be refreshed");
+                }
+            } else if !archive.is_file() {
+                log::warn!("LaunchBox metadata archive is unavailable");
+                return None;
             }
         }
-        if !exact.is_empty() { matched.insert(key, exact); }
-    }
-    if matched.is_empty() { log::info!("LaunchBox has no confident Philips CD-i title matches for missing artwork"); return 0; }
+        let zip = fs::read(&archive).ok()?;
+        let Some(entries) = zip_entries(&zip) else { log::warn!("LaunchBox metadata archive could not be read"); return None; };
+        let wanted: HashSet<String> = HashSet::new();
+        let mut records = ParsedRecords::default();
+        for entry in &entries {
+            if !entry.name.to_ascii_lowercase().ends_with(".xml") || entry.uncompressed_size > 512 * 1024 * 1024 { continue; }
+            let Some(stream) = entry.open(&zip) else { continue; };
+            parse_xml(&mut io::BufReader::new(stream), &wanted, &HashSet::new(), &mut records);
+        }
+        records.games.retain(|g| g.platform.to_ascii_lowercase().contains("philips cd-i"));
+        let mut matched: HashMap<String, Vec<String>> = HashMap::new();
+        for target in &pending {
+            let key = normalize_title(&target.title);
+            let mut exact: Vec<String> = records.games.iter().filter(|g| normalize_title(&g.title) == key).map(|g| g.id.clone()).filter(|id| !id.is_empty()).collect();
+            if exact.is_empty() && let Some(game_id) = crate::screenscraper::public_game_id(&target.title) {
+                exact.extend(records.games.iter().filter(|game| !game.id.is_empty()
+                    && crate::screenscraper::public_game_id(&game.title) == Some(game_id))
+                    .map(|game| game.id.clone()));
+            }
+            exact.sort(); exact.dedup();
+            if exact.is_empty() {
+                let mut scored: Vec<(f32, &GameRecord)> = records.games.iter().filter(|g| !g.id.is_empty()).map(|g| (title_similarity(&key, &normalize_title(&g.title)), g)).collect();
+                scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+                if let Some((score, game)) = scored.first().copied() {
+                    let next = scored.get(1).map(|v| v.0).unwrap_or(0.0);
+                    if score >= 0.90 && score - next >= 0.04 { exact.push(game.id.clone()); }
+                }
+            }
+            if !exact.is_empty() { matched.insert(key, exact); }
+        }
+        if matched.is_empty() { return None; }
+        for target in &pending {
+            let Some(path) = target.synopsis_path.as_deref() else { continue; };
+            let Some(ids) = matched.get(&normalize_title(&target.title)).filter(|ids| ids.len() == 1) else { continue; };
+            if let Some(game) = records.games.iter().find(|game| game.id == ids[0] && !game.overview.trim().is_empty()) {
+                crate::synopsis::save(path, &game.overview);
+            }
+        }
+        Some((zip, entries, records, matched))
+    })();
+    prefer_artwork(&mut pending, &mut image_ready);
+    let Some((zip, entries, mut records, matched)) = prepared else { return 0; };
+    if !pending.iter().any(|t| !t.missing.is_empty() || t.download_all || needs_media(t)) { return 0; }
     let ids: HashSet<String> = matched.values().flatten().cloned().collect();
     records.images.clear();
     for entry in &entries {
@@ -84,40 +135,62 @@ pub fn fetch_missing_artwork(targets: &[FetchTarget], artwork_root: &Path, cache
         parse_xml(&mut io::BufReader::new(stream), &HashSet::new(), &ids, &mut records);
     }
     let mut saved = 0;
-    for target in pending {
+    let mut extras = Vec::new();
+    let mut completed_media = HashMap::new();
+    for target in pending.iter().filter(|t| !t.missing.is_empty() || t.download_all || needs_media(t)) {
         let key = normalize_title(&target.title);
         let Some(game_ids) = matched.get(&key) else { continue };
         for game_id in game_ids {
             let candidates: Vec<&ImageRecord> = records.images.iter().filter(|i| i.id == *game_id).collect();
-            if target.cover_missing || target.download_all {
-                if let Some(image) = choose_image(&candidates, true, &target.title) {
-                    if download_image(image, &covers_dir.join(format!("{}.{}", safe_name(&target.title), extension(&image.file)))) { saved += 1; }
+            for kind in ArtworkKind::ALL {
+                if !target.missing.contains(&kind) && !target.download_all { continue; }
+                if let Some(image) = choose_image(&candidates, kind, &target.title) {
+                    let path = artwork_root.join(kind.folder()).join(kind.filename(&target.title, extension(&image.file)));
+                    let restored = supplemental_path(&media_dir, &bezels_dir, &target.title, image)
+                        .and_then(|cached| fs::read(cached).ok())
+                        .is_some_and(|bytes| crate::synopsis::publish_new(&path, &bytes));
+                    if restored || download_image(image, &path) {
+                        saved += 1;
+                        image_ready(&target.title, kind, &path);
+                    }
                 }
             }
-            if target.disc_missing || target.download_all {
-                if let Some(image) = choose_image(&candidates, false, &target.title) {
-                    if download_image(image, &discs_dir.join(format!("{}-disc.{}", safe_name(&target.title), extension(&image.file)))) { saved += 1; }
-                }
+            if needs_media(target) || target.download_all {
+                extras.push((target, candidates));
             }
-            let mut stored = HashSet::new();
-            for image in candidates.iter().copied() {
-                if !supported_image(&image.file) || image.kind.is_empty() { continue; }
-                let filename = image.file.rsplit('/').next().unwrap_or(&image.file);
-                let filename_stem = Path::new(filename).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "image".to_string());
-                let prefix = safe_name(&target.title);
-                let unique = format!("{}--{}", prefix, safe_name(&filename_stem));
-                if !stored.insert(unique.clone()) { continue; }
-                let kind = image.kind.to_ascii_lowercase();
-                let target_dir = if kind.contains("disc") { media_dir.join("Disc") }
-                    else if kind.contains("fanart - background") || kind == "background" { bezels_dir.clone() }
-                    else { media_dir.join(safe_name(&image.kind)) };
-                let destination = target_dir.join(format!("{}.{}", unique, extension(&image.file)));
-                if download_image(image, &destination) { saved += 1; }
-            }
+        }
+    }
+    // Fill the library and boot screen before downloading supplemental media.
+    for (target, candidates) in extras {
+        let mut stored = HashSet::new();
+        let mut complete = !candidates.is_empty();
+        for image in candidates.iter().copied() {
+            if !supported_image(&image.file) || image.kind.is_empty() { continue; }
+            let Some(destination) = supplemental_path(&media_dir, &bezels_dir, &target.title, image) else { continue; };
+            if !stored.insert(destination.clone()) { continue; }
+            if download_image(image, &destination) { saved += 1; }
+            complete &= destination.is_file();
+        }
+        *completed_media.entry(&target.title).or_insert(true) &= complete;
+    }
+    if fs::create_dir_all(&media_marks).is_ok() {
+        for (title, complete) in completed_media {
+            if complete { let _ = fs::write(marker(title), []); }
         }
     }
     log::info!("LaunchBox artwork lookup saved {} image(s)", saved);
     saved
+}
+
+fn supplemental_path(media_dir: &Path, bezels_dir: &Path, title: &str, image: &ImageRecord) -> Option<std::path::PathBuf> {
+    if !supported_image(&image.file) || image.kind.is_empty() { return None; }
+    let filename = image.file.rsplit('/').next()?;
+    let stem = Path::new(filename).file_stem()?.to_str()?;
+    let kind = image.kind.to_ascii_lowercase();
+    let folder = if kind.contains("disc") { media_dir.join("Disc") }
+        else if kind.contains("fanart - background") || kind == "background" { bezels_dir.to_path_buf() }
+        else { media_dir.join(safe_name(&image.kind)) };
+    Some(folder.join(format!("{}--{}.{}", safe_name(title), safe_name(stem), extension(&image.file))))
 }
 
 fn metadata_is_fresh(path: &Path) -> bool {
@@ -126,7 +199,9 @@ fn metadata_is_fresh(path: &Path) -> bool {
     SystemTime::now().duration_since(modified).unwrap_or(Duration::MAX) < Duration::from_secs(24 * 60 * 60)
 }
 
-fn normalize_title(s: &str) -> String {
+pub(crate) fn normalize_title(s: &str) -> String {
+    let s = s.trim();
+    let s = s.rsplit_once('.').filter(|(_, ext)| matches!(ext.to_ascii_lowercase().as_str(), "chd" | "cue" | "iso" | "bin")).map(|(stem, _)| stem).unwrap_or(s);
     let mut normalized = String::new();
     let mut chars = s.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -135,10 +210,25 @@ fn normalize_title(s: &str) -> String {
             let mut tag = String::new();
             while let Some(c) = chars.next() { if c == closing { break; } tag.push(c); }
             let tag_l = tag.to_ascii_lowercase();
-            let is_dump_tag = ["usa", "europe", "european", "japan", "japanese", "world", "disc", "disk", "cd", "track", "rev", "revision", "version", "beta", "proto", "demo", "pal", "ntsc", "en,", "fr,", "de,"]
+            let is_dump_tag = ["usa", "eur", "europe", "european", "japan", "japanese", "world", "disc", "disk", "cd", "dvc", "track", "rev", "revision", "version", "beta", "proto", "demo", "pal", "ntsc", "en,", "fr,", "de,"]
                 .iter().any(|needle| tag_l.contains(needle));
             if !is_dump_tag { normalized.extend(tag.chars().filter(|c| c.is_alphanumeric()).map(|c| c.to_ascii_lowercase())); }
         } else if ch.is_alphanumeric() { normalized.push(ch.to_ascii_lowercase()); }
+    }
+    // This dump-set subtitle is not part of LaunchBox's title.
+    if normalized == "7thguestthethegame" { return "the7thguest".into(); }
+    // Dump names commonly sort the article after the title ("7th Guest, The").
+    if s.to_ascii_lowercase().contains(", the") {
+        if normalized.ends_with("the") { normalized.truncate(normalized.len() - 3); normalized.insert_str(0, "the"); }
+    }
+    for article in ["a", "an"] {
+        if s.rsplit_once(',').is_some_and(|(_, suffix)| suffix.trim().split(['(', '[']).next().is_some_and(|part| part.trim().eq_ignore_ascii_case(article)))
+            && normalized.ends_with(article)
+        {
+            normalized.truncate(normalized.len() - article.len());
+            normalized.insert_str(0, article);
+            break;
+        }
     }
     normalized
 }
@@ -166,14 +256,19 @@ fn supported_image(file: &str) -> bool {
     file.rsplit_once('.').map(|(_, ext)| matches!(ext.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg")).unwrap_or(false)
 }
 
-fn choose_image<'a>(images: &[&'a ImageRecord], cover: bool, title: &str) -> Option<&'a ImageRecord> {
-    let priorities: &[&str] = if cover { &["Box - Front", "Box - Front - Reconstructed", "Fanart - Box - Front", "Box - 3D"] }
-        else { &["Disc", "Fanart - Disc"] };
+fn choose_image<'a>(images: &[&'a ImageRecord], kind: ArtworkKind, title: &str) -> Option<&'a ImageRecord> {
+    let priorities: &[&str] = match kind {
+        ArtworkKind::Cover => &["Box - Front", "Box - Front - Reconstructed", "Fanart - Box - Front"],
+        ArtworkKind::Disc => &["Disc", "Fanart - Disc"],
+        ArtworkKind::Boxart => &["Box - 3D"],
+        ArtworkKind::Back => &["Box - Back", "Box - Back - Reconstructed", "Fanart - Box - Back"],
+        ArtworkKind::Logo => &["Clear Logo"],
+    };
     let region = title.to_ascii_lowercase();
     for kind in priorities {
         let candidates: Vec<_> = images.iter().copied().filter(|i| i.kind.eq_ignore_ascii_case(kind) && supported_image(&i.file)).collect();
         if candidates.is_empty() { continue; }
-        if region.contains("(europe") || region.contains("(uk") {
+        if region.contains("(eur") || region.contains("(uk") {
             if let Some(i) = candidates.iter().copied().find(|i| i.region.to_ascii_lowercase().contains("europe") || i.region.to_ascii_lowercase().contains("united kingdom")) { return Some(i); }
         } else if region.contains("(usa") || region.contains("(north america") {
             if let Some(i) = candidates.iter().copied().find(|i| i.region.to_ascii_lowercase().contains("north america") || i.region.to_ascii_lowercase().contains("united states")) { return Some(i); }
@@ -186,7 +281,7 @@ fn choose_image<'a>(images: &[&'a ImageRecord], cover: bool, title: &str) -> Opt
     None
 }
 
-fn safe_name(title: &str) -> String {
+pub(crate) fn safe_name(title: &str) -> String {
     let name: String = title.chars().map(|c| if c.is_control() || matches!(c, '<'|'>'|':'|'"'|'/'|'\\'|'|'|'?'|'*') { '_' } else { c }).collect();
     name.trim().trim_matches('.').to_string()
 }
@@ -214,7 +309,7 @@ fn download_image(record: &ImageRecord, destination: &Path) -> bool {
 }
 
 #[cfg(windows)]
-fn http_get(url: &str, max_bytes: usize) -> Option<Vec<u8>> {
+pub(crate) fn http_response(url: &str, max_bytes: usize) -> Option<(u32, Vec<u8>)> {
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
     type InternetHandle = *mut c_void;
@@ -229,6 +324,7 @@ fn http_get(url: &str, max_bytes: usize) -> Option<Vec<u8>> {
     unsafe extern "system" {
         fn InternetOpenW(agent: *const u16, access: u32, proxy: *const u16, bypass: *const u16, flags: u32) -> InternetHandle;
         fn InternetOpenUrlW(handle: InternetHandle, url: *const u16, headers: *const u16, headers_len: u32, flags: u32, context: usize) -> InternetHandle;
+        fn HttpQueryInfoW(handle: InternetHandle, level: u32, buffer: *mut c_void, length: *mut u32, index: *mut u32) -> i32;
         fn InternetReadFile(handle: InternetHandle, buffer: *mut c_void, requested: u32, read: *mut u32) -> i32;
         fn InternetCloseHandle(handle: InternetHandle) -> i32;
         fn InternetSetOptionW(handle: InternetHandle, option: u32, buffer: *mut c_void, length: u32) -> i32;
@@ -246,6 +342,11 @@ fn http_get(url: &str, max_bytes: usize) -> Option<Vec<u8>> {
         InternetSetOptionW(internet.0, INTERNET_OPTION_RECEIVE_TIMEOUT, (&mut timeout as *mut u32).cast(), 4);
         let request = Handle(InternetOpenUrlW(internet.0, url_w.as_ptr(), std::ptr::null(), 0, INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_KEEP_CONNECTION | INTERNET_FLAG_SECURE, 0));
         if request.0.is_null() { return None; }
+        let mut status = 0u32;
+        let mut length = 4u32;
+        if HttpQueryInfoW(request.0, 19 | 0x2000_0000, (&mut status as *mut u32).cast(), &mut length, std::ptr::null_mut()) == 0 {
+            return None;
+        }
         let mut body = Vec::new();
         let mut buffer = [0u8; 65536];
         loop {
@@ -255,12 +356,17 @@ fn http_get(url: &str, max_bytes: usize) -> Option<Vec<u8>> {
             if body.len().saturating_add(count as usize) > max_bytes { return None; }
             body.extend_from_slice(&buffer[..count as usize]);
         }
-        (!body.is_empty()).then_some(body)
+        Some((status, body))
     }
 }
 
 #[cfg(not(windows))]
-fn http_get(_url: &str, _max_bytes: usize) -> Option<Vec<u8>> { None }
+pub(crate) fn http_response(_url: &str, _max_bytes: usize) -> Option<(u32, Vec<u8>)> { None }
+
+pub(crate) fn http_get(url: &str, max_bytes: usize) -> Option<Vec<u8>> {
+    let (status, body) = http_response(url, max_bytes)?;
+    (status == 200 && !body.is_empty()).then_some(body)
+}
 
 #[derive(Clone)]
 struct ZipEntry { name: String, method: u16, compressed_size: usize, uncompressed_size: usize, offset: usize }
@@ -273,7 +379,7 @@ impl ZipEntry {
         let extra_len = read_u16(local, 28)? as usize;
         let start = 30usize.checked_add(name_len)?.checked_add(extra_len)?;
         let end = start.checked_add(self.compressed_size)?;
-        let compressed = zip.get(start..end)?;
+        let compressed = local.get(start..end)?;
         match self.method {
             0 => Some(ZipReader::Stored(Cursor::new(compressed))),
             8 => Some(ZipReader::Deflate(DeflateDecoder::new(Cursor::new(compressed)))),
@@ -285,6 +391,19 @@ impl ZipEntry {
 enum ZipReader<'a> { Stored(Cursor<&'a [u8]>), Deflate(DeflateDecoder<Cursor<&'a [u8]>>) }
 impl Read for ZipReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> { match self { Self::Stored(r) => r.read(buf), Self::Deflate(r) => r.read(buf) } }
+}
+
+#[cfg(windows)]
+pub(crate) fn read_unique_zip_member(zip: &[u8], names: &[&str], max_bytes: usize) -> Option<Vec<u8>> {
+    let mut entries = zip_entries(zip)?.into_iter()
+        .filter(|entry| names.contains(&entry.name.as_str()));
+    let entry = entries.next()?;
+    if entries.next().is_some() || entry.uncompressed_size > max_bytes {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    entry.open(zip)?.take(entry.uncompressed_size as u64 + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() == entry.uncompressed_size).then_some(bytes)
 }
 
 fn zip_entries(zip: &[u8]) -> Option<Vec<ZipEntry>> {
@@ -312,9 +431,73 @@ fn zip_entries(zip: &[u8]) -> Option<Vec<ZipEntry>> {
 fn read_u16(data: &[u8], at: usize) -> Option<u16> { Some(u16::from_le_bytes(data.get(at..at + 2)?.try_into().ok()?)) }
 fn read_u32(data: &[u8], at: usize) -> Option<u32> { Some(u32::from_le_bytes(data.get(at..at + 4)?.try_into().ok()?)) }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "Downloads current LaunchBox metadata and artwork; set OPENCDI_LIVE_ARTWORK_DIR"]
+    fn live_artwork_downloads() {
+        let root = std::path::PathBuf::from(std::env::var_os("OPENCDI_LIVE_ARTWORK_DIR").expect("isolated verification directory required"));
+        let titles = ["7th Guest, The - The Game (EUR) [DVC]", "Backgammon (EUR)", "Brain Dead 13 (EUR) [DVC]", "Burn - Cycle (EUR)"];
+        let targets: Vec<_> = titles.iter().map(|title| FetchTarget { title: (*title).into(), missing: ArtworkKind::ALL.into_iter().collect(), download_all: true, synopsis_path: None }).collect();
+        let _ = env_logger::builder().is_test(true).filter_level(log::LevelFilter::Info).try_init();
+        let count = fetch_missing_artwork(&targets, &root.join("artwork"), &root.join("cache"), |_, _, _| {}, |_, _| {});
+        println!("Downloaded {count} images");
+        for title in titles {
+            let found = fs::read_dir(root.join("artwork/Covers")).unwrap().flatten().any(|entry| entry.path().file_stem().unwrap().to_string_lossy() == safe_name(title));
+            assert!(found, "No cover downloaded for {title}");
+        }
+        assert!(count >= 4);
+    }
+
+    #[test]
+    fn reads_launchbox_overview_and_xml_references() {
+        let xml = "<LaunchBox><Game><Name>A National Parks Tour</Name><Platform>Philips CD-i</Platform><DatabaseID>1</DatabaseID><Overview>Visit Yellowstone &amp; Yosemite. <![CDATA[Explore the Grand Canyon.]]></Overview></Game></LaunchBox>";
+        let mut records = ParsedRecords::default();
+        parse_xml(&mut xml.as_bytes(), &HashSet::new(), &HashSet::new(), &mut records);
+        assert_eq!(records.games[0].overview, "Visit Yellowstone & Yosemite. Explore the Grand Canyon.");
+        assert_eq!(normalize_title("National Parks Tour, A.chd"), normalize_title(&records.games[0].title));
+    }
+
+    #[test]
+    fn dump_filenames_match_catalog_titles() {
+        for (filename, title) in [
+            ("7th Guest, The - The Game (EUR) [DVC].chd", "The 7th Guest"),
+            ("Backgammon (EUR).chd", "Backgammon"),
+            ("Brain Dead 13 (EUR) [DVC].chd", "Brain Dead 13"),
+            ("Burn - Cycle (EUR).chd", "Burn:Cycle"),
+            ("7th Guest, The (Europe).chd", "The 7th Guest"),
+        ] {
+            assert_eq!(normalize_title(filename), normalize_title(title), "{filename}");
+        }
+        assert_ne!(normalize_title("Backgammon"), normalize_title("Super Backgammon"));
+    }
+
+    #[test]
+    fn eur_prefers_european_artwork() {
+        let us = ImageRecord { region: "North America".into(), kind: "Box - Front".into(), file: "us.jpg".into(), ..Default::default() };
+        let eu = ImageRecord { region: "Europe".into(), file: "eu.jpg".into(), kind: "Box - Front".into(), ..Default::default() };
+        assert_eq!(choose_image(&[&us, &eu], ArtworkKind::Cover, "Backgammon (EUR)").unwrap().file, "eu.jpg");
+    }
+
+    #[test]
+    fn zip_entry_reads_data_relative_to_its_local_header() {
+        let payload = b"<Data/>";
+        let mut zip = vec![0u8; 47];
+        zip.extend_from_slice(&0x04034b50u32.to_le_bytes());
+        zip.resize(47 + 30, 0);
+        zip.extend_from_slice(payload);
+        let entry = ZipEntry { name: "metadata.xml".into(), method: 0, compressed_size: payload.len(), uncompressed_size: payload.len(), offset: 47 };
+        let mut actual = Vec::new();
+        entry.open(&zip).unwrap().read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, payload);
+    }
+}
+
 fn parse_xml<R: BufRead>(reader: &mut R, wanted_titles: &HashSet<String>, wanted_ids: &HashSet<String>, out: &mut ParsedRecords) {
     let mut xml = Reader::from_reader(reader);
-    xml.config_mut().trim_text(true);
+    xml.config_mut().trim_text(false);
     let mut buffer = Vec::new();
     let mut stack: Vec<String> = Vec::new();
     let mut game: Option<GameRecord> = None;
@@ -334,14 +517,32 @@ fn parse_xml<R: BufRead>(reader: &mut R, wanted_titles: &HashSet<String>, wanted
                     if let Some(i) = image.as_mut() {
                         match tag.to_ascii_lowercase().as_str() { "databaseid" => i.id.push_str(&text), "filename" => i.file.push_str(&text), "type" => i.kind.push_str(&text), "region" => i.region.push_str(&text), _ => {} }
                     } else if let Some(g) = game.as_mut() {
-                        match tag.to_ascii_lowercase().as_str() { "databaseid" => g.id.push_str(&text), "name" => g.title.push_str(&text), "platform" => g.platform.push_str(&text), _ => {} }
+                        match tag.to_ascii_lowercase().as_str() { "databaseid" => g.id.push_str(&text), "name" => g.title.push_str(&text), "platform" => g.platform.push_str(&text), "overview" | "notes" => g.overview.push_str(&text), _ => {} }
+                    }
+                }
+            }
+            Ok(Event::GeneralRef(e)) => {
+                if let Ok(name) = e.decode() {
+                    let escaped = format!("&{name};");
+                    if let Ok(value) = quick_xml::escape::unescape(&escaped) {
+                        match stack.last().map(String::as_str) {
+                            Some("Overview" | "Notes") => { if let Some(g) = &mut game { g.overview.push_str(&value); } }
+                            Some("Name") => { if let Some(g) = &mut game { g.title.push_str(&value); } }
+                            _ => {}
+                        }
                     }
                 }
             }
             Ok(Event::CData(e)) => {
                 if let Some(tag) = stack.last().map(String::as_str) {
                     if let Some(g) = game.as_mut() {
-                        if tag.eq_ignore_ascii_case("Name") { if let Ok(s) = e.decode() { g.title.push_str(&s); } }
+                        if let Ok(s) = e.decode() {
+                            match tag.to_ascii_lowercase().as_str() {
+                                "name" => g.title.push_str(&s),
+                                "overview" | "notes" => g.overview.push_str(&s),
+                                _ => {}
+                            }
+                        }
                     }
                 }
             }
@@ -351,8 +552,15 @@ fn parse_xml<R: BufRead>(reader: &mut R, wanted_titles: &HashSet<String>, wanted
                 if tag.eq_ignore_ascii_case("GameImage") {
                     if let Some(i) = image.take() { if wanted_ids.contains(&i.id) { out.images.push(i); } }
                 } else if tag.eq_ignore_ascii_case("Game") {
-                    if let Some(g) = game.take() {
-                        if wanted_titles.is_empty() || wanted_titles.contains(&normalize_title(&g.title)) { out.games.push(g); }
+                    if let Some(mut g) = game.take() {
+                        g.id = g.id.trim().to_owned();
+                        g.title = g.title.trim().to_owned();
+                        g.platform = g.platform.trim().to_owned();
+                        if wanted_ids.is_empty() && g.platform.eq_ignore_ascii_case("Philips CD-i")
+                            && (wanted_titles.is_empty() || wanted_titles.contains(&normalize_title(&g.title)))
+                        {
+                            out.games.push(g);
+                        }
                     }
                 }
             }

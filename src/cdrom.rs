@@ -117,6 +117,46 @@ fn to_wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
 }
 
+#[cfg(target_os = "windows")]
+fn optical_handle(device_path: &str) -> Result<Win32CdHandle, u32> {
+    let wide_path = to_wide(device_path);
+    unsafe {
+        let handle = CreateFileW(
+            wide_path.as_ptr(), 0x8000_0000, 0x1 | 0x2, std::ptr::null_mut(), 3, 0, std::ptr::null_mut(),
+        );
+        if handle.is_null() || handle == (-1isize as *mut std::ffi::c_void) {
+            Err(GetLastError())
+        } else {
+            Ok(Win32CdHandle(handle))
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn read_optical_toc(handle: &Win32CdHandle) -> Result<CdromToc, u32> {
+    unsafe {
+        let mut toc: CdromToc = std::mem::zeroed();
+        let mut bytes = 0;
+        let ok = DeviceIoControl(
+            handle.0, 0x0002_4000, // IOCTL_CDROM_READ_TOC
+            std::ptr::null(), 0, (&mut toc as *mut CdromToc).cast(),
+            std::mem::size_of::<CdromToc>() as u32, &mut bytes, std::ptr::null_mut(),
+        );
+        if ok == 0 {
+            Err(GetLastError())
+        } else if bytes < 4 || toc.first_track == 0 || toc.first_track > toc.last_track {
+            Err(13) // ERROR_INVALID_DATA
+        } else {
+            Ok(toc)
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn optical_drive_has_disc(letter: char) -> bool {
+    optical_handle(&format!(r"\\.\{letter}:")).and_then(|handle| read_optical_toc(&handle)).is_ok()
+}
+
 pub fn parse_drive_letter<P: AsRef<Path>>(path: P) -> Option<char> {
     let s = path.as_ref().to_str()?;
     let s_clean = s.trim();
@@ -421,57 +461,18 @@ impl CdRom {
     #[cfg(target_os = "windows")]
     pub fn open_physical_drive(drive_letter: char) -> Result<Self, Box<dyn std::error::Error>> {
         let device_path = format!(r"\\.\{}:", drive_letter);
-        let wide_path = to_wide(&device_path);
-
-        unsafe {
-            let handle = CreateFileW(
-                wide_path.as_ptr(),
-                0x8000_0000, // GENERIC_READ
-                0x0000_0001 | 0x0000_0002, // FILE_SHARE_READ | FILE_SHARE_WRITE
-                std::ptr::null_mut(),
-                3, // OPEN_EXISTING
-                0,
-                std::ptr::null_mut(),
-            );
-
-            if handle.is_null() || handle == (-1isize as *mut std::ffi::c_void) {
-                let err = GetLastError();
-                return Err(format!(
-                    "Impossibile accedere all'unità ottica fisica '{}' (Errore Win32 {})",
-                    device_path, err
-                ).into());
+        let cd_handle = optical_handle(&device_path).map_err(|err| {
+            format!("Impossibile accedere all'unità ottica fisica '{device_path}' (Errore Win32 {err})")
+        })?;
+        let toc = read_optical_toc(&cd_handle).map_err(|err| {
+            if err == 21 {
+                format!("Nessun disco presente nell'unità {drive_letter}:. Inserire un disco CD-i, Video CD o CD Audio e riprovare.")
+            } else {
+                format!("Errore nella lettura del disco nell'unità {drive_letter}: (IOCTL_CDROM_READ_TOC fallito, errore {err})")
             }
+        })?;
 
-            let cd_handle = Win32CdHandle(handle);
-
-            // Read TOC via IOCTL_CDROM_READ_TOC
-            let mut toc: CdromToc = std::mem::zeroed();
-            let mut bytes_ret = 0u32;
-            let ok = DeviceIoControl(
-                cd_handle.0,
-                0x0002_4000, // IOCTL_CDROM_READ_TOC
-                std::ptr::null(),
-                0,
-                &mut toc as *mut _ as *mut std::ffi::c_void,
-                std::mem::size_of::<CdromToc>() as u32,
-                &mut bytes_ret,
-                std::ptr::null_mut(),
-            );
-
-            if ok == 0 {
-                let err = GetLastError();
-                if err == 21 { // ERROR_NOT_READY
-                    return Err(format!(
-                        "Nessun disco presente nell'unità {}:. Inserire un disco CD-i, Video CD o CD Audio e riprovare.",
-                        drive_letter
-                    ).into());
-                }
-                return Err(format!(
-                    "Errore nella lettura del disco nell'unità {}: (IOCTL_CDROM_READ_TOC fallito, errore {})",
-                    drive_letter, err
-                ).into());
-            }
-
+        {
             let first_track = toc.first_track;
             let last_track = toc.last_track;
             info!(
