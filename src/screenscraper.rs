@@ -1,14 +1,14 @@
-use crate::launchbox::{ArtworkKind, FetchTarget, http_get, http_response, normalize_title, safe_name};
+use crate::launchbox::{ArtworkKind, FetchTarget, http_get, http_response, normalize_title};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
-static PUBLIC_ATTEMPTED: LazyLock<Mutex<HashSet<(String, ArtworkKind)>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
-static ATTEMPTED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+static PUBLIC_ATTEMPTED: LazyLock<Mutex<HashSet<(String, ArtworkKind, Option<&'static str>)>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+static SEARCH_GAMES: LazyLock<Mutex<HashMap<String, Option<Value>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn encode(value: &str) -> String {
+pub(crate) fn encode(value: &str) -> String {
     use std::fmt::Write;
     let mut encoded = String::new();
     for byte in value.bytes() {
@@ -21,7 +21,7 @@ fn encode(value: &str) -> String {
     encoded
 }
 
-fn search_name(title: &str) -> String {
+pub(crate) fn search_name(title: &str) -> String {
     let plain = title.split(['(', '[']).next().unwrap_or(title).trim();
     if normalize_title(title) == "the7thguest" { return "The 7th Guest".into(); }
     if let Some((name, article)) = plain.rsplit_once(',') {
@@ -70,9 +70,15 @@ fn find_game<'a>(body: &'a Value, title: &str) -> Option<&'a Value> {
     if let Some(id) = public_game_id(title) {
         if let Some(game) = games.iter().find(|game| game_id(game) == Some(id)) { return Some(game); }
     }
+    let requested_title = normalize_title(title);
     for key in [normalize_title as fn(&str) -> String, relaxed_key] {
         let requested = key(title);
         let mut matches = games.iter().filter(|game| {
+            match (requested_title.as_str(), game_id(game)) {
+                ("goldenoldiesjukebox", Some(104727 | 104728))
+                | ("thejokerswildjr", Some(419679)) => return false,
+                _ => {}
+            }
             game["noms"].as_array().is_some_and(|names| names.iter().any(|name| {
                 name["text"].as_str().is_some_and(|text| key(text) == requested)
             }))
@@ -91,6 +97,54 @@ fn english_synopsis(game: &Value) -> Option<&str> {
         .find(|text| !text.trim().is_empty())
 }
 
+pub(crate) fn disc_regions(title: &str) -> Vec<&'static str> {
+    let mut regions = Vec::new();
+    let lower = title.to_ascii_lowercase();
+    for tag in lower.split('(').skip(1).filter_map(|tag| tag.split_once(')').map(|(tag, _)| tag)) {
+        if tag.contains(',') && tag.split(',').all(|part| part.trim().len() == 2) { continue; }
+        for part in tag.split(',') {
+            let code = region_code(part);
+            if let Some(code) = code && !regions.contains(&code) {
+                regions.push(code);
+            }
+        }
+    }
+    for fallback in ["us", "uk", "eu"] {
+        if !regions.contains(&fallback) { regions.push(fallback); }
+    }
+    regions
+}
+
+pub(crate) fn region_code(region: &str) -> Option<&'static str> {
+    Some(match region.trim().to_ascii_lowercase().as_str() {
+        "usa" | "us" | "united states" | "north america" | "america" => "us",
+        "uk" | "gb" | "gbr" | "united kingdom" | "great britain" | "england" => "uk",
+        "europe" | "eur" | "eu" => "eu",
+        "world" | "worldwide" | "wor" => "wor",
+        "japan" | "jpn" | "jp" => "jp",
+        "france" | "fr" => "fr",
+        "germany" | "de" => "de",
+        "italy" | "it" => "it",
+        "netherlands" | "nl" => "nl",
+        "sweden" | "se" => "se",
+        "spain" | "es" => "es",
+        "brazil" | "br" => "br",
+        "australia" | "au" => "au",
+        "canada" | "ca" => "ca",
+        "belgium" | "be" => "be",
+        "china" | "cn" => "cn",
+        "korea" | "kr" => "kr",
+        "asia" | "asi" => "asi",
+        "taiwan" | "tw" => "tw",
+        "portugal" | "pt" => "pt",
+        "denmark" | "dk" => "dk",
+        "norway" | "no" => "no",
+        "finland" | "fi" => "fi",
+        "russia" | "ru" => "ru",
+        _ => return None,
+    })
+}
+
 fn region(title: &str) -> &str {
     let lower = title.to_ascii_lowercase();
     for (tags, region) in [
@@ -105,7 +159,7 @@ fn region(title: &str) -> &str {
     "wor"
 }
 
-fn media_url<'a>(game: &'a Value, kind: ArtworkKind, title: &str) -> Option<&'a str> {
+fn media_url<'a>(game: &'a Value, kind: ArtworkKind, title: &str, disc_region: Option<&str>) -> Option<&'a str> {
     let wanted_region = region(title);
     let wanted_disc = disc_number(title);
     game["medias"].as_array()?.iter().filter_map(|media| {
@@ -114,7 +168,7 @@ fn media_url<'a>(game: &'a Value, kind: ArtworkKind, title: &str) -> Option<&'a 
             (ArtworkKind::Cover, "box-2D") | (ArtworkKind::Disc, "support-2D") => 0,
             (ArtworkKind::Disc, "support-texture") => 1,
             (ArtworkKind::Disc, "support-scan") => 2,
-            (ArtworkKind::Boxart, "box-3D") | (ArtworkKind::Back, "box-2D-back") | (ArtworkKind::Logo, "wheel") => 0,
+            (ArtworkKind::Back, "box-2D-back") | (ArtworkKind::Logo, "wheel") => 0,
             (ArtworkKind::Logo, "wheel-hd") => 1,
             _ => return None,
         };
@@ -126,7 +180,10 @@ fn media_url<'a>(game: &'a Value, kind: ArtworkKind, title: &str) -> Option<&'a 
         if wanted_disc.is_some_and(|wanted| disc != 0 && disc != wanted) { return None; }
         if wanted_disc.is_none() && disc > 1 { return None; }
         let disc_priority = u8::from(wanted_disc != Some(disc));
-        let region_priority = match media["region"].as_str().unwrap_or("") {
+        let media_region = media["region"].as_str().unwrap_or("");
+        if let Some(required) = disc_region
+            && region_code(media_region) != Some(required) { return None; }
+        let region_priority = match media_region {
             value if value == wanted_region => 0,
             "wor" | "ss" | "" => 1,
             _ => 2,
@@ -134,14 +191,6 @@ fn media_url<'a>(game: &'a Value, kind: ArtworkKind, title: &str) -> Option<&'a 
         Some(((region_priority, disc_priority, type_priority), url))
     }).min_by_key(|(priority, _)| *priority).map(|(_, url)| url)
 }
-
-pub fn can_check_gallery(title: &str) -> bool {
-    if public_game_id(title).is_some() { return true; }
-    ["OPENCDI_SCREENSCRAPER_DEV_ID", "OPENCDI_SCREENSCRAPER_DEV_PASSWORD"]
-        .iter().all(|key| std::env::var(key).is_ok_and(|value| !value.is_empty()))
-}
-
-pub const GALLERY_KINDS: [ArtworkKind; 5] = ArtworkKind::ALL;
 
 fn preferred_filename(kind: ArtworkKind, title: &str, extension: &str) -> String {
     kind.filename(&format!("{title}--screenscraper"), extension)
@@ -153,27 +202,10 @@ pub fn preferred_gallery_image(folder: &Path, kind: ArtworkKind, title: &str) ->
         .find(|path| path.is_file())
 }
 
-fn gallery_image_is_launchbox(root: &Path, kind: ArtworkKind, title: &str, archive: &[PathBuf]) -> bool {
-    let folder = root.join(kind.folder());
-    if preferred_gallery_image(&folder, kind, title).is_some() { return false; }
-    let stem = format!("{}--", safe_name(title).to_ascii_lowercase());
-    let candidates: Vec<_> = archive.iter().filter(|path| {
-        path.file_name().is_some_and(|name| name.to_string_lossy().to_ascii_lowercase().starts_with(&stem))
-    }).collect();
-    if candidates.is_empty() { return false; }
-    for extension in ["png", "jpg", "jpeg"] {
-        let path = folder.join(kind.filename(title, extension));
-        if let Ok(current) = std::fs::read(path) {
-            return candidates.iter().any(|cached| std::fs::read(cached).is_ok_and(|bytes| bytes == current));
-        }
-    }
-    false
-}
-
 fn public_gallery_url(game: &Value, kind: ArtworkKind, region: &str, disc: Option<u64>) -> Option<String> {
     let id = game["id"].as_u64().or_else(|| game["id"].as_str()?.parse().ok())?;
     let media = match kind {
-        ArtworkKind::Boxart => "box-3D",
+        ArtworkKind::Boxart => return None,
         ArtworkKind::Disc => "support-2D",
         ArtworkKind::Cover => "box-2D",
         ArtworkKind::Back => "box-2D-back",
@@ -201,27 +233,20 @@ fn gallery_disc_candidates(title: &str) -> Vec<Option<u64>> {
     }
 }
 
-fn fetch_boxart(game: &Value, title: &str) -> Option<(Vec<u8>, &'static str)> {
-    if let Some(url) = media_url(game, ArtworkKind::Boxart, title) {
-        if let Some(bytes) = http_get(url, 24 * 1024 * 1024) {
-            if let Some(extension) = image_extension(&bytes) { return Some((bytes, extension)); }
-        }
-    }
-    fetch_gallery_image(game, ArtworkKind::Boxart, title)
-}
-
-fn fetch_gallery_image(game: &Value, kind: ArtworkKind, title: &str) -> Option<(Vec<u8>, &'static str)> {
-    probe_gallery_image(game, kind, title).0
-}
-
 type GalleryImage = (Vec<u8>, &'static str);
 
-fn probe_gallery_image(game: &Value, kind: ArtworkKind, title: &str) -> (Option<GalleryImage>, bool) {
-    let requested = region(title);
-    let mut regions = vec![requested];
-    for fallback in ["wor", "ss"] {
-        if !regions.contains(&fallback) { regions.push(fallback); }
-    }
+fn probe_gallery_image(game: &Value, kind: ArtworkKind, title: &str, disc_region: Option<&str>) -> (Option<GalleryImage>, bool) {
+    let regions = match disc_region {
+        Some(code) => vec![code],
+        None => {
+            let requested = region(title);
+            let mut regions = vec![requested];
+            for fallback in ["wor", "ss"] {
+                if !regions.contains(&fallback) { regions.push(fallback); }
+            }
+            regions
+        }
+    };
     let mut retry = false;
     for region in regions {
         for disc in gallery_disc_candidates(title) {
@@ -254,38 +279,30 @@ pub fn fetch_missing(
     mut ready: impl FnMut(&str, ArtworkKind, &Path),
     mut synopsis_ready: impl FnMut(&Path, &str),
 ) {
-    let cached_art = |folder: &str| -> Vec<PathBuf> {
-        std::fs::read_dir(artwork_root.join("LaunchBox").join(folder))
-            .into_iter().flatten().flatten().map(|entry| entry.path()).collect()
-    };
-    let launchbox_cases = cached_art("Box - 3D");
-    let archives = [
-        (ArtworkKind::Cover, cached_art("Box - Front")),
-        (ArtworkKind::Disc, cached_art("Disc")),
-        (ArtworkKind::Boxart, launchbox_cases.clone()),
-        (ArtworkKind::Back, cached_art("Box - Back")),
-        (ArtworkKind::Logo, cached_art("Clear Logo")),
-    ];
+    fetch_missing_for_kinds(targets, artwork_root, &ArtworkKind::DOWNLOADS, None, &mut ready, &mut synopsis_ready);
+}
+
+pub fn fetch_missing_for_kinds(
+    targets: &[FetchTarget], artwork_root: &Path, kinds: &[ArtworkKind], disc_region: Option<&'static str>,
+    mut ready: impl FnMut(&str, ArtworkKind, &Path),
+    mut synopsis_ready: impl FnMut(&Path, &str),
+) {
     let mut targets = targets.to_vec();
     for target in &mut targets {
         let Some(id) = public_game_id(&target.title) else { continue; };
         let game = serde_json::json!({"id": id});
-        for (kind, archive) in &archives {
-            let kind = *kind;
-            let missing = target.missing.contains(&kind);
-            let upgrading = !missing && gallery_image_is_launchbox(artwork_root, kind, &target.title, archive);
-            if !missing && !upgrading { continue; }
-            let key = (target.title.clone(), kind);
+        for &kind in kinds {
+            if !target.missing.contains(&kind) { continue; }
+            let key = (target.title.clone(), kind, disc_region);
             if PUBLIC_ATTEMPTED.lock().unwrap().contains(&key) { continue; }
-            let (image, retry) = probe_gallery_image(&game, kind, &target.title);
+            let (image, retry) = probe_gallery_image(&game, kind, &target.title, disc_region);
             let Some((bytes, extension)) = image else {
                 if !retry { PUBLIC_ATTEMPTED.lock().unwrap().insert(key); }
                 continue;
             };
-            let filename = if upgrading { preferred_filename(kind, &target.title, extension) }
-                else { kind.filename(&target.title, extension) };
+            let filename = kind.filename(&target.title, if matches!(kind, ArtworkKind::Cover | ArtworkKind::Disc) { "png" } else { extension });
             let path = artwork_root.join(kind.folder()).join(filename);
-            if crate::synopsis::publish_new(&path, &bytes) {
+            if crate::boxart::publish_media(kind, &path, &bytes) {
                 ready(&target.title, kind, &path);
                 target.missing.remove(&kind);
                 PUBLIC_ATTEMPTED.lock().unwrap().insert(key);
@@ -300,53 +317,43 @@ pub fn fetch_missing(
     }
     for target in targets {
         let synopsis = target.synopsis_path.as_deref().filter(|path| !path.exists());
-        let upgrade_boxart = !target.missing.contains(&ArtworkKind::Boxart)
-            && gallery_image_is_launchbox(artwork_root, ArtworkKind::Boxart, &target.title, &launchbox_cases);
-        if target.missing.is_empty() && synopsis.is_none() && !upgrade_boxart { continue; }
-        if ATTEMPTED.lock().unwrap().contains(&target.title) { continue; }
-        let url = format!("https://api.screenscraper.fr/api2/jeuRecherche.php?{query}&recherche={}", encode(&search_name(&target.title)));
-        let Some((status, bytes)) = http_response(&url, 4 * 1024 * 1024) else {
-            log::warn!("ScreenScraper is unavailable");
-            break;
+        if synopsis.is_none() && !kinds.iter().any(|kind| target.missing.contains(kind)) { continue; }
+        let cached = SEARCH_GAMES.lock().unwrap().get(&target.title).cloned();
+        let game = match cached {
+            Some(game) => game,
+            None => {
+                let url = format!("https://api.screenscraper.fr/api2/jeuRecherche.php?{query}&recherche={}", encode(&search_name(&target.title)));
+                let response = http_response(&url, 4 * 1024 * 1024);
+                std::thread::sleep(Duration::from_secs(1));
+                let game = match response {
+                    Some((200, bytes)) => {
+                        let Ok(body) = serde_json::from_slice::<Value>(&bytes) else { break; };
+                        if !body.get("response").is_some_and(Value::is_object) { break; }
+                        find_game(&body, &target.title).cloned()
+                    }
+                    Some((404, _)) => None,
+                    _ => {
+                        log::warn!("ScreenScraper stopped the artwork lookup");
+                        break;
+                    }
+                };
+                SEARCH_GAMES.lock().unwrap().insert(target.title.clone(), game.clone());
+                game
+            }
         };
-        if status == 404 {
-            ATTEMPTED.lock().unwrap().insert(target.title.clone());
-            std::thread::sleep(Duration::from_secs(1));
-            continue;
-        }
-        if status != 200 {
-            log::warn!("ScreenScraper stopped the lookup (HTTP {status})");
-            break;
-        }
-        let Ok(body) = serde_json::from_slice::<Value>(&bytes) else { break; };
-        if !body.get("response").is_some_and(Value::is_object) { break; }
-        ATTEMPTED.lock().unwrap().insert(target.title.clone());
-        std::thread::sleep(Duration::from_secs(1));
-        let Some(game) = find_game(&body, &target.title) else { continue; };
+        let Some(game) = game.as_ref() else { continue; };
         if let (Some(path), Some(text)) = (synopsis, english_synopsis(game)) {
             synopsis_ready(path, text);
         }
-        for kind in ArtworkKind::ALL {
-            let upgrading = kind == ArtworkKind::Boxart && upgrade_boxart;
-            if !target.missing.contains(&kind) && !upgrading { continue; }
-            let asset = if kind == ArtworkKind::Boxart {
-                if public_game_id(&target.title) == game_id(game) && game_id(game).is_some() {
-                    media_url(game, ArtworkKind::Boxart, &target.title)
-                        .and_then(|url| http_get(url, 24 * 1024 * 1024))
-                        .and_then(|bytes| image_extension(&bytes).map(|extension| (bytes, extension)))
-                } else {
-                    fetch_boxart(game, &target.title)
-                }
-            } else {
-                media_url(game, kind, &target.title)
-                    .and_then(|url| http_get(url, 24 * 1024 * 1024))
-                    .and_then(|bytes| image_extension(&bytes).map(|extension| (bytes, extension)))
-            };
+        for &kind in kinds {
+            if kind == ArtworkKind::Boxart || !target.missing.contains(&kind) { continue; }
+            let asset = media_url(game, kind, &target.title, disc_region)
+                .and_then(|url| http_get(url, 24 * 1024 * 1024))
+                .and_then(|bytes| image_extension(&bytes).map(|extension| (bytes, extension)));
             let Some((bytes, ext)) = asset else { continue; };
-            let filename = if upgrading { preferred_filename(kind, &target.title, ext) }
-                else { kind.filename(&target.title, ext) };
+            let filename = kind.filename(&target.title, if matches!(kind, ArtworkKind::Cover | ArtworkKind::Disc) { "png" } else { ext });
             let path = artwork_root.join(kind.folder()).join(filename);
-            if crate::synopsis::publish_new(&path, &bytes) {
+            if crate::boxart::publish_media(kind, &path, &bytes) {
                 ready(&target.title, kind, &path);
             }
             std::thread::sleep(Duration::from_secs(1));
@@ -362,15 +369,31 @@ mod tests {
         assert_eq!(public_game_id("Dragon's Lair (EUR).chd"), Some(104713));
         assert_eq!(public_game_id("Dragons Lair II - Time Warp (EUR).chd"), Some(104714));
         assert_eq!(public_game_id("Unknown CD-i disc"), None);
+        assert_eq!(public_game_id("Joker's Wild!, The (USA)"), Some(419679));
+        let junior = "Joker's Wild! Jr., The (USA)";
+        assert_eq!(public_game_id(junior), None);
+        let body = serde_json::json!({"response": {"jeux": [
+            {"id": 419679, "noms": [{"text": "The Joker's Wild! Jr."}]}
+        ]}});
+        assert!(find_game(&body, junior).is_none());
+        assert_eq!(public_game_id("Monty Python's Invasion from the Planet Skyron (Europe).chd"), Some(104762));
+        assert_eq!(public_game_id("Invasion from the Planet Skyron"), Some(104762));
+        for title in ["Golden Oldies Jukebox (Europe).chd", "Golden Oldies Jukebox (USA).chd"] {
+            assert_eq!(public_game_id(title), None);
+            let body = serde_json::json!({"response": {"jeux": [
+                {"id": 104727, "noms": [{"text": "Golden Oldies Jukebox"}]},
+                {"id": 104728, "noms": [{"text": "Golden Oldies Jukebox"}]}
+            ]}});
+            assert!(find_game(&body, title).is_none());
+        }
     }
 
     #[test]
-    fn builds_the_public_3d_endpoint_without_credentials() {
+    fn never_requests_downloaded_3d_boxart() {
         let game = serde_json::json!({"id":"104723","medias":[{"type":"box-texture"}]});
-        assert_eq!(media_url(&game, ArtworkKind::Boxart, "Flashback (Europe)"), None);
-        let url = public_gallery_url(&game, ArtworkKind::Boxart, region("Flashback (Europe)"), None).unwrap();
-        assert_eq!(url, "https://www.screenscraper.fr/image.php?plateformid=133&gameid=104723&media=box-3D&hd=0&region=eu&num=&version=&maxwidth=600&maxheight=600");
-        assert!(public_gallery_url(&serde_json::json!({"id":"104723&x=1"}), ArtworkKind::Boxart, "eu", None).is_none());
+        assert_eq!(media_url(&game, ArtworkKind::Boxart, "Flashback (Europe)", None), None);
+        assert!(public_gallery_url(&game, ArtworkKind::Boxart, "eu", None).is_none());
+        assert!(!ArtworkKind::DOWNLOADS.contains(&ArtworkKind::Boxart));
     }
 
     #[test]
@@ -394,22 +417,32 @@ mod tests {
 
     #[test]
     #[ignore = "Downloads live ScreenScraper artwork into OPENCDI_LIVE_ARTWORK_DIR"]
-    fn thunder_disc_downloads_all_five_artwork_kinds() {
+    fn thunder_disc_downloads_four_artwork_kinds() {
         let root = std::path::PathBuf::from(std::env::var_os("OPENCDI_LIVE_ARTWORK_DIR")
             .expect("isolated verification directory required"));
         let title = "Thunder in Paradise (Europe) (Disc 1) (The Game)";
         let target = FetchTarget {
-            title: title.into(), missing: ArtworkKind::ALL.into_iter().collect(),
+            title: title.into(), missing: ArtworkKind::DOWNLOADS.into_iter().collect(),
             download_all: false, synopsis_path: None,
         };
         let mut kinds = HashSet::new();
         fetch_missing(&[target], &root, |received_title, kind, path| {
             assert_eq!(received_title, title);
             let image = crate::library::load_artwork(path).expect("valid downloaded artwork");
+            if kind == ArtworkKind::Cover { assert_eq!((image.w, image.h), (600, 600)); }
             println!("{}: {} x {}", kind.folder(), image.w, image.h);
             kinds.insert(kind);
         }, |_, _| {});
-        assert!(ArtworkKind::ALL.into_iter().all(|kind| kinds.contains(&kind)));
+        assert!(ArtworkKind::DOWNLOADS.into_iter().all(|kind| kinds.contains(&kind)));
+    }
+
+    #[test]
+    fn disc_region_fallback_keeps_the_requested_region_first() {
+        assert_eq!(disc_regions("Title (Sweden)"), ["se", "us", "uk", "eu"]);
+        assert_eq!(disc_regions("Title (Europe) (En,Fr) (Disc 2)"), ["eu", "us", "uk"]);
+        assert_eq!(disc_regions("Title (Japan)"), ["jp", "us", "uk", "eu"]);
+        assert_eq!(disc_regions("Title (UK)"), ["uk", "us", "eu"]);
+        assert_eq!(disc_regions("Title"), ["us", "uk", "eu"]);
     }
 
     #[test]
@@ -428,10 +461,10 @@ mod tests {
         let body = serde_json::json!({"response":{"jeux":[game]}});
         let matched = find_game(&body, "Brain Dead 13 (Europe) (Disc 2)").unwrap();
         assert_eq!(english_synopsis(matched), Some("English synopsis"));
-        assert_eq!(media_url(matched, ArtworkKind::Disc, "Brain Dead 13 (Europe) (Disc 2)"), Some("https://www.screenscraper.fr/second-eu"));
-        assert_eq!(media_url(matched, ArtworkKind::Boxart, "Brain Dead 13 (Europe)"), None);
-        assert_eq!(media_url(matched, ArtworkKind::Back, "Brain Dead 13 (Europe)"), Some("https://www.screenscraper.fr/back"));
-        assert_eq!(media_url(matched, ArtworkKind::Logo, "Brain Dead 13 (Europe)"), Some("https://www.screenscraper.fr/logo"));
+        assert_eq!(media_url(matched, ArtworkKind::Disc, "Brain Dead 13 (Europe) (Disc 2)", Some("eu")), Some("https://www.screenscraper.fr/second-eu"));
+        assert_eq!(media_url(matched, ArtworkKind::Boxart, "Brain Dead 13 (Europe)", None), None);
+        assert_eq!(media_url(matched, ArtworkKind::Back, "Brain Dead 13 (Europe)", None), Some("https://www.screenscraper.fr/back"));
+        assert_eq!(media_url(matched, ArtworkKind::Logo, "Brain Dead 13 (Europe)", None), Some("https://www.screenscraper.fr/logo"));
         assert_eq!(encode("A & B"), "A%20%26%20B");
     }
 }

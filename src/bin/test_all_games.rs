@@ -1,29 +1,9 @@
-#[path = r"C:\Users\Gian\.gemini\antigravity\scratch\philips cdi\opencdi\src\audio.rs"]
-mod audio;
-#[path = r"C:\Users\Gian\.gemini\antigravity\scratch\philips cdi\opencdi\src\bus.rs"]
-mod bus;
-#[path = r"C:\Users\Gian\.gemini\antigravity\scratch\philips cdi\opencdi\src\cdic.rs"]
-mod cdic;
-#[path = r"C:\Users\Gian\.gemini\antigravity\scratch\philips cdi\opencdi\src\cdrom.rs"]
-mod cdrom;
-#[path = r"C:\Users\Gian\.gemini\antigravity\scratch\philips cdi\opencdi\src\dma.rs"]
-mod dma;
-#[path = "../dvc.rs"]
-mod dvc;
-#[path = r"C:\Users\Gian\.gemini\antigravity\scratch\philips cdi\opencdi\src\mcd212.rs"]
-mod mcd212;
-#[path = r"C:\Users\Gian\.gemini\antigravity\scratch\philips cdi\opencdi\src\nvram.rs"]
-mod nvram;
-#[path = r"C:\Users\Gian\.gemini\antigravity\scratch\philips cdi\opencdi\src\scc_timer.rs"]
-mod scc_timer;
-#[path = r"C:\Users\Gian\.gemini\antigravity\scratch\philips cdi\opencdi\src\slave.rs"]
-mod slave;
-
+use opencdi::mcd212;
 use std::path::{Path, PathBuf};
 use m68k::{CpuCore, CpuType, AddressBus};
 
-use crate::bus::CdiBus;
-use crate::mcd212::{TOTAL_SCANLINES, CYCLES_PER_SCANLINE};
+use opencdi::bus::CdiBus;
+use opencdi::mcd212::{TOTAL_SCANLINES, CYCLES_PER_SCANLINE};
 
 fn find_file<P: AsRef<Path>>(rel: P) -> Option<PathBuf> {
     let candidates = [

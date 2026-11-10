@@ -3731,6 +3731,10 @@ pub(crate) enum TrapFinish {
 }
 
 pub(crate) fn record_trace_target(pc: u32, cpu_type: CpuType) {
+    // Baked trace cycles do not model the SCC68070 per-instruction clocks, so it never traces.
+    if cpu_type == CpuType::SCC68070 {
+        return;
+    }
     with_trace_jit(|jit| jit.record_trace_target(pc, cpu_type));
 }
 
@@ -3767,6 +3771,9 @@ pub(crate) fn stop_recording(cpu: &mut CpuCore, cause: RecordingStop) {
 /// the filters whenever it invalidates or rejects a trace.
 #[inline]
 pub(crate) fn note_backward_branch(cpu: &mut CpuCore, cpu_type: CpuType) -> bool {
+    if cpu_type == CpuType::SCC68070 {
+        return false;
+    }
     let pc = cpu.pc;
     #[cfg(feature = "trace-profile")]
     {
@@ -4486,7 +4493,7 @@ fn decode_mul_word_immediate_trace_op<B: AddressBus>(
             immediate: extension,
             dst: ((opcode >> 9) & 7) as u8,
             signed: op_mode == 7,
-            m68000_timing: cpu_type == CpuType::M68000,
+            m68000_timing: matches!(cpu_type, CpuType::M68000 | CpuType::SCC68070),
         },
     })
 }
@@ -5481,7 +5488,7 @@ fn decode_bit_imm_reg_trace_op<B: AddressBus>(
     // fetch on top of the dynamic-form base (bitop_cycles), while the other
     // CPUs use the dynamic-form legacy cost. The modifying ops add 2 clocks
     // pre-68020 when the bit lives in the upper register half; BTST does not.
-    let m68000 = cpu.cpu_type == CpuType::M68000;
+    let m68000 = cpu.uses_m68000_timing();
     let hi = if cpu.is_pre_68020 && bit >= 16 { 2 } else { 0 };
     let raw_cycles = match op {
         JitBitOp::Test => {
@@ -5514,10 +5521,17 @@ fn decode_bit_imm_reg_trace_op<B: AddressBus>(
     // processor's timing model. Traces must store that same modeled value:
     // the 68020/030 tables make register bit operations four clocks, the
     // 68040 and 68060 pipelines issue them in one clock, and the remaining
-    // models (SCC68070) keep the legacy scaler.
+    // models keep the legacy scaler; the SCC68070 uses its datasheet clocks.
     let cycles = match cpu.cpu_type {
         CpuType::M68EC020 | CpuType::M68020 | CpuType::M68EC030 | CpuType::M68030 => 4,
         CpuType::M68EC040 | CpuType::M68LC040 | CpuType::M68040 | CpuType::M68060 => 1,
+        CpuType::SCC68070 => {
+            if op == JitBitOp::Test {
+                14
+            } else {
+                17
+            }
+        }
         _ => cpu.scale_cycles_for_cpu_type(raw_cycles),
     };
     Some(TraceBuildOp {

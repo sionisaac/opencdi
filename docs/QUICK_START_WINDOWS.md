@@ -24,9 +24,11 @@ Create a `Portable` folder beside `opencdi.exe` before first launch to store set
 
 ## 3. Add discs and artwork
 
-Use **Open Disc** to select a CHD, ISO, or CUE image. When Windows reports a readable disc in an optical drive, **Play Disc** appears in the library toolbar with the drive letter. Select it to boot the disc. In **Paths**, add one or more disc folders; the library scans their subfolders. Set separate folders for cover, CD, and bezel artwork if desired. While the library is open, OpenCDi checks for disc changes automatically and looks up missing artwork through LaunchBox when an internet connection is available.
+Use **Open Disc** to select a CHD, ISO, or CUE image. When Windows detects a readable CD-i disc, the toolbar also offers **Play Disc** with the drive letter. Both open the disc details screen. Choose **Play** with the mouse, press Enter, or press the configured gamepad Button I to start emulation. Use **Back to Library**, Escape, or Button II to leave the preview.
 
-The smallest artwork setting shows 10 columns and 4 rows. Disc names appear below the artwork. Covers appear as they download. The library displays the Cover Missing image when no cover is available, and the startup screen uses a generic CD-i disc when it has no disc art. Use the artwork slider to choose a larger size. Move through the library with the keyboard, mouse wheel, gamepad D-pad, or left analog stick. Press Enter or gamepad A to launch the selected disc.
+Use **Settings → Add Disc Folder** to scan a folder and its subfolders. Artwork uses the default app-data folders. **Settings → Switch BIOS** lets you choose another system ROM, which OpenCDi remembers for later launches.
+
+The smallest artwork setting shows 10 columns and 4 rows. Disc names appear below the artwork. Covers appear as they download. The library displays the Cover Missing image when no cover is available, and the startup screen uses a generic CD-i disc when it has no disc art. Use the artwork slider to choose a larger size. Move through the library with the keyboard, mouse wheel, gamepad D-pad, or left analog stick. Press Enter or gamepad A, or double-click a cover, to view the selected disc.
 
 ### Synopses and ScreenScraper
 
@@ -36,10 +38,9 @@ This folder is inside `Portable` when portable mode is active, or inside
 `%APPDATA%\OpenCDi` otherwise. You can add or edit these files yourself. The
 loading screen displays the synopsis to the right of the spinning disc.
 
-When configured, ScreenScraper is tried first for flat covers, disc images, 3D
-box art, back covers, and Wheel logos. LaunchBox fills missing artwork and
+When configured, ScreenScraper is tried first for flat covers, disc images, back covers, and Wheel logos. LaunchBox fills missing artwork and
 remains the first source for synopses, which are saved before artwork downloads. The public ScreenScraper gallery works without credentials for known CD-i titles. The new image folders under Artwork are
-Boxart, Back and Logo. Boxart requires a 3D case image. The library uses logos
+Boxart, Back and Logo. Boxart is generated locally from the front cover. The library uses logos
 below covers where available. The loading screen and pause Info show the disc,
 3D case, back cover, logo or title, and synopsis where available. To enable it, set the following
 Windows environment variables for your account and restart OpenCDi.
@@ -122,3 +123,36 @@ cargo build --release --bin opencdi
 
 The Windows executable is `target\release\opencdi.exe`. No BIOS ROM is required to compile the project.
 
+
+## Artwork progress
+
+The bottom of the library shows the current download phase, discs checked,
+images saved, a progress bar, and the title being checked. Covers are checked
+first. The current library page is prioritised when a lookup starts.
+Each disc tries ScreenScraper before LaunchBox for missing artwork.
+The progress bar runs separately for covers and other media. A completion
+summary stays visible for 15 seconds.
+
+## Controller settings and NVRAM
+
+The gamepad button used to open Controller Settings must be released before
+a new press can start assigning a binding. This applies from the library
+and the pause menu. Use the configured CD-i Button II to go back.
+
+Per-disc NVRAM is now the default for new settings. An explicit NVRAM mode
+saved in an existing configuration continues to apply.
+
+## Generated 3D box art and square covers
+
+OpenCDi generates 3D case artwork from each available front cover using the
+approved black CD-i jewel-case template. The case has a transparent background
+and no sideways title text. Generated images are saved in Artwork/Boxart with
+a --generated.png filename and are refreshed if the cover changes.
+
+3D box-art downloading is disabled for ScreenScraper and LaunchBox, including
+supplemental artwork downloads. The loading and Info screens use the locally
+generated cases.
+
+New cover downloads from both sources are saved as 600 x 600 PNGs. Existing
+downloaded covers in the managed Covers folder are normalised during the
+background artwork pass. Rectangular covers are resized to a square.

@@ -1,28 +1,8 @@
-#[path = "../audio.rs"]
-mod audio;
-#[path = "../bus.rs"]
-mod bus;
-#[path = "../cdic.rs"]
-mod cdic;
-#[path = "../cdrom.rs"]
-mod cdrom;
-#[path = "../dma.rs"]
-mod dma;
-#[path = "../dvc.rs"]
-mod dvc;
-#[path = "../mcd212.rs"]
-mod mcd212;
-#[path = "../nvram.rs"]
-mod nvram;
-#[path = "../scc_timer.rs"]
-mod scc_timer;
-#[path = "../slave.rs"]
-mod slave;
-
+use opencdi::mcd212;
 use std::path::{Path, PathBuf};
 use m68k::{CpuCore, CpuType, AddressBus};
-use crate::bus::CdiBus;
-use crate::mcd212::{TOTAL_SCANLINES, CYCLES_PER_SCANLINE};
+use opencdi::bus::CdiBus;
+use opencdi::mcd212::{TOTAL_SCANLINES, CYCLES_PER_SCANLINE};
 
 fn find_file(relative_subpath: &str) -> Option<PathBuf> {
     let candidates = [
@@ -139,17 +119,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if frame >= 2600 && frame % 100 == 0 {
-            let q_len = bus.cdic.audio.sample_queue.lock().unwrap().len();
+            let q_len = bus.cdic.audio.main.len();
             println!(
-                "[Frame {}] CDIC State: cmd=0x{:02X}, disc_cmd=0x{:02X}, lba={}, audio_chan=0x{:04X}, chan=0x{:08X}, dec_map={}, dec_addr=0x{:04X}, sec_cnt={}, total_audio_sectors={}, q_len={}",
+                "[Frame {}] CDIC State: cmd=0x{:02X}, disc_cmd=0x{:02X}, lba={}, audio_chan=0x{:04X}, chan=0x{:08X}, sec_cnt={}, total_audio_sectors={}, q_len={}",
                 frame,
                 bus.cdic.command,
                 bus.cdic.disc_command,
                 bus.cdic.curr_lba,
                 bus.cdic.audio_channel,
                 bus.cdic.channel,
-                bus.cdic.decoding_audio_map,
-                bus.cdic.decode_addr,
                 bus.cdic.audio_sector_counter,
                 bus.cdic.audio.total_sectors_decoded,
                 q_len
@@ -240,7 +218,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn save_bmp(bus: &bus::CdiBus, path: &str) -> std::io::Result<()> {
+fn save_bmp(bus: &CdiBus, path: &str) -> std::io::Result<()> {
     let width = mcd212::SCREEN_WIDTH as i32;
     let height = mcd212::SCREEN_HEIGHT as i32;
     let file_size = 54 + (width * height * 4) as u32;

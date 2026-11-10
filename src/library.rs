@@ -1,3 +1,4 @@
+use crate::library_catalogue::{Category, Collection, MISSING_ROWS};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
@@ -10,10 +11,23 @@ const MAX_ITEMS: usize = 512;
 pub const TOOLBAR_HEIGHT: usize = 42;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ToolbarPopup { Paths, Display, About }
+pub enum ToolbarPopup { Settings, About }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ToolbarAction { OpenDisc, PlayDisc(char), Controller, Paths, Display, About, Exit, AddDiscFolder, SetCovers, SetCd, SetBezels, Borderless, Decorated, Windowed }
+pub enum ToolbarAction { OpenDisc, PlayDisc(char), Controller, Settings, About, Exit, AddDiscFolder, SwitchBios, Borderless, Decorated, Windowed }
+
+const SETTINGS_X: usize = 229;
+const SETTINGS_Y: usize = TOOLBAR_HEIGHT + 4;
+const SETTINGS_WIDTH: usize = 215;
+const SETTINGS_ROW: usize = 22;
+const SETTINGS_ITEMS: [(&str, ToolbarAction); 5] = [
+    ("Borderless Fullscreen", ToolbarAction::Borderless),
+    ("Decorated Fullscreen", ToolbarAction::Decorated),
+    ("Windowed", ToolbarAction::Windowed),
+    ("Add Disc Folder…", ToolbarAction::AddDiscFolder),
+    ("Switch BIOS…", ToolbarAction::SwitchBios),
+];
+
 #[derive(Clone, Copy)]
 pub struct LibraryLayout {
     pub columns: usize,
@@ -42,7 +56,7 @@ pub fn layout(art_size: u8) -> LibraryLayout {
     let gap = 10;
     let left = 14;
     let top = 108;
-    let bottom = H - 69;
+    let bottom = H - 105;
     let cell_w = (W - 2 * left - gap * (columns - 1)) / columns;
     let cell_h = (bottom - top - gap * (rows - 1)) / rows;
     LibraryLayout { columns, rows, cell_w, cell_h, gap, left, top }
@@ -111,6 +125,14 @@ impl<'a> NativeCanvas<'a> {
         let pw=self.x(x.saturating_add(w)).saturating_sub(px); let ph=self.y(y.saturating_add(h)).saturating_sub(py);
         blit_fit_scaled(self.dst,self.width,self.height,art,px,py,pw,ph);
     }
+    pub fn cover_fit(&mut self, art: &Artwork, x: usize, y: usize, w: usize, h: usize) {
+        let px = self.x(x);
+        let py = self.y(y);
+        let pw = self.x(x.saturating_add(w)).saturating_sub(px);
+        let ph = self.y(y.saturating_add(h)).saturating_sub(py);
+        blit_cover_fit(self.dst, self.width, self.height, art, px, py, pw, ph);
+    }
+
     pub fn ring_art(&mut self,art:&Artwork,box_xywh:(usize,usize,usize,usize),center:(f32,f32),radius:f32,color:u32){
         if art.w==0||art.h==0{return;}
         let(x,y,w,h)=box_xywh;let px=self.x(x);let py=self.y(y);let pw=self.x(x+w).saturating_sub(px);let ph=self.y(y+h).saturating_sub(py);
@@ -135,14 +157,19 @@ impl<'a> NativeCanvas<'a> {
     }
 }
 
-#[cfg(windows)]
 impl Drop for NativeCanvas<'_> {
-    fn drop(&mut self) { draw_labels_gdi(self); }
+    fn drop(&mut self) { self.flush_labels(); }
 }
 
-#[cfg(not(windows))]
-impl Drop for NativeCanvas<'_> {
-    fn drop(&mut self) {
+impl NativeCanvas<'_> {
+    #[cfg(windows)]
+    fn flush_labels(&mut self) {
+        draw_labels_gdi(self);
+        self.labels.clear();
+    }
+
+    #[cfg(not(windows))]
+    fn flush_labels(&mut self) {
         let labels=std::mem::take(&mut self.labels);
         for label in labels {
             if let Some((right, bottom)) = label.bounds {
@@ -265,12 +292,10 @@ pub fn scan_paths(roots: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 pub fn load_items(paths: Vec<PathBuf>, covers_root: &Path, cd_root: &Path, artwork_root: &Path) -> Vec<Item> {
-    let fallback_covers = artwork_root.join("Covers");
-    let fallback_cd = artwork_root.join("CD");
     paths.into_iter().map(|path| {
         let title = disc_title(&path);
-        let cover = load_cover_artwork(&path, covers_root).or_else(|| load_cover_artwork(&path, &fallback_covers));
-        let disc = load_disc_artwork(&path, cd_root).or_else(|| load_disc_artwork(&path, &fallback_cd));
+        let cover = load_cover_artwork(&path, covers_root);
+        let disc = load_disc_artwork(&path, cd_root);
         let logo = managed_art_path(&path, artwork_root, crate::launchbox::ArtworkKind::Logo).and_then(|p| load_artwork(&p));
         Item { path, title, cover, disc, logo }
     }).collect()
@@ -279,6 +304,10 @@ pub fn load_items(paths: Vec<PathBuf>, covers_root: &Path, cd_root: &Path, artwo
 pub fn managed_art_path(disc: &Path, root: &Path, kind: crate::launchbox::ArtworkKind) -> Option<PathBuf> {
     let folder = root.join(kind.folder());
     let title = disc_title(disc);
+    if kind == crate::launchbox::ArtworkKind::Boxart {
+        let path = crate::boxart::generated_path(root, &title);
+        return path.is_file().then_some(path);
+    }
     if let Some(path) = crate::screenscraper::preferred_gallery_image(&folder, kind, &title) { return Some(path); }
     let stem = disc.file_stem()?.to_string_lossy();
     ["png", "jpg", "jpeg"].into_iter().flat_map(|extension| {
@@ -326,25 +355,6 @@ fn scan_dir(dir: &Path, depth: usize, seen: &mut HashSet<PathBuf>, out: &mut Vec
     }
 }
 
-fn sibling_art(disc: &Path, cover: bool) -> Option<PathBuf> {
-    let parent = disc.parent().unwrap_or_else(|| Path::new("."));
-    let stem = disc.file_stem()?.to_string_lossy();
-    let kind = if cover { "cover" } else { "disc" };
-    let mut candidates = Vec::new();
-    for (suffix, dir) in if cover { vec![("", "covers"), ("-cover", "covers"), ("_cover", "covers"), (".cover", "artwork")] }
-                          else { vec![("-disc", "discs"), ("_disc", "discs"), (".disc", "artwork"), ("-disk", "discs")] } {
-        for ext in ["png", "jpg", "jpeg"] {
-            candidates.push(parent.join(dir).join(format!("{stem}{suffix}.{ext}")));
-            candidates.push(parent.join("artwork").join(format!("{stem}{suffix}.{ext}")));
-        }
-    }
-    for ext in ["png", "jpg", "jpeg"] {
-        candidates.push(parent.join(format!("{stem}-{kind}.{ext}")));
-        if cover { candidates.push(parent.join(format!("{stem}.{ext}"))); }
-    }
-    candidates.into_iter().find(|p| p.is_file())
-}
-
 fn art_in_root(disc: &Path, root: &Path, cover: bool) -> Option<PathBuf> {
     let stem = disc.file_stem()?.to_string_lossy();
     let downloaded_name = crate::launchbox::safe_name(&disc_title(disc));
@@ -363,20 +373,26 @@ fn art_in_root(disc: &Path, root: &Path, cover: bool) -> Option<PathBuf> {
 pub fn has_disc_image(disc: &Path, root: &Path, cover: bool) -> bool {
     let kind = if cover { crate::launchbox::ArtworkKind::Cover } else { crate::launchbox::ArtworkKind::Disc };
     crate::screenscraper::preferred_gallery_image(root, kind, &disc_title(disc)).is_some()
-        || art_in_root(disc, root, cover).is_some() || sibling_art(disc, cover).is_some()
+        || art_in_root(disc, root, cover).is_some()
+}
+
+pub fn cover_artwork_path(disc: &Path, root: &Path) -> Option<PathBuf> {
+    crate::screenscraper::preferred_gallery_image(root, crate::launchbox::ArtworkKind::Cover, &disc_title(disc))
+        .or_else(|| art_in_root(disc, root, true))
 }
 
 pub fn load_cover_artwork(disc: &Path, root: &Path) -> Option<Artwork> {
     crate::screenscraper::preferred_gallery_image(root, crate::launchbox::ArtworkKind::Cover, &disc_title(disc))
         .and_then(|path| load_artwork(&path))
-        .or_else(|| art_in_root(disc, root, true).or_else(|| sibling_art(disc, true)).and_then(|p| load_artwork(&p)))
+        .or_else(|| art_in_root(disc, root, true).and_then(|p| load_artwork(&p)))
 }
 
 pub fn load_disc_artwork(disc: &Path, root: &Path) -> Option<Artwork> {
     let kind = crate::launchbox::ArtworkKind::Disc;
     crate::screenscraper::preferred_gallery_image(root, kind, &disc_title(disc))
         .and_then(|path| load_artwork(&path))
-        .or_else(|| art_in_root(disc, root, false).or_else(|| sibling_art(disc, false)).and_then(|p| load_artwork(&p)))
+        .or_else(|| art_in_root(disc, root, false).and_then(|p| load_artwork(&p)))
+        .map(|image| crate::disc_art::normalize(&image))
 }
 
 pub fn load_artwork(path: &Path) -> Option<Artwork> {
@@ -459,8 +475,7 @@ pub fn render(dst: &mut [u32], items: &[Item], selected: usize, art_size: u8) {
     render_size_slider(dst, art_size);
     if items.is_empty() {
         text(dst, 205, 210, "NO DISC IMAGES FOUND", 0xFFFFD27A, 2);
-        text(dst, 135, 250, "ADD CHD ISO OR CUE BIN FILES BESIDE THE APP", 0xFFE1E5ED, 1);
-        text(dst, 200, 280, "OR PLACE THEM IN A GAMES, DISCS OR ROMS FOLDER", 0xFFE1E5ED, 1);
+        text(dst, 135, 250, "ADD A DISC FOLDER FROM PATHS TO BEGIN", 0xFFE1E5ED, 1);
         text(dst, 180, 330, "PRESS CTRL O TO BROWSE FOR A DISC", 0xFF90A4B8, 1);
     } else {
         let layout = layout(art_size);
@@ -477,7 +492,7 @@ pub fn render(dst: &mut [u32], items: &[Item], selected: usize, art_size: u8) {
             let art_y = y + 2;
             let art_w = layout.cell_w.saturating_sub(6);
             let art_h = layout.cell_h.saturating_sub(42);
-            blit_fit(dst, items[i].cover.as_ref().unwrap_or(&MISSING_COVER), art_x, art_y, art_w, art_h);
+            blit_cover_fit(dst, W, H, items[i].cover.as_ref().unwrap_or(&MISSING_COVER), art_x, art_y, art_w, art_h);
             let title: String = items[i].title.chars().take(24).collect();
             text(dst, x + 4, y + layout.cell_h - 30, &title, if active { 0xFFFFD98A } else { 0xFFE6EAF0 }, 1);
             let format = ext(&items[i].path).to_ascii_uppercase();
@@ -486,7 +501,7 @@ pub fn render(dst: &mut [u32], items: &[Item], selected: usize, art_size: u8) {
         }
         let pages = (items.len() + per_page - 1) / per_page;
         text(dst, 23, 512, "ARROWS OR GAMEPAD D PAD / STICK: MOVE     ENTER / A: PLAY", 0xFFD5DCE7, 1);
-        text(dst, 23, 530, "MOUSE: SELECT / DOUBLE CLICK: PLAY     WHEEL: SCROLL     ESC: QUIT", 0xFFD5DCE7, 1);
+        text(dst, 23, 530, "MOUSE: SELECT / DOUBLE CLICK: DETAILS     WHEEL: SCROLL     ESC: QUIT", 0xFFD5DCE7, 1);
         text(dst, 717, 544, &format!("{}/{}", selected / per_page + 1, pages), 0xFFFFD98A, 1);
     }
 }
@@ -498,6 +513,7 @@ pub struct Search {
     pub caret: usize,
     pub select_all: bool,
     matches: Vec<usize>,
+    pub collection: Collection,
 }
 
 fn search_key(text: &str) -> String {
@@ -507,21 +523,27 @@ fn search_key(text: &str) -> String {
 impl Search {
     pub fn rebuild(&mut self, items: &[Item]) {
         self.matches.clear();
-        if self.query.is_empty() { return; }
+        if self.is_unfiltered() { return; }
         let terms: Vec<_> = self.query.split_whitespace().map(search_key).filter(|term| !term.is_empty()).collect();
         self.matches.extend(items.iter().enumerate().filter_map(|(index, item)| {
+            if !self.collection.includes(index) { return None; }
+            if terms.is_empty() { return Some(index); }
             let title = search_key(&item.title);
             let file = search_key(&item.path.file_name().unwrap_or_default().to_string_lossy());
             terms.iter().all(|term| title.contains(term) || file.contains(term)).then_some(index)
         }));
     }
 
+    fn is_unfiltered(&self) -> bool {
+        self.query.is_empty() && self.collection.category == Category::All
+    }
+
     pub fn len(&self, items: &[Item]) -> usize {
-        if self.query.is_empty() { items.len() } else { self.matches.len() }
+        if self.is_unfiltered() { items.len() } else { self.matches.len() }
     }
 
     pub fn get<'a>(&self, items: &'a [Item], index: usize) -> Option<&'a Item> {
-        items.get(if self.query.is_empty() { index } else { *self.matches.get(index)? })
+        items.get(if self.is_unfiltered() { index } else { *self.matches.get(index)? })
     }
 
     pub fn position(&self, items: &[Item], path: &Path) -> Option<usize> {
@@ -568,31 +590,118 @@ impl Search {
 }
 
 pub fn search_hit(x: i32, y: i32) -> Option<bool> {
-    ((455..710).contains(&x) && (58..87).contains(&y)).then_some(x >= 681)
+    ((455..710).contains(&x) && (45..73).contains(&y)).then_some(x >= 681)
 }
 
-pub fn render_native(dst: &mut [u32], width: usize, height: usize, view: (usize,usize,usize,usize), items: &[Item], selected: usize, art_size: u8, toolbar_visible: bool, mode: DisplayMode, popup: Option<ToolbarPopup>, optical_disc: Option<char>, search: &Search) {
+const TAB_LEFT: i32 = 14;
+const TAB_WIDTH: i32 = 92;
+const TAB_TOP: i32 = 76;
+const TAB_HEIGHT: i32 = 27;
+const MISSING_LEFT: i32 = 50;
+const MISSING_RIGHT: i32 = 718;
+const MISSING_TOP: i32 = 111;
+const MISSING_BOTTOM: i32 = 445;
+const MISSING_FIRST_ROW: i32 = 158;
+const MISSING_ROW_HEIGHT: i32 = 25;
+
+pub fn category_hit(x: i32, y: i32) -> Option<Category> {
+    if x < TAB_LEFT || !(TAB_TOP..TAB_TOP + TAB_HEIGHT).contains(&y) { return None; }
+    Category::TABS.get(((x - TAB_LEFT) / TAB_WIDTH) as usize).copied()
+}
+
+pub fn collection_count_hit(x: i32, y: i32) -> bool {
+    (476..753).contains(&x) && (H as i32 - 94..H as i32 - 62).contains(&y)
+}
+
+pub fn missing_close_hit(x: i32, y: i32) -> bool {
+    (647..704).contains(&x) && (120..148).contains(&y)
+}
+
+pub fn missing_row_hit(x: i32, y: i32) -> Option<usize> {
+    if !(MISSING_LEFT..MISSING_RIGHT).contains(&x) || y < MISSING_FIRST_ROW { return None; }
+    let row = ((y - MISSING_FIRST_ROW) / MISSING_ROW_HEIGHT) as usize;
+    (row < MISSING_ROWS).then_some(row)
+}
+
+fn render_missing(c: &mut NativeCanvas<'_>, collection: &Collection, offset: usize) {
+    c.labels.retain(|label| label.y < MISSING_TOP as usize || label.y >= MISSING_BOTTOM as usize);
+    c.round_rect(MISSING_LEFT as usize, MISSING_TOP as usize, (MISSING_RIGHT - MISSING_LEFT) as usize,
+        (MISSING_BOTTOM - MISSING_TOP) as usize, 9, 0xFF365573);
+    c.round_rect(MISSING_LEFT as usize + 1, MISSING_TOP as usize + 1, (MISSING_RIGHT - MISSING_LEFT) as usize - 2,
+        (MISSING_BOTTOM - MISSING_TOP) as usize - 2, 8, 0xFF142337);
+    c.text(66, 124, &format!("Missing titles · {}", collection.category.label()), 0xFFF1F5FA, 2);
+    c.round_rect(647, 120, 57, 28, 5, 0xFF243C55);
+    c.centered_text(675, 127, "Close", 0xFFE5F1FF, 1);
+    if collection.missing_count() == 0 {
+        c.centered_text(W / 2, 250, "No missing titles in this category.", 0xFFD5DFEA, 1);
+        return;
+    }
+    for row in 0..MISSING_ROWS {
+        let Some(title) = collection.missing_title(offset + row) else { break; };
+        let y = MISSING_FIRST_ROW as usize + row * MISSING_ROW_HEIGHT as usize;
+        if row % 2 == 0 { c.rect(63, y, 642, MISSING_ROW_HEIGHT as usize, 0xFF192B40); }
+        c.text(72, y + 5, &short_title(&title.name, 84), 0xFFB9DEFF, 1);
+    }
+    let end = (offset + MISSING_ROWS).min(collection.missing_count());
+    c.text(68, 420, &format!("{}–{} of {}  ·  Scroll for more  ·  Click a title to open its source",
+        offset + 1, end, collection.missing_count()), 0xFFA3B6CB, 1);
+}
+
+pub fn render_native(dst: &mut [u32], width: usize, height: usize, view: (usize,usize,usize,usize), items: &[Item], selected: usize, art_size: u8, toolbar_visible: bool, mode: DisplayMode, popup: Option<ToolbarPopup>, optical_disc: Option<char>, search: &Search, progress: Option<&crate::launchbox::LookupProgress>) {
     let mut c=NativeCanvas::new(dst,width,height,view);
     for y in 0..H { let t=y as u32*10/H as u32; let color=0xFF000000|((10+t)<<16)|((20+t)<<8)|(34+t*2); c.rect(0,y,W,1,color); }
-    c.round_rect(12,50,W-24,45,10,0xFF101D2C);
-    c.text(25,64,"CD-I LIBRARY",0xFFF1F5FA,2);
-    if search.focused { c.round_rect(454,57,257,31,8,0xFF59B2F5); }
-    c.round_rect(455,58,255,29,8,0xFF1A293B);
-    c.ring(472,72,5,0xFF91A9C2);
-    c.line(476,76,6,0xFF91A9C2);
+    c.round_rect(12,43,W-24,32,8,0xFF101D2C);
+    c.text(25,48,"CD-I LIBRARY",0xFFF1F5FA,2);
+    if search.focused { c.round_rect(454,44,257,30,8,0xFF59B2F5); }
+    c.round_rect(455,45,255,28,8,0xFF1A293B);
+    c.ring(472,58,5,0xFF91A9C2);
+    c.line(476,62,6,0xFF91A9C2);
     if search.query.is_empty() {
-        c.text(486,67,"Search library...",0xFFA3B6CB,1);
+        c.text(486,53,"Search library...",0xFFA3B6CB,1);
     } else {
         let mut chars: Vec<_> = search.query.chars().collect();
         let caret = search.query[..search.caret].chars().count();
         let start = if search.focused { caret.saturating_sub(21) } else { 0 };
         if search.focused && !search.select_all { chars.insert(caret, '|'); }
         let shown: String = chars.into_iter().skip(start).take(23).collect();
-        if search.focused && search.select_all { c.round_rect(483,64,194,18,3,0xFF324F72); }
-        c.text(486,67,&shown,0xFFF1F5FA,1);
-        c.text(689,66,"×",0xFFD6E2EF,1);
+        if search.focused && search.select_all { c.round_rect(483,50,194,18,3,0xFF324F72); }
+        c.text(486,53,&shown,0xFFF1F5FA,1);
+        c.text(689,52,"×",0xFFD6E2EF,1);
     }
-    c.rect(0,H-64,W,64,0xFF0D1725); c.rect(0,H-64,W,1,0xFF26374A);
+    c.line(14, 104, W - 28, 0xFF26374A);
+    for (index, category) in Category::TABS.into_iter().enumerate() {
+        let x = TAB_LEFT as usize + index * TAB_WIDTH as usize;
+        let active = category == search.collection.category;
+        if active {
+            c.round_rect(x + 1, TAB_TOP as usize, TAB_WIDTH as usize - 2, TAB_HEIGHT as usize, 5, 0xFF223B56);
+            c.rect(x + 3, 101, TAB_WIDTH as usize - 6, 2, 0xFF62B7F8);
+        }
+        c.centered_text(x + TAB_WIDTH as usize / 2, 82, category.label(),
+            if active { 0xFFE6F4FF } else { 0xFFB9C9DB }, 1);
+    }
+    c.rect(0,H-100,W,100,0xFF0D1725);
+    c.rect(0,H-100,W,1,0xFF26374A);
+    if let Some(progress) = progress {
+        let status = if progress.finished {
+            format!("{} · {} images saved · {} discs missing media", progress.phase, progress.saved, progress.missing)
+        } else {
+            format!("{} · {} of {} discs · {} images saved", progress.phase, progress.checked, progress.total, progress.saved)
+        };
+        c.text(18,H-94,&short_title(&status, 70),0xFFD5DFEA,1);
+        c.round_rect(18,H-75,180,3,1,0xFF33465A);
+        let filled = if progress.total == 0 { 0 } else { progress.checked.min(progress.total) * 180 / progress.total };
+        c.round_rect(18,H-75,filled,3,1,0xFF57AEF5);
+        if !progress.current.is_empty() {
+            c.text(213,H-79,&short_title(&progress.current, 42),0xFF9AAFC4,1);
+        }
+    }
+    c.round_rect(476, H - 94, 277, 32, 6, 0xFF203852);
+    let owned = search.collection.owned_count();
+    let missing = search.collection.missing_count();
+    let discs = if owned == 1 { "disc" } else { "discs" };
+    let titles = if missing == 1 { "title" } else { "titles" };
+    let collection_count = format!("{owned} {discs} in collection  ·  {missing} {titles} missing");
+    c.centered_text(615, H - 85, &collection_count, 0xFFE6F4FF, 1);
     c.text(18,H-48,"ARTWORK SIZE",0xFFB7C5D4,1);
     let track_x=125; let track_w=145; let track_y=H-35;
     c.round_rect(track_x,track_y,track_w,4,2,0xFF33465A);
@@ -607,11 +716,13 @@ pub fn render_native(dst: &mut [u32], width: usize, height: usize, view: (usize,
         c.text(338, H - 42, &short_title(&item.title, 46), 0xFFB7C5D4, 1);
     }
     let count_label = if search.query.is_empty() { format!("{count} ITEMS") }
-        else { format!("{count} OF {}", items.len()) };
+        else { format!("{count} OF {}", search.collection.owned_count()) };
     c.text(660,H-42,&count_label,0xFF9AAFC4,1);
     let per_page = l.visible_count();
     if count == 0 && !search.query.is_empty() {
         c.centered_text(W / 2, 242, "No discs match your search", 0xFFF1F5FA, 2);
+    } else if count == 0 && search.collection.category != Category::All {
+        c.centered_text(W / 2, 242, "No discs in this category", 0xFFF1F5FA, 2);
     } else if count == 0 {
         c.text(205,210,"NO DISC IMAGES FOUND",0xFFF1F5FA,2);
         c.text(135,250,"ADD A DISC FOLDER FROM PATHS TO BEGIN",0xFF9AAFC4,1);
@@ -623,7 +734,7 @@ pub fn render_native(dst: &mut [u32], width: usize, height: usize, view: (usize,
             let col=slot%l.columns; let row=slot/l.columns;
             let x=l.left+col*(l.cell_w+l.gap); let y=l.top+row*(l.cell_h+l.gap);
             let art_x=x+4; let art_y=y+2; let art_w=l.cell_w.saturating_sub(8); let art_h=l.cell_h.saturating_sub(31);
-            c.art_fit(item.cover.as_ref().unwrap_or(&MISSING_COVER), art_x, art_y, art_w, art_h);
+            c.cover_fit(item.cover.as_ref().unwrap_or(&MISSING_COVER), art_x, art_y, art_w, art_h);
             let active = i == selected;
             if let Some(logo) = &item.logo {
                 c.art_fit(logo, x + 3, y + l.cell_h - 28, l.cell_w - 6, 22);
@@ -639,8 +750,11 @@ pub fn render_native(dst: &mut [u32], width: usize, height: usize, view: (usize,
             if active { c.round_rect(x+3,y+l.cell_h-4,l.cell_w.saturating_sub(6),2,1,0xFF56B1F7); }
         }
         let pages=count.div_ceil(per_page);
-        c.text(18,H-18,"MOUSE: SELECT  ·  DOUBLE CLICK: PLAY    D-PAD / STICK: MOVE",0xFF778DA5,1);
+        c.text(18,H-18,"MOUSE: SELECT  ·  DOUBLE CLICK: DETAILS    D-PAD / STICK: MOVE",0xFF778DA5,1);
         c.text(686,H-18,&format!("{}/{}",selected/per_page+1,pages),0xFFB7C5D4,1);
+    }
+    if let Some(offset) = search.collection.missing_offset {
+        render_missing(&mut c, &search.collection, offset);
     }
     // Draw popovers over the grid so they remain legible when they extend below the toolbar.
     if toolbar_visible { render_toolbar_native(&mut c,mode,popup,optical_disc); }
@@ -661,21 +775,20 @@ fn wrap_title(title: &str, width: usize) -> (String, String) {
 
 fn render_toolbar_native(c:&mut NativeCanvas<'_>,mode:DisplayMode,popup:Option<ToolbarPopup>, optical_disc: Option<char>){
     c.rect(0,0,W,TOOLBAR_HEIGHT,0xFF0C1726); c.rect(0,TOOLBAR_HEIGHT-1,W,1,0xFF26374A);
-    let buttons=[(12,100,"Open Disc"),(116,108,"Controller"),(229,92,"Paths"),(326,96,"Settings"),(427,112,"About"),(676,80,"Exit")];
-    for (i,(x,w,label)) in buttons.iter().enumerate(){
-        let active=matches!((i,popup),(2,Some(ToolbarPopup::Paths))|(3,Some(ToolbarPopup::Display))|(4,Some(ToolbarPopup::About)));
-        if active { c.round_rect(*x,5,*w,31,7,0xFF1B2D42); }
-        let cx=*x+13;let cy=15;let color=if i==5{0xFFFF7777}else{0xFFB6C7DA};
+    let buttons=[(0,12,100,"Open Disc"),(1,116,108,"Controller"),(3,229,109,"Settings"),(4,344,112,"About"),(5,676,80,"Exit")];
+    for &(i,x,w,label) in &buttons {
+        let active=matches!((i,popup),(3,Some(ToolbarPopup::Settings))|(4,Some(ToolbarPopup::About)));
+        if active { c.round_rect(x,5,w,31,7,0xFF1B2D42); }
+        let cx=x+13;let cy=15;let color=if i==5{0xFFFF7777}else{0xFFB6C7DA};
         match i {
             0=>{c.round_rect(cx-7,cy-5,14,11,3,0xFF334B65);c.rect(cx-5,cy-1,10,5,0xFF0C1726);c.rect(cx-4,cy-5,6,3,0xFF334B65);}
             1=>{c.round_rect(cx-8,cy-5,16,11,4,0xFF344D67);c.rect(cx-5,cy-1,3,2,0xFF0C1726);c.rect(cx+3,cy-1,3,2,0xFF0C1726);c.rect(cx-1,cy+2,3,2,0xFF0C1726);}
-            2=>{c.round_rect(cx-7,cy-6,14,13,2,0xFF344D67);c.rect(cx-4,cy-3,8,1,0xFF0C1726);c.rect(cx-4,cy,8,1,0xFF0C1726);c.rect(cx-4,cy+3,6,1,0xFF0C1726);}
             3=>{c.ring(cx,cy,7,color);c.ring(cx,cy,3,color);for(dx,dy)in[(0,-10),(0,8),(-10,0),(8,0)]{c.rect((cx as isize+dx)as usize,(cy as isize+dy)as usize,2,2,color);}}
             4=>{c.ring(cx,cy,8,color);c.rect(cx-1,cy-4,2,2,color);c.rect(cx-1,cy,2,5,color);}
             _=>{c.rect(cx-1,cy-8,3,12,color);c.rect(cx+2,cy+2,6,3,color);c.rect(cx+7,cy+4,2,4,color);}
         }
-        c.text(*x+31,14,label,if i==5{0xFFFF808A}else{0xFFE0E8F1},1);
-        if i!=5 { c.rect(*x+*w,11,1,18,0xFF213247); }
+        c.text(x+31,14,label,if i==5{0xFFFF808A}else{0xFFE0E8F1},1);
+        if i!=5 { c.rect(x+w,11,1,18,0xFF213247); }
     }
     if let Some(letter) = optical_disc {
         c.round_rect(550, 5, 115, 31, 7, 0xFF1B2D42);
@@ -685,16 +798,12 @@ fn render_toolbar_native(c:&mut NativeCanvas<'_>,mode:DisplayMode,popup:Option<T
     }
     let _=mode;
     match popup {
-        Some(ToolbarPopup::Paths) => {
-            c.round_rect(229, TOOLBAR_HEIGHT + 4, 228, 100, 9, 0xFF17263A);
-            for (row, label) in ["Add Disc Folder", "Set Cover Artwork", "Set CD Artwork", "Set Bezels"].iter().enumerate() {
-                c.text(245, TOOLBAR_HEIGHT + 12 + row * 22, label, 0xFFE6EDF5, 1);
-            }
-        }
-        Some(ToolbarPopup::Display) => {
-            c.round_rect(326, TOOLBAR_HEIGHT + 4, 206, 78, 9, 0xFF17263A);
-            for (row, label) in ["Borderless Fullscreen", "Decorated Fullscreen", "Windowed"].iter().enumerate() {
-                c.text(339, TOOLBAR_HEIGHT + 10 + row * 22, label, 0xFFE6EDF5, 1);
+        Some(ToolbarPopup::Settings) => {
+            // Paint any queued grid text before the opaque menu covers it.
+            c.flush_labels();
+            c.round_rect(SETTINGS_X, SETTINGS_Y, SETTINGS_WIDTH, SETTINGS_ITEMS.len() * SETTINGS_ROW + 12, 9, 0xFF17263A);
+            for (row, (label, _)) in SETTINGS_ITEMS.iter().enumerate() {
+                c.text(SETTINGS_X + 13, SETTINGS_Y + 8 + row * SETTINGS_ROW, label, 0xFFE6EDF5, 1);
             }
         }
         Some(ToolbarPopup::About) => {
@@ -717,7 +826,7 @@ fn render_toolbar_native(c:&mut NativeCanvas<'_>,mode:DisplayMode,popup:Option<T
             ].iter().enumerate() {
                 c.text(157, 207 + row * 17, line, 0xFFE6EDF5, 1);
             }
-            for (row, line) in ["Emulator Core by sigsantilio", "User Interface by sionisaac", "App Version 1"].iter().enumerate() {
+            for (row, line) in ["Emulator Core by sigsantilio and Arnold de Ruiter", "User Interface by sionisaac", "App Version 1"].iter().enumerate() {
                 c.text(157, 295 + row * 19, line, 0xFFE6EDF5, 1);
             }
             c.round_rect(535, 365, 76, 30, 6, 0xFF243B55);
@@ -733,8 +842,8 @@ pub fn about_close_hit(x: usize, y: usize) -> bool {
 
 pub fn toolbar_popup_hit(x: usize, y: usize, popup: Option<ToolbarPopup>) -> bool {
     match popup {
-        Some(ToolbarPopup::Paths) => (229..457).contains(&x) && (TOOLBAR_HEIGHT + 4..TOOLBAR_HEIGHT + 104).contains(&y),
-        Some(ToolbarPopup::Display) => (326..532).contains(&x) && (TOOLBAR_HEIGHT + 4..TOOLBAR_HEIGHT + 82).contains(&y),
+        Some(ToolbarPopup::Settings) => (SETTINGS_X..SETTINGS_X + SETTINGS_WIDTH).contains(&x)
+            && (SETTINGS_Y..SETTINGS_Y + SETTINGS_ITEMS.len() * SETTINGS_ROW + 12).contains(&y),
         _ => false,
     }
 }
@@ -756,8 +865,61 @@ pub fn draw_covers_high_res(dst: &mut [u32], dst_w: usize, dst_h: usize, view: (
         let h = layout.cell_h.saturating_sub(42);
         let sx = |n: usize| vx + n * vw / W;
         let sy = |n: usize| vy + n * vh / H;
-        blit_fit_scaled(dst, dst_w, dst_h, art, sx(x), sy(y), (x + w) * vw / W + vx - sx(x), (y + h) * vh / H + vy - sy(y));
+        blit_cover_fit(dst, dst_w, dst_h, art, sx(x), sy(y), (x + w) * vw / W + vx - sx(x), (y + h) * vh / H + vy - sy(y));
     }
+}
+
+const CASE_WIDTH: usize = 668;
+const CASE_HEIGHT: usize = 612;
+
+static COVER_FRAME: LazyLock<Artwork> = LazyLock::new(|| {
+    let template = load_png_bytes(include_bytes!("../assets/boxart_case.png"))
+        .expect("embedded jewel case");
+    let mut pixels = vec![0; CASE_WIDTH * CASE_HEIGHT];
+    for y in 0..CASE_HEIGHT {
+        for x in 0..CASE_WIDTH {
+            let edge = x.min(CASE_WIDTH - 1 - x).min(y).min(CASE_HEIGHT - 1 - y);
+            let color = match edge {
+                0 => 0x99848d96,
+                1 => 0xffd7dbe0,
+                2 => 0xfff1f3f5,
+                3 => 0xff838c96,
+                4 => 0xffc0c6cd,
+                _ => 0xff22252a,
+            };
+            pixels[y * CASE_WIDTH + x] = color;
+        }
+    }
+    for y in 6..606 {
+        pixels[y * CASE_WIDTH + 62..y * CASE_WIDTH + 662].fill(0);
+        for x in 6..56 {
+            pixels[y * CASE_WIDTH + x] = sample_bilinear(&template,
+                13.0 + (x - 6) as f32 * 30.0 / 50.0,
+                12.0 + (y - 6) as f32 * 430.0 / 600.0) | 0xff000000;
+        }
+        pixels[y * CASE_WIDTH + 57] = 0xffe4e7ea;
+        pixels[y * CASE_WIDTH + 59] = 0xff747e88;
+        pixels[y * CASE_WIDTH + 60] = 0xffc0c5ca;
+    }
+    Artwork { w: CASE_WIDTH, h: CASE_HEIGHT, pixels: pixels.into() }
+});
+
+fn blit_cover_fit(
+    dst: &mut [u32], dst_w: usize, dst_h: usize, cover: &Artwork,
+    x: usize, y: usize, w: usize, h: usize,
+) {
+    if w == 0 || h == 0 { return; }
+    let scale = (w as f32 / CASE_WIDTH as f32).min(h as f32 / CASE_HEIGHT as f32);
+    let frame_w = (CASE_WIDTH as f32 * scale).max(1.0) as usize;
+    let frame_h = (CASE_HEIGHT as f32 * scale).max(1.0) as usize;
+    let left = x + (w - frame_w) / 2;
+    let top = y + (h - frame_h) / 2;
+    let inset_x = left + 62 * frame_w / CASE_WIDTH;
+    let inset_y = top + 6 * frame_h / CASE_HEIGHT;
+    let inset_w = 600 * frame_w / CASE_WIDTH;
+    let inset_h = 600 * frame_h / CASE_HEIGHT;
+    blit_fit_scaled(dst, dst_w, dst_h, cover, inset_x, inset_y, inset_w, inset_h);
+    blit_fit_scaled(dst, dst_w, dst_h, &COVER_FRAME, left, top, frame_w, frame_h);
 }
 
 fn blit_fit_scaled(dst: &mut [u32], dst_w: usize, dst_h: usize, art: &Artwork, x: usize, y: usize, w: usize, h: usize) {
@@ -836,23 +998,40 @@ pub fn render_boot_details(
     });
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreviewAction { Play, Back }
+
+const PLAY_BUTTON: (usize, usize, usize, usize) = (312, 510, 144, 40);
+const BACK_BUTTON: (usize, usize, usize, usize) = (22, 524, 128, 28);
+
+pub fn render_preview_actions(dst: &mut [u32], width: usize, height: usize, view: (usize, usize, usize, usize)) {
+    let mut canvas = NativeCanvas::overlay(dst, width, height, view);
+    let (x, y, w, h) = PLAY_BUTTON;
+    canvas.round_rect(x, y, w, h, 8, 0xFF2E6698);
+    canvas.centered_text(x + w / 2, y + 8, "Play", 0xFFF1F5FA, 2);
+    let (x, y, w, h) = BACK_BUTTON;
+    canvas.round_rect(x, y, w, h, 6, 0xFF243B55);
+    canvas.centered_text(x + w / 2, y + 6, "Back to Library", 0xFFE6EDF5, 1);
+}
+
+pub fn preview_hit(x: i32, y: i32) -> Option<PreviewAction> {
+    let (x, y) = (usize::try_from(x).ok()?, usize::try_from(y).ok()?);
+    [(PLAY_BUTTON, PreviewAction::Play), (BACK_BUTTON, PreviewAction::Back)].into_iter()
+        .find_map(|((left, top, w, h), action)| {
+            ((left..left + w).contains(&x) && (top..top + h).contains(&y)).then_some(action)
+        })
+}
+
 pub fn toolbar_hit(x: usize, y: usize, popup: Option<ToolbarPopup>, optical_disc: Option<char>) -> Option<ToolbarAction> {
-    if let Some(popup) = popup {
-        if popup == ToolbarPopup::Paths && toolbar_popup_hit(x, y, Some(popup)) {
-            return match y.saturating_sub(TOOLBAR_HEIGHT + 10) / 22 {
-                0 => Some(ToolbarAction::AddDiscFolder), 1 => Some(ToolbarAction::SetCovers), 2 => Some(ToolbarAction::SetCd),
-                3 => Some(ToolbarAction::SetBezels), _ => None,
-            };
-        }
-        if popup == ToolbarPopup::Display && toolbar_popup_hit(x, y, Some(popup)) {
-            return match y.saturating_sub(TOOLBAR_HEIGHT + 8) / 22 { 0 => Some(ToolbarAction::Borderless), 1 => Some(ToolbarAction::Decorated), 2 => Some(ToolbarAction::Windowed), _ => None };
-        }
+    if popup == Some(ToolbarPopup::Settings) && toolbar_popup_hit(x, y, popup) {
+        let row = y.checked_sub(SETTINGS_Y + 6)? / SETTINGS_ROW;
+        return SETTINGS_ITEMS.get(row).map(|&(_, action)| action);
     }
     if y >= TOOLBAR_HEIGHT { return None; }
     match x {
         12..=111 => Some(ToolbarAction::OpenDisc), 116..=224 => Some(ToolbarAction::Controller),
-        229..=321 => Some(ToolbarAction::Paths), 326..=422 => Some(ToolbarAction::Display),
-        427..=539 => Some(ToolbarAction::About), 550..=664 => optical_disc.map(ToolbarAction::PlayDisc), 676..=760 => Some(ToolbarAction::Exit), _ => None,
+        229..=337 => Some(ToolbarAction::Settings),
+        344..=455 => Some(ToolbarAction::About), 550..=664 => optical_disc.map(ToolbarAction::PlayDisc), 676..=760 => Some(ToolbarAction::Exit), _ => None,
     }
 }
 
@@ -975,7 +1154,7 @@ pub(crate) fn blit_fit(dst: &mut [u32], art: &Artwork, x: usize, y: usize, w: us
     }}
 }
 
-fn sample_bilinear(art: &Artwork, x: f32, y: f32) -> u32 {
+pub(crate) fn sample_bilinear(art: &Artwork, x: f32, y: f32) -> u32 {
     let x = x.clamp(0.0, art.w.saturating_sub(1) as f32);
     let y = y.clamp(0.0, art.h.saturating_sub(1) as f32);
     let x0 = x.floor() as usize; let y0 = y.floor() as usize;
@@ -1056,6 +1235,32 @@ mod library_tests {
     use super::*;
 
     #[test]
+    fn category_search_and_collection_controls_leave_the_grid_and_slider_available() {
+        let items = ["Flashback (Europe)", "Space Safari (UK)", "Uncatalogued disc"].map(|title| {
+            Item { path: format!("{title}.chd").into(), title: title.into(), cover: None, disc: None, logo: None }
+        });
+        let mut search = Search::default();
+        search.collection.refresh(&items);
+        assert_eq!(search.len(&items), 3);
+        search.collection.category = Category::Kids;
+        search.rebuild(&items);
+        assert_eq!(search.len(&items), 1);
+        assert_eq!(search.get(&items, 0).unwrap().title, "Space Safari (UK)");
+        assert_eq!(search.collection.owned_count(), 1);
+        let missing = search.collection.missing_count();
+        search.insert("Flashback");
+        search.rebuild(&items);
+        assert_eq!(search.len(&items), 0);
+        assert_eq!(search.collection.missing_count(), missing);
+        assert_eq!(category_hit(14 + 6 * TAB_WIDTH, TAB_TOP), Some(Category::Homebrew));
+        assert!(TAB_TOP as usize + (TAB_HEIGHT as usize) < layout(ART_SIZE_MIN).top);
+        assert!(size_slider_hit(160, H - 35));
+        assert!(!collection_count_hit(160, (H - 35) as i32));
+        assert!(collection_count_hit(615, (H - 79) as i32));
+        assert!(!size_slider_hit(615, H - 79));
+    }
+
+    #[test]
     fn search_filters_titles_and_filenames_without_losing_source_items() {
         let items = [
             Item { path: "Shadoan (Europe).chd".into(), title: "Kingdom II".into(), cover: None, disc: None, logo: None },
@@ -1081,6 +1286,20 @@ mod library_tests {
     }
 
     #[test]
+    fn settings_menu_covers_deferred_library_text() {
+        let render = |underlying_label: &str| {
+            let mut pixels = vec![0; W * H];
+            {
+                let mut canvas = NativeCanvas::new(&mut pixels, W, H, (0, 0, W, H));
+                canvas.text(SETTINGS_X + 25, SETTINGS_Y + 35, underlying_label, 0xFFFFFFFF, 1);
+                render_toolbar_native(&mut canvas, DisplayMode::Windowed, Some(ToolbarPopup::Settings), None);
+            }
+            pixels
+        };
+        assert!(render("Library text") == render(""));
+    }
+
+    #[test]
     fn search_editing_handles_multibyte_text() {
         let mut search = Search::default();
         assert!(search.insert("Café"));
@@ -1090,8 +1309,8 @@ mod library_tests {
         search.select_all = true;
         assert!(search.insert("CD-i"));
         assert_eq!(search.query, "CD-i");
-        assert_eq!(search_hit(689, 70), Some(true));
-        assert_eq!(search_hit(500, 70), Some(false));
+        assert_eq!(search_hit(689, 58), Some(true));
+        assert_eq!(search_hit(500, 58), Some(false));
         assert_eq!(search_hit(500, 90), None);
     }
 
@@ -1115,14 +1334,14 @@ mod library_tests {
 
     #[test]
     fn toolbar_uses_new_positions_and_paths_has_four_actions() {
-        assert!(toolbar_hit(350, 16, None, None) == Some(ToolbarAction::Display));
-        assert!(toolbar_hit(455, 16, None, None) == Some(ToolbarAction::About));
-        for (row, action) in [ToolbarAction::AddDiscFolder, ToolbarAction::SetCovers,
-            ToolbarAction::SetCd, ToolbarAction::SetBezels].into_iter().enumerate() {
-            assert!(toolbar_hit(250, TOOLBAR_HEIGHT + 12 + row * 22, Some(ToolbarPopup::Paths), None) == Some(action));
+        assert!(toolbar_hit(275, 16, None, None) == Some(ToolbarAction::Settings));
+        assert!(toolbar_hit(400, 16, None, None) == Some(ToolbarAction::About));
+        for (row, (_, action)) in SETTINGS_ITEMS.into_iter().enumerate() {
+            assert!(toolbar_hit(250, SETTINGS_Y + 9 + row * SETTINGS_ROW, Some(ToolbarPopup::Settings), None) == Some(action));
         }
-        assert!(toolbar_hit(250, TOOLBAR_HEIGHT + 12 + 4 * 22, Some(ToolbarPopup::Paths), None).is_none());
-        assert!(about_close_hit(560, 378));
+        assert_eq!(preview_hit(384, 530), Some(PreviewAction::Play));
+        assert_eq!(preview_hit(64, 540), Some(PreviewAction::Back));
+        assert_eq!(preview_hit(384, 500), None);
     }
 
     #[test]
@@ -1138,6 +1357,19 @@ mod library_tests {
         assert!(scan_paths(std::slice::from_ref(&root)).is_empty());
         std::fs::remove_dir(discs).unwrap();
         std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn case_overlay_keeps_cover_pixels_unchanged_and_draws_the_frame_separately() {
+        let cover = Artwork { w: 2, h: 2, pixels: vec![0xff336699; 4].into() };
+        let original = cover.pixels.clone();
+        let mut output = vec![0xff101010; CASE_WIDTH * CASE_HEIGHT];
+        blit_cover_fit(&mut output, CASE_WIDTH, CASE_HEIGHT, &cover,
+            0, 0, CASE_WIDTH, CASE_HEIGHT);
+        assert_eq!(cover.pixels.as_ref(), original.as_ref());
+        assert_eq!(output[306 * CASE_WIDTH + 362], 0xff336699);
+        assert_ne!(output[306 * CASE_WIDTH + 30], 0xff336699);
+        assert_eq!(COVER_FRAME.pixels[306 * CASE_WIDTH + 362], 0);
     }
 
     #[test]
@@ -1157,7 +1389,7 @@ mod library_tests {
     fn missing_cover_keeps_its_title_without_a_box() {
         let mut pixels = vec![0; W * H];
         let item = Item { path: "Example.chd".into(), title: "Example".into(), cover: None, disc: None, logo: None };
-        render_native(&mut pixels, W, H, (0, 0, W, H), &[item], 0, ART_SIZE_MIN, true, DisplayMode::Windowed, None, None, &Search::default());
+        render_native(&mut pixels, W, H, (0, 0, W, H), &[item], 0, ART_SIZE_MIN, true, DisplayMode::Windowed, None, None, &Search::default(), None);
         let l = layout(ART_SIZE_MIN);
         assert_eq!(pixels[(l.top + 5) * W + l.left + 1], pixels[(l.top + 5) * W + l.left - 1]);
         assert_eq!(MISSING_COVER.w, 680);

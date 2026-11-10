@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use log::info;
 
-use crate::frontend::{push_action, ArtworkPathKind, DisplayMode, GuiAction, InputDeviceMode, InputProfile, NvramMode};
+use crate::frontend::{push_action, DisplayMode, GuiAction, InputDeviceMode, InputProfile, NvramMode};
 
 pub const ID_FILE_INSERT: usize = 1000;
 pub const ID_FILE_OPEN: usize = 1001;
@@ -49,10 +49,7 @@ pub const ID_FILE_CLEAR_NVRAM: usize = 1005;
 pub const ID_NVRAM_GLOBAL: usize = 1006;
 pub const ID_NVRAM_PER_DISC: usize = 1007;
 pub const ID_PATH_ADD_DISCS: usize = 1220;
-pub const ID_PATH_COVERS: usize = 1221;
-pub const ID_PATH_CD_ART: usize = 1222;
-pub const ID_PATH_BEZELS: usize = 1223;
-pub const ID_PATH_EDIT_INI: usize = 1225;
+pub const ID_SWITCH_BIOS: usize = 1225;
 
 pub const ID_STATE_QUICK_SAVE: usize = 1070;
 pub const ID_STATE_QUICK_LOAD: usize = 1071;
@@ -649,20 +646,8 @@ unsafe extern "system" fn custom_wndproc(
                 if let Some(path) = modal(hwnd, || select_folder_dialog(hwnd, "Choose a folder to scan for disc images")) { push_action(GuiAction::AddDiscPath(path)); }
                 return 0;
             }
-            ID_PATH_COVERS => {
-                if let Some(path) = modal(hwnd, || select_folder_dialog(hwnd, "Choose the Covers artwork folder")) { push_action(GuiAction::SetArtworkPath(ArtworkPathKind::Covers, path)); }
-                return 0;
-            }
-            ID_PATH_CD_ART => {
-                if let Some(path) = modal(hwnd, || select_folder_dialog(hwnd, "Choose the CD artwork folder")) { push_action(GuiAction::SetArtworkPath(ArtworkPathKind::Cd, path)); }
-                return 0;
-            }
-            ID_PATH_BEZELS => {
-                if let Some(path) = modal(hwnd, || select_folder_dialog(hwnd, "Choose the bezels artwork folder")) { push_action(GuiAction::SetArtworkPath(ArtworkPathKind::Bezels, path)); }
-                return 0;
-            }
-            ID_PATH_EDIT_INI => {
-                let _ = std::process::Command::new("notepad.exe").arg(crate::frontend::settings_file_path()).spawn();
+            ID_SWITCH_BIOS => {
+                if let Some(path) = modal(hwnd, || open_bios_dialog(hwnd)) { push_action(GuiAction::SwitchBios(path)); }
                 return 0;
             }
             ID_HELP_FEEDBACK => {
@@ -793,14 +778,10 @@ pub fn attach_gui_menu(
         AppendMenuW(file_menu, MF_STRING, ID_FILE_EXIT, to_wide("Exit\tEsc").as_ptr());
         AppendMenuW(main_menu, MF_POPUP, file_menu as usize, to_wide("File").as_ptr());
 
-        let paths_menu = CreatePopupMenu();
-        AppendMenuW(paths_menu, MF_STRING, ID_PATH_ADD_DISCS, to_wide("Add Disc Scan Folder...").as_ptr());
-        AppendMenuW(paths_menu, MF_STRING, ID_PATH_COVERS, to_wide("Set Covers Artwork Folder...").as_ptr());
-        AppendMenuW(paths_menu, MF_STRING, ID_PATH_CD_ART, to_wide("Set CD Artwork Folder...").as_ptr());
-        AppendMenuW(paths_menu, MF_STRING, ID_PATH_BEZELS, to_wide("Set Bezels Artwork Folder...").as_ptr());
-        AppendMenuW(paths_menu, MF_SEPARATOR, 0, std::ptr::null());
-        AppendMenuW(paths_menu, MF_STRING, ID_PATH_EDIT_INI, to_wide("Edit All Paths in Settings File...").as_ptr());
-        AppendMenuW(main_menu, MF_POPUP, paths_menu as usize, to_wide("Paths").as_ptr());
+        let settings_menu = CreatePopupMenu();
+        AppendMenuW(settings_menu, MF_STRING, ID_PATH_ADD_DISCS, to_wide("Add Disc Folder...").as_ptr());
+        AppendMenuW(settings_menu, MF_STRING, ID_SWITCH_BIOS, to_wide("Switch BIOS...").as_ptr());
+        AppendMenuW(main_menu, MF_POPUP, settings_menu as usize, to_wide("Settings").as_ptr());
 
         // 2. Controls Menu
         let controls_menu = CreatePopupMenu();
@@ -909,26 +890,28 @@ pub fn update_nvram_mode_menu(mode: NvramMode) {
 }
 
 pub fn open_file_dialog(owner: *mut std::ffi::c_void) -> Option<PathBuf> {
+    choose_file(owner, "Select CD-i Disc Image (CHD / ISO / BIN / CUE)",
+        "CD-i Disc Images", "*.chd;*.iso;*.bin;*.cue", None)
+}
+
+pub fn open_bios_dialog(owner: *mut std::ffi::c_void) -> Option<PathBuf> {
+    let folder = crate::frontend::app_data_dir().join("bios");
+    choose_file(owner, "Select a Philips CD-i System BIOS", "BIOS ROM files",
+        "*.rom;*.bin;*.zip", Some(&folder))
+}
+
+fn choose_file(owner: *mut std::ffi::c_void, title: &str, label: &str,
+    extensions: &str, folder: Option<&std::path::Path>) -> Option<PathBuf> {
     let mut file_buf = [0u16; 1024];
-
-    // Filter string: "CD-i Disc Images (*.chd, *.iso, *.bin, *.cue)\0*.chd;*.iso;*.bin;*.cue\0All Files (*.*)\0*.*\0\0"
-    let mut filter: Vec<u16> = Vec::new();
-    filter.extend(OsStr::new("CD-i Disc Images (*.chd;*.iso;*.bin;*.cue)").encode_wide());
-    filter.push(0);
-    filter.extend(OsStr::new("*.chd;*.iso;*.bin;*.cue").encode_wide());
-    filter.push(0);
-    filter.extend(OsStr::new("All Files (*.*)").encode_wide());
-    filter.push(0);
-    filter.extend(OsStr::new("*.*").encode_wide());
-    filter.push(0);
-    filter.push(0);
-
-    let title = to_wide("Select CD-i Disc Image (CHD / ISO / BIN / CUE)");
+    let filter = to_wide(&format!("{label}\0{extensions}\0All Files (*.*)\0*.*\0"));
+    let title = to_wide(title);
+    let folder = folder.map(|path| path.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>());
 
     let mut ofn: OPENFILENAMEW = unsafe { std::mem::zeroed() };
     ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
     ofn.hwndOwner = owner;
     ofn.lpstrFilter = filter.as_ptr();
+    ofn.lpstrInitialDir = folder.as_ref().map_or(std::ptr::null(), |path| path.as_ptr());
     ofn.lpstrFile = file_buf.as_mut_ptr();
     ofn.nMaxFile = file_buf.len() as u32;
     ofn.lpstrTitle = title.as_ptr();
@@ -1026,6 +1009,7 @@ pub fn show_about_dialog(owner: *mut std::ffi::c_void) {
     let text = to_wide(
         "OpenCDi - Philips CD-i Emulator\n\
         Version: 0.2.0 (High Performance Edition)\n\
+        Emulator Core by sigsantilio and Arnold de Ruiter\n\
         Built with Rust, winit & softbuffer\n\n\
         Key Emulation Features:\n\
         • Philips SCC68070 Microprocessor & OS-9 CD-RTOS kernel\n\
@@ -1047,11 +1031,15 @@ pub fn show_about_dialog(owner: *mut std::ffi::c_void) {
 }
 
 pub fn open_feedback_url() {
+    open_web_url("https://cdi-tester-feedback.pages.dev/");
+}
+
+pub fn open_web_url(url: &str) {
     unsafe {
         ShellExecuteW(
             std::ptr::null_mut(),
             to_wide("open").as_ptr(),
-            to_wide("https://cdi-tester-feedback.pages.dev/").as_ptr(),
+            to_wide(url).as_ptr(),
             std::ptr::null(),
             std::ptr::null(),
             1,

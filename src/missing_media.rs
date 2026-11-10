@@ -10,8 +10,6 @@ pub fn refresh(
     destination: &Path,
     discs: &[PathBuf],
     artwork: &Path,
-    covers: &Path,
-    cd_art: &Path,
     synopses: &Path,
     lookup_running: bool,
 ) -> std::io::Result<()> {
@@ -27,11 +25,6 @@ pub fn refresh(
             (ArtworkKind::Back, "Back cover"),
             (ArtworkKind::Logo, "Clear logo"),
         ] {
-            let local = match kind {
-                ArtworkKind::Cover => library::has_disc_image(disc, covers, true),
-                ArtworkKind::Disc => library::has_disc_image(disc, cd_art, false),
-                _ => false,
-            };
             let managed = match kind {
                 ArtworkKind::Cover | ArtworkKind::Disc => library::has_disc_image(
                     disc,
@@ -40,7 +33,7 @@ pub fn refresh(
                 ),
                 _ => library::managed_art_path(disc, artwork, kind).is_some(),
             };
-            if !local && !managed {
+            if !managed {
                 missing.push(label);
             }
         }
@@ -133,8 +126,6 @@ mod tests {
             refresh(
                 &report,
                 std::slice::from_ref(&disc),
-                &dir,
-                &dir,
                 &dir,
                 &dir,
                 running,

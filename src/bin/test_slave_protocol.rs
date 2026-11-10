@@ -12,12 +12,16 @@ mod dma;
 mod dvc;
 #[path = "../mcd212.rs"]
 mod mcd212;
+#[path = "../mono4/mod.rs"]
+mod mono4;
 #[path = "../nvram.rs"]
 mod nvram;
 #[path = "../scc_timer.rs"]
 mod scc_timer;
 #[path = "../slave.rs"]
 mod slave;
+#[path = "../tap.rs"]
+mod tap;
 
 use crate::bus::CdiBus;
 
@@ -190,6 +194,22 @@ fn main() {
         for (i, &want) in p_up.iter().enumerate() {
             let got = read_ch0_byte(&mut bus);
             expect(got == want, format!("rilascio successivo preservato: byte {} del rilascio == 0x{:02X}", i, want), format!("got=0x{:02X} want=0x{:02X}", want, got));
+        }
+    }
+
+    // ---- Gruppo 7: reattivita sparo/click immediato (movimento mouse poi click prima della lettura)
+    {
+        let mut bus = CdiBus::new();
+        // Mouse si muove (senza click)
+        bus.slave.update_mouse(300, 200, 0);
+        // Subito dopo arriva lo sparo (click DOWN btn=1) prima che la CPU abbia letto il byte 0
+        bus.slave.update_mouse(300, 200, 1);
+
+        // Il pacchetto letto DEVE contenere immediatamente il click (btn=1), senza ritardi!
+        let p_shot = expected_mouse_packet(300, 200, 1);
+        for (i, &want) in p_shot.iter().enumerate() {
+            let got = read_ch0_byte(&mut bus);
+            expect(got == want, format!("sparo immediato: byte {} ha il click == 0x{:02X}", i, want), format!("got=0x{:02X} want=0x{:02X}", want, got));
         }
     }
 

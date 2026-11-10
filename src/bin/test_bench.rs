@@ -1,28 +1,8 @@
-#[path = "../audio.rs"]
-mod audio;
-#[path = "../bus.rs"]
-mod bus;
-#[path = "../cdic.rs"]
-mod cdic;
-#[path = "../cdrom.rs"]
-mod cdrom;
-#[path = "../dma.rs"]
-mod dma;
-#[path = "../dvc.rs"]
-mod dvc;
-#[path = "../mcd212.rs"]
-mod mcd212;
-#[path = "../nvram.rs"]
-mod nvram;
-#[path = "../scc_timer.rs"]
-mod scc_timer;
-#[path = "../slave.rs"]
-mod slave;
-
+use opencdi::mcd212;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use m68k::{CpuCore, CpuType, AddressBus};
-use crate::bus::CdiBus;
+use opencdi::bus::CdiBus;
 
 fn find_file(relative_subpath: &str) -> Option<PathBuf> {
     let candidates = [
@@ -136,7 +116,7 @@ fn test_game(game_name: &str, frames: usize) {
 
             cycle_debt = (line_cycles - cyc_per_line as i32).clamp(0, 100);
 
-            // Clock real-time peripherals (CDIC, SCC Timer, Slave MCU) strictly at 15.5 MHz master clock
+            // Clock real-time peripherals (CDIC, SCC Timer, Slave MCU) on the CPU clock
             bus.tick_cdic(cyc_per_line);
             bus.tick_timer(cyc_per_line);
         }

@@ -12,18 +12,25 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode as Key, ModifiersState, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
-use opencdi::audio::HostAudioOutput;
-use opencdi::frontend::{app_data_dir, app_data_file, migrate_app_data_dir, pop_action, push_action, ArtworkPathKind, DisplayMode, GuiAction, InputDeviceMode, KeyBindings, NvramMode, UiShortcuts};
+use opencdi::audio::{self, Frame, HostAudioOutput};
+use opencdi::savestate::{Reader, State, StateError};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, atomic::{AtomicU32, Ordering}};
+use opencdi::frontend::{app_data_dir, app_data_file, migrate_app_data_dir, pop_action, push_action, DisplayMode, GuiAction, InputDeviceMode, KeyBindings, NvramMode, UiShortcuts};
 use crate::controller_config::{Action as ControllerConfigAction, Hit as ControllerConfigHit, State as ControllerConfigState, Target as ControllerConfigTarget};
 #[cfg(target_os = "windows")]
 use opencdi::gui;
 use opencdi::machine::Machine;
 use opencdi::mcd212::{SCREEN_WIDTH, SCREEN_HEIGHT, VideoMode};
 mod library;
+mod library_catalogue;
 mod launchbox;
 mod screenscraper;
 mod synopsis;
+mod world_of_cdi;
 mod missing_media;
+mod boxart;
+mod disc_art;
 #[cfg(windows)]
 mod updater;
 mod controller_config;
@@ -162,6 +169,55 @@ Settings and BIOS files use %APPDATA%/OpenCDI by default. Create Portable/ next 
 ";
 
 
+fn write_state_file(path: &Path, m: &Machine, frontend: &[u8]) -> std::io::Result<usize> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut buf = Vec::new();
+    m.save_state(frontend, &mut buf);
+    let tmp = std::path::PathBuf::from(format!("{}.tmp", path.display()));
+    std::fs::write(&tmp, &buf)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(buf.len())
+}
+
+// Returns the frontend bytes; the machine is unchanged on any error
+fn read_state_file(path: &Path, m: &mut Machine) -> Result<Vec<u8>, String> {
+    let data = std::fs::read(path).map_err(|e| e.to_string())?;
+    m.load_state(&data).map(|fe| fe.to_vec()).map_err(|e: StateError| e.to_string())
+}
+
+fn board_nvram_path(machine: &Machine, custom: Option<&Path>) -> PathBuf {
+    if let Some(path) = custom { return path.to_path_buf(); }
+    let path = default_nvram_save_path();
+    if machine.bus.mono4.is_some() { path.with_file_name("nvram_mono4.bin") } else { path }
+}
+
+fn flush_nvram(bus: &mut opencdi::bus::CdiBus) {
+    bus.nvram.flush_if_dirty();
+    if let Some(m4) = bus.mono4.as_deref_mut() {
+        m4.nvram.flush_if_dirty();
+    }
+}
+
+fn load_nvram(bus: &mut opencdi::bus::CdiBus, path: &Path) -> std::io::Result<()> {
+    if let Some(board) = bus.mono4.as_deref_mut() {
+        let mut nvram = opencdi::mono4::nvram::Nvram32::default();
+        nvram.attach_file(path)?;
+        board.nvram = nvram;
+        Ok(())
+    } else {
+        bus.nvram.load_or_initialize(path)
+    }
+}
+
+fn send_pointer(bus: &mut opencdi::bus::CdiBus, x: i32, y: i32, buttons: u8) {
+    match bus.mono4.as_deref_mut() {
+        Some(m4) => m4.ikat.update_pointer(x, y, buttons),
+        None => bus.slave.update_mouse(x, y, buttons),
+    }
+}
+
 fn savestate_path_for(game_name: &str, slot: usize) -> PathBuf {
     let safe_name: String = game_name
         .chars()
@@ -171,7 +227,7 @@ fn savestate_path_for(game_name: &str, slot: usize) -> PathBuf {
     let base = if trimmed.is_empty() { "cdi_bios" } else { trimmed };
     let dir = migrate_app_data_dir("savestates");
     let _ = std::fs::create_dir_all(&dir);
-    dir.join(format!("{}_slot{}.st", base, slot))
+    dir.join(format!("{}_slot{}_v{}.st", base, slot, opencdi::savestate::VERSION))
 }
 
 fn default_nvram_save_path() -> PathBuf {
@@ -286,21 +342,13 @@ fn find_bios_rom() -> Option<PathBuf> {
     None
 }
 
-fn find_dvc_rom() -> Option<PathBuf> {
-    const DVC_CANDIDATES: &[&str] = &[
-        "dvc/vmpega.rom",
-        "bios/vmpega.rom",
-        "vmpega.rom",
-        "dvc/impega.rom",
-        "bios/impega.rom",
-        "impega.rom",
-    ];
-    for &name in DVC_CANDIDATES {
-        if let Some(p) = find_rom_file(name) {
-            return Some(store_rom_in_app_data(p, name));
-        }
-    }
-    None
+fn find_dvc_rom(board: opencdi::bus::BoardKind) -> Option<PathBuf> {
+    let names = if board == opencdi::bus::BoardKind::Mono4 {
+        ["dvc/impega.rom", "bios/impega.rom", "impega.rom"]
+    } else {
+        ["dvc/vmpega.rom", "bios/vmpega.rom", "vmpega.rom"]
+    };
+    names.into_iter().find_map(|name| find_rom_file(name).map(|path| store_rom_in_app_data(path, name)))
 }
 
 fn store_rom_in_app_data(found: PathBuf, relative_name: &str) -> PathBuf {
@@ -430,7 +478,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 1. Load BIOS ROM
-    let bios_path = match rom_arg.or_else(find_bios_rom) {
+    let preferences = UiShortcuts::load();
+    let saved_bios = preferences.bios_path.as_deref().map(|path| app_data_dir().join(path))
+        .filter(|path| Machine::read_bios(path).is_ok_and(|(_, image)| image.report.status != opencdi::bios::Status::Error));
+    let bios_path = match rom_arg.or(saved_bios).or_else(find_bios_rom) {
         Some(path) => path,
         None => {
             let data_dir = app_data_dir();
@@ -474,7 +525,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     match m.load_bios(&bios_path) {
-        Ok(()) => info!("Loaded system BIOS from {:?}", bios_path),
+        Ok(report) => info!("Loaded system BIOS from {:?}: {}", bios_path, report.message),
         Err(e) => {
             error!("Cannot use system BIOS {:?}: {}", bios_path, e);
             eprintln!("Cannot use system BIOS {:?}: {}", bios_path, e);
@@ -484,23 +535,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Load NVRAM if present
     let nvram_arg = args.iter().position(|a| a == "--nvram").and_then(|i| args.get(i + 1)).map(PathBuf::from);
-    let nvram_mode = UiShortcuts::load().nvram_mode;
-    let resolved_nvram_path = nvram_arg.unwrap_or_else(default_nvram_save_path);
+    let nvram_mode = preferences.nvram_mode;
+    let resolved_nvram_path = board_nvram_path(&m, nvram_arg.as_deref());
     let mut current_nvram_path = resolved_nvram_path.clone();
-    if resolved_nvram_path.is_file() {
-        if let Err(e) = m.bus.nvram.load_from_file(&resolved_nvram_path) {
-            log::warn!("Impossibile caricare NVRAM da {:?}: {:?}", resolved_nvram_path, e);
-        } else {
-            info!("NVRAM caricata da {:?}", resolved_nvram_path);
-        }
+    if let Err(error) = load_nvram(&mut m.bus, &resolved_nvram_path) {
+        log::warn!("Could not load NVRAM from {resolved_nvram_path:?}: {error}");
     }
 
     // 2b. Load DVC ROM (Digital Video Cartridge) by default if present
     let dvc_disabled = has_flag("--no-dvc") || has_flag("--nodvc");
     let dvc_arg = flag_value("--dvc").map(PathBuf::from);
     if !dvc_disabled {
-        if let Some(dvc_path) = dvc_arg.clone().or_else(find_dvc_rom) {
-            if let Ok(_) = m.load_dvc_rom(&dvc_path) {
+        if let Some(dvc_path) = dvc_arg.clone().or_else(|| find_dvc_rom(m.bus.board)) {
+            if let Ok(_) = m.load_dvc(&dvc_path) {
                 info!("Loaded Digital Video Cartridge (DVC) ROM from {:?}", dvc_path);
             }
         } else {
@@ -544,7 +591,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 current_disc_path = Some(p.clone());
                 if nvram_mode == NvramMode::PerDisc {
                     current_nvram_path = per_disc_nvram_save_path(&resolved_nvram_path, &p);
-                    if let Err(e) = m.bus.nvram.load_or_initialize(&current_nvram_path) {
+                    if let Err(e) = load_nvram(&mut m.bus, &current_nvram_path) {
                         log::warn!("Cannot load per-disc NVRAM {:?}: {}", current_nvram_path, e);
                     }
                 }
@@ -552,9 +599,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 current_game_name = opencdi::frontend::disc_display_name(&p);
                 info!("Loaded game disc at startup: {}", current_game_name);
 
-                let name_upper = current_game_name.to_uppercase();
-                let is_ntsc = (name_upper.contains("(USA)") || name_upper.contains("(JAPAN)") || name_upper.contains("NTSC"))
-                    && m.bus.cdrom.as_ref().map_or(true, |cd| cd.disc_type != 0x20);
+                let is_ntsc = m.bus.cdrom.as_ref().is_some_and(|cd| cd.is_ntsc_hint(&current_game_name).unwrap_or(false));
                 if is_ntsc {
                     info!("Detected NTSC disc (USA/Japan): auto-configured NTSC 60 Hz video mode");
                     m.bus.set_video_mode(VideoMode::Ntsc);
@@ -585,29 +630,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(path) = &active_disc_config_path { bindings.load_disc_config(path); bindings.save_disc_config(path); }
     let skip_shell = bindings.ui_shortcuts.skip_shell;
     let disc_paths = bindings.ui_shortcuts.disc_paths.iter().map(|p| resolve_config_path(p)).collect::<Vec<_>>();
-    let covers_path = resolve_config_path(&bindings.ui_shortcuts.covers_path);
-    let cd_art_path = resolve_config_path(&bindings.ui_shortcuts.cd_art_path);
-    let bezels_path = resolve_config_path(&bindings.ui_shortcuts.bezels_path);
     let managed_artwork_root = app_data_dir().join("Artwork");
     let synopsis_root = app_data_dir().join("Synopses");
     let boot_synopsis = current_disc_path.as_deref().and_then(|p| synopsis::load(&synopsis_root, p));
     let managed_covers_path = managed_artwork_root.join("Covers");
     let managed_cd_path = managed_artwork_root.join("CD");
-    let mut scan_roots = library_roots();
-    scan_roots.extend(disc_paths.iter().cloned());
-    let library_items = if library_mode { library::scan(&scan_roots, &covers_path, &cd_art_path, &managed_artwork_root) } else { Vec::new() };
+    let library_items = if library_mode { library::scan(&disc_paths, &managed_covers_path, &managed_cd_path, &managed_artwork_root) } else { Vec::new() };
+    let mut library_search = library::Search::default();
+    library_search.collection.refresh(&library_items);
     let disc_details = current_disc_path.as_deref().map(|path| library::DiscDetails::load(path, &managed_artwork_root)).unwrap_or_default();
-    let boot_disc_art = current_disc_path.as_deref().and_then(|p| library::load_disc_artwork(p, &cd_art_path).or_else(|| library::load_disc_artwork(p, &managed_cd_path)));
+    let boot_disc_art = current_disc_path.as_deref().and_then(|p| library::load_disc_artwork(p, &managed_cd_path));
     let input_device_mode = if has_flag("--mouse") { InputDeviceMode::Mouse } else { bindings.ui_shortcuts.input_device };
 
     // 6. Initialize Host Audio Playback
-    let host_audio = HostAudioOutput::try_start(
-        m.bus.cdic.audio.sample_queue.clone(),
-        m.bus.cdic.audio.sfx_queue.clone(),
-        m.bus.cdic.audio.dvc_queue.clone(),
-        m.bus.cdic.audio.source_rate.clone(),
-        m.bus.cdic.audio.dvc_rate.clone(),
-    );
+    let audio_ring = Arc::new(Mutex::new(VecDeque::with_capacity(audio::RING_CAP)));
+    let audio_gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+    let host_audio = HostAudioOutput::try_start(audio_ring.clone(), audio_gain.clone());
 
     // 7. Initialize USB Gamepad subsystem (Gilrs / XInput / DirectInput)
     let gilrs = gilrs::Gilrs::new().ok();
@@ -641,7 +679,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         current_game_name,
         nvram_path: Some(current_nvram_path),
         global_nvram_path: resolved_nvram_path,
+        custom_nvram_path: nvram_arg,
         current_disc_path,
+        preview_started: None,
+        boot_details_until: None,
+        previous_play_pad: false,
         nvram_mode,
         window: None,
         surface: None,
@@ -650,6 +692,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         display_mode: DisplayMode::BorderlessFullscreen,
         restore_check: None,
         _host_audio: host_audio,
+        audio_ring,
+        audio_gain,
+        audio_buf: Vec::new(),
+        volume: 1.0,
+        muted: false,
         gilrs,
         keys: HashSet::new(),
         mods: ModifiersState::empty(),
@@ -703,6 +750,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         library_mode,
         library_items,
         artwork_fetch_rx: None,
+        artwork_progress_rx: None,
+        artwork_progress: None,
+        artwork_progress_at: Instant::now(),
         #[cfg(windows)]
         startup_update: updater::Startup::default(),
         artwork_during_scan: Vec::new(),
@@ -712,11 +762,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         library_scan_at: Instant::now(),
         library_reload_art: false,
         library_selected: 0,
-        library_search: library::Search::default(),
+        library_search,
         disc_paths,
-        covers_path,
-        cd_art_path,
-        bezels_path,
         managed_artwork_root,
         synopsis_root,
         boot_synopsis,
@@ -747,7 +794,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         timeEndPeriod(1);
     }
 
-    app.m.bus.nvram.flush_if_dirty();
+    flush_nvram(&mut app.m.bus);
     info!("Emulation stopped. Final PC: 0x{:08X}", app.m.cpu.pc);
     Ok(())
 }
@@ -772,21 +819,62 @@ fn window_icon() -> Option<winit::window::Icon> {
     winit::window::Icon::from_rgba(buf, info.width, info.height).ok()
 }
 
-fn library_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Ok(exe) = std::env::current_exe() { if let Some(parent) = exe.parent() { roots.push(parent.to_path_buf()); } }
-    if let Ok(cwd) = std::env::current_dir() { if !roots.contains(&cwd) { roots.push(cwd.clone()); } }
-    let bases = roots.clone();
-    for base in bases { for name in ["games", "discs", "roms", "images"] {
-        let candidate = base.join(name); if candidate.is_dir() && !roots.contains(&candidate) { roots.push(candidate); }
-    }}
-    roots
-}
-
 fn resolve_config_path(path: &Path) -> PathBuf {
     if path.is_absolute() { return path.to_path_buf(); }
     std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join(path)))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join(path))
+}
+
+const BEZEL_WIDTH: usize = 1672;
+const BEZEL_HEIGHT: usize = 941;
+
+fn bezel_rect(width: usize, height: usize) -> (usize, usize, usize, usize) {
+    let fitted_width = width.min(height.saturating_mul(BEZEL_WIDTH) / BEZEL_HEIGHT);
+    let fitted_height = height.min(width.saturating_mul(BEZEL_HEIGHT) / BEZEL_WIDTH);
+    ((width - fitted_width) / 2, (height - fitted_height) / 2, fitted_width, fitted_height)
+}
+
+fn bezel_game_rect(width: usize, height: usize) -> (usize, usize, usize, usize) {
+    let (x, y, w, h) = bezel_rect(width, height);
+    let opening_left = 226 * w / BEZEL_WIDTH;
+    let opening_top = 28 * h / BEZEL_HEIGHT;
+    let opening_width = 1446 * w / BEZEL_WIDTH - opening_left;
+    let opening_height = 914 * h / BEZEL_HEIGHT - opening_top;
+    let (gx, gy, gw, gh) = image_rect(opening_width, opening_height);
+    (x + opening_left + gx, y + opening_top + gy, gw, gh)
+}
+
+fn draw_bezel(dst: &mut [u32], width: usize, height: usize, game: (usize, usize, usize, usize)) {
+    static BEZEL: std::sync::LazyLock<library::Artwork> = std::sync::LazyLock::new(|| {
+        library::load_png_bytes(include_bytes!("../assets/emulation_bezel.png"))
+            .expect("embedded emulation bezel")
+    });
+    let (left, top, w, h) = bezel_rect(width, height);
+    let (gx, gy, gw, gh) = game;
+    for y in top..top + h {
+        let row = &mut dst[y * width + left..y * width + left + w];
+        let source_y = (y - top) * BEZEL.h / h;
+        let draw_range = |row: &mut [u32], start: usize, end: usize| {
+            for x in start..end {
+                let pixel = BEZEL.pixels[source_y * BEZEL.w + x * BEZEL.w / w];
+                let alpha = pixel >> 24;
+                if alpha == 255 {
+                    row[x] = pixel;
+                } else if alpha != 0 {
+                    row[x] = 0xff000000
+                        | ((((pixel >> 16) & 255) * alpha / 255) << 16)
+                        | ((((pixel >> 8) & 255) * alpha / 255) << 8)
+                        | ((pixel & 255) * alpha / 255);
+                }
+            }
+        };
+        if (gy..gy + gh).contains(&y) {
+            draw_range(row, 0, gx.saturating_sub(left).min(w));
+            draw_range(row, (gx + gw).saturating_sub(left).min(w), w);
+        } else {
+            draw_range(row, 0, w);
+        }
+    }
 }
 
 fn image_rect(dst_w: usize, dst_h: usize) -> (usize, usize, usize, usize) {
@@ -892,7 +980,11 @@ struct App {
     current_game_name: String,
     nvram_path: Option<PathBuf>,
     global_nvram_path: PathBuf,
+    custom_nvram_path: Option<PathBuf>,
     current_disc_path: Option<PathBuf>,
+    preview_started: Option<Instant>,
+    boot_details_until: Option<Instant>,
+    previous_play_pad: bool,
     nvram_mode: NvramMode,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
@@ -901,6 +993,11 @@ struct App {
     display_mode: DisplayMode,
     restore_check: Option<Instant>,
     _host_audio: Option<HostAudioOutput>,
+    audio_ring: Arc<Mutex<VecDeque<Frame>>>,
+    audio_gain: Arc<AtomicU32>,
+    audio_buf: Vec<Frame>,
+    volume: f32,
+    muted: bool,
     gilrs: Option<gilrs::Gilrs>,
     keys: HashSet<Key>,
     mods: ModifiersState,
@@ -955,6 +1052,9 @@ struct App {
     library_mode: bool,
     library_items: Vec<library::Item>,
     artwork_fetch_rx: Option<std::sync::mpsc::Receiver<DownloadedArtwork>>,
+    artwork_progress_rx: Option<std::sync::mpsc::Receiver<launchbox::LookupProgress>>,
+    artwork_progress: Option<launchbox::LookupProgress>,
+    artwork_progress_at: Instant,
     #[cfg(windows)]
     startup_update: updater::Startup,
     artwork_during_scan: Vec<DownloadedArtwork>,
@@ -966,9 +1066,6 @@ struct App {
     library_selected: usize,
     library_search: library::Search,
     disc_paths: Vec<PathBuf>,
-    covers_path: PathBuf,
-    cd_art_path: PathBuf,
-    bezels_path: PathBuf,
     managed_artwork_root: PathBuf,
     synopsis_root: PathBuf,
     boot_synopsis: Option<String>,
@@ -990,6 +1087,66 @@ struct App {
 }
 
 impl App {
+    fn frontend_state(&self) -> Vec<u8> {
+        let mut w = Vec::new();
+        (self.frame_count, self.disc_launched, self.shell_ready_count).save(&mut w);
+        (self.pad_x, self.pad_y, self.prev_key_btn).save(&mut w);
+        (self.pad_x_f, self.pad_y_f).save(&mut w);
+        w
+    }
+
+    fn set_frontend_state(&mut self, data: &[u8]) -> Result<(), StateError> {
+        let mut r = Reader::new(data);
+        let mut a = (self.frame_count, self.disc_launched, self.shell_ready_count);
+        let mut b = (self.pad_x, self.pad_y, self.prev_key_btn);
+        let mut c = (self.pad_x_f, self.pad_y_f);
+        a.load(&mut r)?;
+        b.load(&mut r)?;
+        c.load(&mut r)?;
+        (self.frame_count, self.disc_launched, self.shell_ready_count) = a;
+        (self.pad_x, self.pad_y, self.prev_key_btn) = b;
+        (self.pad_x_f, self.pad_y_f) = c;
+        Ok(())
+    }
+
+    fn state_slot(&mut self, slot: usize, load: bool) {
+        let path = savestate_path_for(&self.current_game_name, slot);
+        if load {
+            match read_state_file(&path, &mut self.m) {
+                Ok(frontend) => {
+                    if let Err(error) = self.set_frontend_state(&frontend) {
+                        error!("Could not restore frontend state: {error}");
+                    }
+                    if let Ok(mut ring) = self.audio_ring.lock() { ring.clear(); }
+                    self.reset_telemetry();
+                    info!("Loaded state slot {slot} from {path:?}");
+                }
+                Err(error) => error!("Could not load state slot {slot}: {error}"),
+            }
+        } else {
+            match write_state_file(&path, &self.m, &self.frontend_state()) {
+                Ok(_) => info!("Saved state slot {slot} to {path:?}"),
+                Err(error) => error!("Could not save state slot {slot}: {error}"),
+            }
+        }
+    }
+
+    fn showing_disc_details(&self) -> bool {
+        self.pause_info || self.preview_started.is_some()
+            || self.boot_details_until.is_some_and(|until| Instant::now() < until)
+            || (self.skip_shell && self.m.bus.mono4.is_none() && self.m.bus.cdrom.is_some() && !self.disc_launched)
+    }
+
+    fn content_rect(&self, width: usize, height: usize) -> (usize, usize, usize, usize) {
+        if self.library_mode || self.controller_config.is_some() {
+            (0, 0, width, height)
+        } else if self.showing_disc_details() {
+            image_rect(width, height)
+        } else {
+            bezel_game_rect(width, height)
+        }
+    }
+
     fn toggle_menu(&mut self) {
         if !self.library_mode || self.controller_config.is_some() { return; }
         self.menu_visible = !self.menu_visible;
@@ -1025,7 +1182,7 @@ impl App {
                 self.controller_config_was_captured = self.mouse_captured;
                 self.controller_config = Some(controller_config::State::default());
                 self.mouse_captured = false;
-                self.m.bus.slave.update_mouse(self.pad_x, self.pad_y, 0);
+                send_pointer(&mut self.m.bus, self.pad_x, self.pad_y, 0);
                 self.prev_key_btn = 0;
                 self.apply_grab();
             }
@@ -1042,12 +1199,14 @@ impl App {
         self.pause_info = false;
         self.toolbar_popup = None;
         self.library_mode = true;
+        self.preview_started = None;
+        self.boot_details_until = None;
         self.library_scan_at = Instant::now();
         // The South/A button used to confirm this action may still be held on the
         // next library tick. Consume that edge so it cannot relaunch the selected disc.
         self.library_prev_confirm = true;
         self.mouse_captured = false;
-        self.m.bus.slave.set_disc_inserted(false);
+        self.m.bus.slave.set_disc_inserted(false, false);
         self.m.bus.cdrom = None;
         self.current_disc_path = None;
         self.active_disc_config_path = None;
@@ -1076,10 +1235,14 @@ impl App {
             self.pause_info = false;
         } else if self.paused {
             self.toggle_pause_menu();
+        } else if self.preview_started.is_some() {
+            self.stop_to_library();
         } else if !self.library_mode {
             return false;
         } else if self.toolbar_popup.take().is_none() {
-            if self.library_search.focused {
+            if self.library_search.collection.missing_offset.take().is_some() {
+                // Closing the list restores the current category and selection.
+            } else if self.library_search.focused {
                 self.set_search_focus(false);
             } else if !self.library_search.query.is_empty() {
                 self.library_search.clear();
@@ -1136,32 +1299,29 @@ impl App {
                 push_action(GuiAction::OpenDisc(PathBuf::from(format!("{letter}:"))));
             }
             T::Controller => push_action(GuiAction::OpenControllerConfig),
-            T::Paths => self.toolbar_popup = if self.toolbar_popup == Some(library::ToolbarPopup::Paths) { None } else { Some(library::ToolbarPopup::Paths) },
             T::About => self.toolbar_popup = Some(library::ToolbarPopup::About),
-            T::Display => self.toolbar_popup = if self.toolbar_popup == Some(library::ToolbarPopup::Display) { None } else { Some(library::ToolbarPopup::Display) },
+            T::Settings => self.toolbar_popup = if self.toolbar_popup == Some(library::ToolbarPopup::Settings) { None } else { Some(library::ToolbarPopup::Settings) },
             T::Exit => { self.toolbar_popup = None; push_action(GuiAction::Exit); }
             T::Borderless => { self.toolbar_popup = None; self.set_display_mode(DisplayMode::BorderlessFullscreen); }
             T::Decorated => { self.toolbar_popup = None; self.set_display_mode(DisplayMode::DecoratedFullscreen); }
             T::Windowed => { self.toolbar_popup = None; self.set_display_mode(DisplayMode::Windowed); }
-            T::AddDiscFolder | T::SetCovers | T::SetCd | T::SetBezels => {
+            T::AddDiscFolder => {
                 self.toolbar_popup = None;
-                #[cfg(target_os = "windows")]
+                #[cfg(windows)]
                 {
                     let hwnd = self.hwnd();
-                    let title = match action {
-                        T::AddDiscFolder => "Choose a folder to scan for disc images",
-                        T::SetCovers => "Choose the Covers artwork folder",
-                        T::SetCd => "Choose the CD artwork folder",
-                        _ => "Choose the bezels artwork folder",
-                    };
-                    if let Some(path) = gui::modal(hwnd, || gui::select_folder_dialog(hwnd, title)) {
-                        match action {
-                            T::AddDiscFolder => push_action(GuiAction::AddDiscPath(path)),
-                            T::SetCovers => push_action(GuiAction::SetArtworkPath(ArtworkPathKind::Covers, path)),
-                            T::SetCd => push_action(GuiAction::SetArtworkPath(ArtworkPathKind::Cd, path)),
-                            T::SetBezels => push_action(GuiAction::SetArtworkPath(ArtworkPathKind::Bezels, path)),
-                            _ => {}
-                        }
+                    if let Some(path) = gui::modal(hwnd, || gui::select_folder_dialog(hwnd, "Choose a folder to scan for disc images")) {
+                        push_action(GuiAction::AddDiscPath(path));
+                    }
+                }
+            }
+            T::SwitchBios => {
+                self.toolbar_popup = None;
+                #[cfg(windows)]
+                {
+                    let hwnd = self.hwnd();
+                    if let Some(path) = gui::modal(hwnd, || gui::open_bios_dialog(hwnd)) {
+                        push_action(GuiAction::SwitchBios(path));
                     }
                 }
             }
@@ -1170,10 +1330,81 @@ impl App {
     }
 
     fn launch_library_selection(&mut self) {
+        if self.library_search.collection.missing_offset.is_some() { return; }
         if let Some(item) = self.library_search.get(&self.library_items, self.library_selected) {
-            self.boot_disc_art = item.disc.clone();
             push_action(GuiAction::OpenDisc(item.path.clone()));
         }
+    }
+
+    fn preview_disc(&mut self, path: PathBuf) {
+        if !self.library_mode && self.preview_started.is_none() {
+            self.stop_to_library();
+        }
+        self.set_search_focus(false);
+        self.library_mode = false;
+        self.toolbar_popup = None;
+        if let Ok(mut ring) = self.audio_ring.lock() { ring.clear(); }
+        self.preview_started = Some(Instant::now());
+        self.boot_details_until = None;
+        self.mouse_left = false;
+        self.mouse_right = false;
+        self.mouse_middle = false;
+        self.mouse_captured = false;
+        self.apply_grab();
+        self.disc_details = library::DiscDetails::load(&path, &self.managed_artwork_root);
+        self.boot_synopsis = synopsis::load(&self.synopsis_root, &path);
+        self.boot_disc_art = library::load_disc_artwork(&path, &self.managed_cd_path);
+        self.current_game_name = opencdi::frontend::disc_display_name(&path);
+        self.current_disc_path = Some(path);
+        self.next_synopsis_check = Instant::now();
+        self.artwork_retry_at = self.next_synopsis_check;
+        self.refresh_title();
+        if let Some(window) = &self.window { window.request_redraw(); }
+    }
+
+    fn switch_bios(&mut self, path: PathBuf) {
+        let result = Machine::read_bios(&path).and_then(|(_, image)| {
+            if image.report.status == opencdi::bios::Status::Error {
+                Err(std::io::Error::new(std::io::ErrorKind::InvalidData, image.report.message.clone()))
+            } else {
+                Ok(image)
+            }
+        });
+        let image = match result {
+            Ok(image) => image,
+            Err(error) => {
+                log::warn!("Cannot use BIOS {path:?}: {error}");
+                #[cfg(windows)]
+                gui::show_disc_error(self.hwnd(), &format!("Cannot use this system BIOS:\n\n{error}"));
+                return;
+            }
+        };
+        if !self.library_mode { self.stop_to_library(); }
+        flush_nvram(&mut self.m.bus);
+        let previous = self.m.bus.board;
+        self.m.load_bios_image(&image);
+        if previous != self.m.bus.board {
+            self.m.bus.dvc = opencdi::dvc::Dvc::new();
+            if !self.dvc_disabled
+                && let Some(rom) = self.dvc_arg.clone().or_else(|| find_dvc_rom(self.m.bus.board))
+            {
+                if let Err(error) = self.m.load_dvc(rom) { log::warn!("Cannot load DVC for this BIOS: {error}"); }
+            }
+        }
+        self.global_nvram_path = board_nvram_path(&self.m, self.custom_nvram_path.as_deref());
+        self.nvram_path = None;
+        self.activate_nvram_for_selection();
+        self.m.reset();
+        self.reset_state();
+        let data_dir = app_data_dir();
+        let saved = path.strip_prefix(&data_dir).unwrap_or(&path).to_path_buf();
+        self.bindings.ui_shortcuts.bios_path = Some(saved.clone());
+        self.global_bindings.ui_shortcuts.bios_path = Some(saved);
+        self.bindings.save_to_ini();
+        #[cfg(windows)]
+        gui::update_dvc_menu(self.m.bus.dvc.is_fitted());
+        info!("Selected system BIOS {:?}: {}", path, image.report.message);
+        if let Some(window) = &self.window { window.request_redraw(); }
     }
 
     fn refresh_library(&mut self) {
@@ -1187,6 +1418,19 @@ impl App {
     fn update_library(&mut self, now: Instant) {
         use std::sync::mpsc::TryRecvError;
 
+        if let Some(rx) = &self.artwork_progress_rx {
+            while let Ok(progress) = rx.try_recv() {
+                self.artwork_progress = Some(progress);
+                self.artwork_progress_at = now;
+                if let Some(window) = &self.window { window.request_redraw(); }
+            }
+        }
+        if self.artwork_progress.as_ref().is_some_and(|progress| progress.finished)
+            && now.duration_since(self.artwork_progress_at) > Duration::from_secs(15)
+        {
+            self.artwork_progress = None;
+            if let Some(window) = &self.window { window.request_redraw(); }
+        }
         let mut artwork_changed = false;
         while let Some(rx) = &self.artwork_fetch_rx {
             match rx.try_recv() {
@@ -1194,8 +1438,7 @@ impl App {
                     artwork_changed |= update.apply(&mut self.library_items);
                     if update.preferred && update.kind == launchbox::ArtworkKind::Cover {
                         for item in self.library_items.iter_mut().filter(|item| item.title == update.title) {
-                            item.cover = library::load_cover_artwork(&item.path, &self.covers_path)
-                                .or_else(|| library::load_cover_artwork(&item.path, &self.managed_covers_path));
+                            item.cover = library::load_cover_artwork(&item.path, &self.managed_covers_path);
                             artwork_changed = true;
                         }
                     }
@@ -1209,11 +1452,10 @@ impl App {
                             Cover => None,
                         };
                         if update.kind == Disc && let Some(path) = &self.current_disc_path {
-                            self.boot_disc_art = library::load_disc_artwork(path, &self.cd_art_path)
-                                .or_else(|| library::load_disc_artwork(path, &self.managed_cd_path))
+                            self.boot_disc_art = library::load_disc_artwork(path, &self.managed_cd_path)
                                 .or_else(|| Some(update.image.clone()));
                             artwork_changed = true;
-                        } else if let Some(slot) = slot.filter(|slot| slot.is_none() || update.preferred) {
+                        } else if let Some(slot) = slot.filter(|slot| slot.is_none() || update.preferred || update.kind == Boxart) {
                             *slot = Some(update.image.clone());
                             artwork_changed = true;
                         }
@@ -1248,6 +1490,7 @@ impl App {
                             self.library_click = None;
                         }
                         self.library_items = items;
+                        self.library_search.collection.refresh(&self.library_items);
                         self.library_search.rebuild(&self.library_items);
                         self.library_selected = selected_path.and_then(|path| self.library_search.position(&self.library_items, &path))
                             .unwrap_or_else(|| self.library_selected.min(self.library_search.len(&self.library_items).saturating_sub(1)));
@@ -1269,15 +1512,21 @@ impl App {
             self.next_synopsis_check = now + Duration::from_millis(500);
             self.boot_synopsis = self.current_disc_path.as_deref().and_then(|path| synopsis::load(&self.synopsis_root, path));
         }
+        if now >= self.artwork_retry_at && self.artwork_fetch_rx.is_none()
+            && (self.library_mode || self.current_disc_path.is_some())
+            && self.library_scan_rx.is_none() && !self.library_reload_art
+        {
+            self.artwork_retry_at = now + ARTWORK_RETRY_INTERVAL;
+            self.start_artwork_lookup();
+        }
         if (self.library_mode || !self.library_items.is_empty())
             && now >= self.library_scan_at && self.library_scan_rx.is_none()
         {
             self.library_scan_at = now + LIBRARY_SCAN_INTERVAL;
-            let mut roots = library_roots();
-            roots.extend(self.disc_paths.iter().cloned());
+            let roots = self.disc_paths.clone();
             let previous: Vec<_> = self.library_items.iter().map(|item| item.path.clone()).collect();
-            let covers = self.covers_path.clone();
-            let discs = self.cd_art_path.clone();
+            let covers = self.managed_covers_path.clone();
+            let discs = self.managed_cd_path.clone();
             let managed_artwork = self.managed_artwork_root.clone();
             let missing_logos: Vec<_> = self.library_items.iter().filter(|item| item.logo.is_none())
                 .map(|item| item.path.clone()).collect();
@@ -1293,7 +1542,7 @@ impl App {
                 let optical_disc = None;
                 let paths = library::scan_paths(&roots);
                 if let Some(path) = report_path {
-                    if let Err(error) = missing_media::refresh(&path, &paths, &managed_artwork, &covers, &discs, &synopsis_root, lookup_running) {
+                    if let Err(error) = missing_media::refresh(&path, &paths, &managed_artwork, &synopsis_root, lookup_running) {
                         log::debug!("Could not write Missing Media.txt: {error}");
                     }
                 }
@@ -1309,22 +1558,13 @@ impl App {
                 self.library_reload_art = false;
             }
         }
-        if now >= self.artwork_retry_at && self.artwork_fetch_rx.is_none()
-            && (self.library_mode || self.current_disc_path.is_some())
-            && self.library_scan_rx.is_none() && !self.library_reload_art
-        {
-            self.artwork_retry_at = now + ARTWORK_RETRY_INTERVAL;
-            self.start_artwork_lookup();
-        }
+
     }
 
     fn start_artwork_lookup(&mut self) {
         let cache = self.managed_artwork_root.join("Cache");
         let needs_lookup = |target: &launchbox::FetchTarget| {
             !target.missing.is_empty() || target.synopsis_path.is_some()
-                || (screenscraper::can_check_gallery(&target.title) && screenscraper::GALLERY_KINDS.into_iter().any(|kind| {
-                    screenscraper::preferred_gallery_image(&self.managed_artwork_root.join(kind.folder()), kind, &target.title).is_none()
-                }))
                 || !cache.join("LaunchBox-Media").join(format!("{}.done", launchbox::safe_name(&target.title))).is_file()
         };
         let target_for = |path: &Path, cover_missing: bool, disc_missing: bool, logo_missing: bool| {
@@ -1342,15 +1582,14 @@ impl App {
                 synopsis_path: synopsis::path(&self.synopsis_root, path).filter(|path| !path.exists()),
             }
         };
-        let targets: Vec<_> = if self.library_mode {
+        let mut targets: Vec<_> = if self.library_mode {
             self.library_items.iter()
                 .map(|item| target_for(&item.path, item.cover.is_none(), item.disc.is_none(), item.logo.is_none()))
                 .filter(needs_lookup)
                 .collect()
         } else if let Some(path) = &self.current_disc_path {
             if opencdi::cdrom::parse_drive_letter(path).is_some() { return; }
-            let cover_missing = library::load_cover_artwork(path, &self.covers_path)
-                .or_else(|| library::load_cover_artwork(path, &self.managed_covers_path)).is_none();
+            let cover_missing = library::load_cover_artwork(path, &self.managed_covers_path).is_none();
             let target = target_for(path, cover_missing, self.boot_disc_art.is_none(), self.disc_details.logo.is_none());
             if !needs_lookup(&target) { return; }
             vec![target]
@@ -1358,29 +1597,74 @@ impl App {
             return;
         };
         if targets.is_empty() { return; }
+        let mut seen_titles = HashSet::new();
+        targets.retain(|target| seen_titles.insert(target.title.clone()));
+        if self.library_mode {
+            let per_page = library::layout(self.bindings.ui_shortcuts.artwork_size).visible_count();
+            let start = self.library_selected / per_page * per_page;
+            let visible: HashSet<_> = (start..start + per_page)
+                .filter_map(|index| self.library_search.get(&self.library_items, index))
+                .map(|item| item.title.clone()).collect();
+            targets.sort_by_key(|target| !visible.contains(&target.title));
+        }
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        self.artwork_progress_rx = Some(progress_rx);
+        self.artwork_progress = Some(launchbox::LookupProgress {
+            phase: "Preparing artwork lookup", total: targets.len(), ..Default::default()
+        });
+        let existing_covers: Vec<_> = targets.iter().filter_map(|target| {
+            let disc = self.library_items.iter().find(|item| item.title == target.title).map(|item| item.path.as_path())
+                .or(self.current_disc_path.as_deref())?;
+            library::cover_artwork_path(disc, &self.managed_covers_path)
+                .map(|cover| (target.title.clone(), cover))
+        }).collect();
         let artwork_root = self.managed_artwork_root.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         self.artwork_fetch_rx = Some(rx);
         let result = std::thread::Builder::new().name("launchbox-artwork".into()).spawn(move || {
-            let image_ready = |title: &str, kind, path: &Path| {
+            let send_image = |title: &str, kind, path: &Path| {
                 if let Some(image) = library::load_artwork(path) {
                     let preferred = path.file_stem().is_some_and(|stem| stem.to_string_lossy().ends_with("--screenscraper")
                         || stem.to_string_lossy().ends_with("--screenscraper-disc"));
                     let _ = tx.send(DownloadedArtwork { title: title.to_owned(), kind, image, preferred });
                 }
             };
-            launchbox::fetch_missing_artwork(&targets, &artwork_root, &cache, image_ready, |pending, notify| {
+            for (title, cover) in existing_covers {
+                match boxart::ensure(&cover, &title, &artwork_root) {
+                    Ok(Some(path)) => {
+                        send_image(&title, launchbox::ArtworkKind::Cover, &cover);
+                        send_image(&title, launchbox::ArtworkKind::Boxart, &path);
+                    }
+                    Err(error) => log::warn!("Could not generate box art for {title}: {error}"),
+                    _ => {}
+                }
+            }
+            let image_ready = |title: &str, kind, path: &Path| {
+                send_image(title, kind, path);
+                if kind == launchbox::ArtworkKind::Cover {
+                    match boxart::ensure(path, title, &artwork_root) {
+                        Ok(Some(path)) => send_image(title, launchbox::ArtworkKind::Boxart, &path),
+                        Err(error) => log::warn!("Could not generate box art for {title}: {error}"),
+                        _ => {}
+                    }
+                }
+            };
+            launchbox::fetch_missing_artwork(&targets, &artwork_root, &cache, image_ready, |pending, kinds, disc_region, notify| {
                 let mut supplied = HashSet::new();
-                screenscraper::fetch_missing(pending, &artwork_root, |title, kind, path| {
+                screenscraper::fetch_missing_for_kinds(pending, &artwork_root, kinds, disc_region, |title, kind, path| {
                     supplied.insert((title.to_owned(), kind));
                     notify(title, kind, path);
                 }, synopsis::save);
                 for target in pending {
                     target.missing.retain(|&kind| !supplied.contains(&(target.title.clone(), kind)));
                 }
-            });
+            }, |progress| { let _ = progress_tx.send(progress); });
         });
-        if result.is_err() { self.artwork_fetch_rx = None; }
+        if result.is_err() {
+            self.artwork_fetch_rx = None;
+            self.artwork_progress_rx = None;
+            self.artwork_progress = None;
+        }
     }
 
     fn set_artwork_size(&mut self, value: u8) {
@@ -1393,9 +1677,7 @@ impl App {
 
     fn persist_paths(&mut self) {
         self.bindings.ui_shortcuts.disc_paths = self.disc_paths.clone();
-        self.bindings.ui_shortcuts.covers_path = self.covers_path.clone();
-        self.bindings.ui_shortcuts.cd_art_path = self.cd_art_path.clone();
-        self.bindings.ui_shortcuts.bezels_path = self.bezels_path.clone();
+        self.global_bindings.ui_shortcuts.disc_paths = self.disc_paths.clone();
         self.bindings.save_to_ini();
     }
 
@@ -1408,6 +1690,13 @@ impl App {
             self.bindings.save_to_ini();
             self.global_bindings = self.bindings.clone();
         }
+    }
+
+    fn save_global_shortcuts(&mut self) {
+        let input_device = self.global_bindings.ui_shortcuts.input_device;
+        self.global_bindings.ui_shortcuts = self.bindings.ui_shortcuts.clone();
+        self.global_bindings.ui_shortcuts.input_device = input_device;
+        self.global_bindings.save_to_ini();
     }
 
     fn save_active_disc_settings(&self) {
@@ -1424,6 +1713,11 @@ impl App {
     }
 
     fn move_library_selection(&mut self, delta: isize) {
+        if self.library_search.collection.missing_offset.is_some() {
+            self.library_search.collection.scroll_missing(delta);
+            if let Some(window) = &self.window { window.request_redraw(); }
+            return;
+        }
         let n = self.library_search.len(&self.library_items) as isize;
         if n == 0 { return; }
         self.library_selected = (self.library_selected as isize + delta).rem_euclid(n) as usize;
@@ -1435,8 +1729,8 @@ impl App {
                 .unwrap_or_else(|| self.global_nvram_path.clone())
         } else { self.global_nvram_path.clone() };
         if self.nvram_path.as_ref() == Some(&target) { return; }
-        self.m.bus.nvram.flush_if_dirty();
-        match self.m.bus.nvram.load_or_initialize(&target) {
+        flush_nvram(&mut self.m.bus);
+        match load_nvram(&mut self.m.bus, &target) {
             Ok(()) => {
                 self.nvram_path = Some(target.clone());
                 info!("NVRAM loaded from {:?}", target);
@@ -1446,12 +1740,29 @@ impl App {
     }
 
     fn set_search_focus(&mut self, focused: bool) {
+        if focused { self.library_search.collection.missing_offset = None; }
         self.library_search.focused = focused;
         self.library_search.select_all = false;
         if let Some(window) = &self.window {
             window.set_ime_allowed(focused);
             window.request_redraw();
         }
+    }
+
+    fn select_library_category(&mut self, category: library_catalogue::Category) {
+        self.set_search_focus(false);
+        if self.library_search.collection.category == category { return; }
+        self.library_search.collection.category = category;
+        if let Some(offset) = &mut self.library_search.collection.missing_offset { *offset = 0; }
+        self.search_changed();
+    }
+
+    fn toggle_missing_titles(&mut self) {
+        let collection = &mut self.library_search.collection;
+        collection.missing_offset = collection.missing_offset.is_none().then_some(0);
+        self.library_click = None;
+        self.library_scroll_accum = 0.0;
+        self.set_search_focus(false);
     }
 
     fn search_changed(&mut self) {
@@ -1517,6 +1828,30 @@ impl App {
 
     fn library_key(&mut self, el: &ActiveEventLoop, code: Key) -> bool {
         if !self.library_mode { return false; }
+        if self.mods.control_key() {
+            match code {
+                Key::KeyM => { self.toggle_missing_titles(); return true; }
+                Key::ArrowLeft | Key::ArrowRight => {
+                    let direction = if code == Key::ArrowLeft { -1 } else { 1 };
+                    self.select_library_category(self.library_search.collection.category.step(direction));
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        if self.library_search.collection.missing_offset.is_some() {
+            match code {
+                Key::Escape => self.toggle_missing_titles(),
+                Key::ArrowUp => self.move_library_selection(-1),
+                Key::ArrowDown => self.move_library_selection(1),
+                Key::PageUp => self.move_library_selection(-(library_catalogue::MISSING_ROWS as isize)),
+                Key::PageDown => self.move_library_selection(library_catalogue::MISSING_ROWS as isize),
+                Key::Home => self.move_library_selection(isize::MIN),
+                Key::End => self.move_library_selection(isize::MAX),
+                _ => {}
+            }
+            return true;
+        }
         match code {
             Key::ArrowLeft => self.move_library_selection(-1),
             Key::ArrowRight => self.move_library_selection(1),
@@ -1667,6 +2002,14 @@ impl App {
 
     fn on_key_pressed(&mut self, el: &ActiveEventLoop, code: Key) {
         if code == self.bindings.btn2 && self.go_back() { return; }
+        if self.preview_started.is_some() && self.controller_config.is_none() {
+            if code == Key::Escape {
+                self.stop_to_library();
+            } else if matches!(code, Key::Enter | Key::NumpadEnter | Key::Space) || code == self.bindings.btn1 {
+                push_action(GuiAction::PlaySelectedDisc);
+            }
+            return;
+        }
         if self.pause_info { return; }
         if self.toolbar_popup == Some(library::ToolbarPopup::About) {
             if matches!(code, Key::Escape | Key::Enter | Key::NumpadEnter | Key::Space) {
@@ -1676,16 +2019,21 @@ impl App {
             return;
         }
         let mut save_input = false;
+        let mut save_shortcuts = false;
         let mut closed_controller_config = false;
         if let Some(state) = self.controller_config.as_mut() {
             match state.key_pressed(code) {
                 ControllerConfigAction::AssignedKey(row, key) => {
-                    if row == 7 { self.bindings.ui_shortcuts.set_pause_key(key); }
-                    else { self.bindings.set_key_binding(row, key); }
-                    save_input = true;
+                    if row == 7 {
+                        self.bindings.ui_shortcuts.set_pause_key(key);
+                        save_shortcuts = true;
+                    } else {
+                        self.bindings.set_key_binding(row, key);
+                        save_input = true;
+                    }
                 }
-                ControllerConfigAction::AssignedPauseKey(key) => { self.bindings.ui_shortcuts.set_pause_key(key); save_input = true; }
-                ControllerConfigAction::AssignedExitKey(key) => { self.bindings.ui_shortcuts.set_exit_key(key); save_input = true; }
+                ControllerConfigAction::AssignedPauseKey(key) => { self.bindings.ui_shortcuts.set_pause_key(key); save_shortcuts = true; }
+                ControllerConfigAction::AssignedExitKey(key) => { self.bindings.ui_shortcuts.set_exit_key(key); save_shortcuts = true; }
                 ControllerConfigAction::Close => {
                     self.controller_config = None;
                     closed_controller_config = true;
@@ -1694,13 +2042,14 @@ impl App {
                 }
                 ControllerConfigAction::Cancelled | ControllerConfigAction::Handled => {}
             }
+            if save_input { self.save_input_settings(); }
+            if save_shortcuts { self.save_global_shortcuts(); }
             if self.controller_config.is_some() { return; }
             if closed_controller_config {
                 if let Some(window) = &self.window { window.request_redraw(); }
                 return;
             }
         }
-        if save_input { self.save_input_settings(); }
         if self.bindings.ui_shortcuts.exit_key == Some(code) { el.exit(); return; }
         if self.paused {
             if self.bindings.ui_shortcuts.pause_key == Some(code) { self.toggle_pause_menu(); return; }
@@ -1752,8 +2101,9 @@ impl App {
             Key::F8 => save_screenshot_ppm(self.frame_count, &self.m.bus.mcd212.framebuffer[..]),
             Key::F12 => save_screenshot(self.frame_count, &self.m.bus.mcd212.framebuffer[..]),
             Key::KeyM if !self.bound(code) => {
-                self.m.bus.cdic.audio.muted = !self.m.bus.cdic.audio.muted;
-                info!("Audio: {}", if self.m.bus.cdic.audio.muted { "MUTED" } else { "UNMUTED" });
+                self.muted = !self.muted;
+                    self.publish_gain();
+                info!("Audio: {}", if self.muted { "MUTED" } else { "UNMUTED" });
             }
             _ => {}
         }
@@ -1775,7 +2125,7 @@ impl App {
                             self.next_synopsis_check = Instant::now();
                             self.artwork_retry_at = self.next_synopsis_check;
                             self.activate_nvram_for_selection();
-                            self.boot_disc_art = library::load_disc_artwork(&path, &self.cd_art_path).or_else(|| library::load_disc_artwork(&path, &self.managed_cd_path));
+                            self.boot_disc_art = library::load_disc_artwork(&path, &self.managed_cd_path);
                             self.current_game_name = opencdi::frontend::disc_display_name(&path);
                             self.add_recent(&path);
                             info!("New disc inserted successfully: {}", self.current_game_name);
@@ -1787,31 +2137,25 @@ impl App {
                         }
                     }
                 }
-                GuiAction::OpenDisc(path) => {
+                GuiAction::OpenDisc(path) => self.preview_disc(path),
+                GuiAction::PlaySelectedDisc => {
+                    if self.preview_started.is_none() { continue; }
+                    let Some(path) = self.current_disc_path.clone() else { continue; };
                     info!("Loading and booting new disc (Reset): {:?}", path);
                     match self.m.bus.load_cdrom(&path) {
                         Ok(_) => {
                             self.save_active_disc_settings();
                             self.activate_disc_settings(&path);
                             self.set_search_focus(false);
-                            self.library_mode = false;
-                            self.toolbar_popup = None;
+                            self.preview_started = None;
                             self.grab_applied = None;
-                            self.apply_grab();
-                            self.current_disc_path = Some(path.clone());
-                            self.disc_details = library::DiscDetails::load(&path, &self.managed_artwork_root);
-                            self.boot_synopsis = synopsis::load(&self.synopsis_root, &path);
-                            self.next_synopsis_check = Instant::now();
-                            self.artwork_retry_at = self.next_synopsis_check;
                             self.activate_nvram_for_selection();
-                            self.boot_disc_art = library::load_disc_artwork(&path, &self.cd_art_path).or_else(|| library::load_disc_artwork(&path, &self.managed_cd_path));
-                            self.current_game_name = opencdi::frontend::disc_display_name(&path);
                             self.add_recent(&path);
                             info!("Disc loaded successfully: {}", self.current_game_name);
 
                             if !self.dvc_disabled && !self.m.bus.dvc.is_fitted() {
-                                if let Some(dvc_path) = self.dvc_arg.clone().or_else(find_dvc_rom) {
-                                    if let Ok(_) = self.m.load_dvc_rom(&dvc_path) {
+                                if let Some(dvc_path) = self.dvc_arg.clone().or_else(|| find_dvc_rom(self.m.bus.board)) {
+                                    if let Ok(_) = self.m.load_dvc(&dvc_path) {
                                         info!("Loaded Digital Video Cartridge (DVC) extension from {:?}", dvc_path);
                                         #[cfg(target_os = "windows")]
                                         gui::update_dvc_menu(true);
@@ -1819,9 +2163,7 @@ impl App {
                                 }
                             }
 
-                            let name_upper = self.current_game_name.to_uppercase();
-                            let is_ntsc = (name_upper.contains("(USA)") || name_upper.contains("(JAPAN)") || name_upper.contains("NTSC"))
-                                && self.m.bus.cdrom.as_ref().map_or(true, |cd| cd.disc_type != 0x20);
+                            let is_ntsc = self.m.bus.cdrom.as_ref().is_some_and(|cd| cd.is_ntsc_hint(&self.current_game_name).unwrap_or(false));
                             let mode = if is_ntsc {
                                 info!("Detected NTSC disc (USA/Japan): auto-configured NTSC 60 Hz video mode");
                                 VideoMode::Ntsc
@@ -1836,8 +2178,10 @@ impl App {
                             self.m.cpu.reset(&mut self.m.bus);
                             self.reset_state();
                             self.mouse_captured = true;
+                            self.apply_grab();
                             self.m.bus.emulate_wait_states = true;
                             self.next_frame_time = Instant::now();
+                            self.boot_details_until = Some(self.next_frame_time + Duration::from_millis(750));
                             self.reset_telemetry();
                         }
                         Err(e) => {
@@ -1850,7 +2194,7 @@ impl App {
                 GuiAction::EjectDisc => {
                     info!("Ejecting disc from CD-i drive");
                     self.save_active_disc_settings();
-                    self.m.bus.slave.set_disc_inserted(false);
+                    self.m.bus.slave.set_disc_inserted(false, false);
                     self.m.bus.cdrom = None;
                     self.current_disc_path = None;
                     self.active_disc_config_path = None;
@@ -1908,7 +2252,7 @@ impl App {
                     self.controller_config_was_captured = self.mouse_captured;
                     self.controller_config = Some(ControllerConfigState::default());
                     self.mouse_captured = false;
-                    self.m.bus.slave.update_mouse(self.pad_x, self.pad_y, 0);
+                    send_pointer(&mut self.m.bus, self.pad_x, self.pad_y, 0);
                     self.prev_key_btn = 0;
                     self.apply_grab();
                     if let Some(window) = &self.window { window.request_redraw(); }
@@ -1918,14 +2262,17 @@ impl App {
                     info!("Mouse capture: {}", if self.mouse_captured { "CAPTURED" } else { "RELEASED" });
                 }
                 GuiAction::ToggleMute => {
-                    self.m.bus.cdic.audio.muted = !self.m.bus.cdic.audio.muted;
-                    info!("Audio: {}", if self.m.bus.cdic.audio.muted { "MUTED" } else { "UNMUTED" });
+                    self.muted = !self.muted;
+                    self.publish_gain();
+                    info!("Audio: {}", if self.muted { "MUTED" } else { "UNMUTED" });
                 }
                 GuiAction::VolumeUp => {
-                    self.m.bus.cdic.audio.volume = (self.m.bus.cdic.audio.volume + 0.05).min(2.0);
+                    self.volume = (self.volume + 0.05).min(2.0);
+                    self.publish_gain();
                 }
                 GuiAction::VolumeDown => {
-                    self.m.bus.cdic.audio.volume = (self.m.bus.cdic.audio.volume - 0.05).max(0.0);
+                    self.volume = (self.volume - 0.05).max(0.0);
+                    self.publish_gain();
                 }
                 GuiAction::ToggleFullscreen => {
                     self.toggle_fullscreen();
@@ -1963,20 +2310,7 @@ impl App {
                     self.refresh_library();
                     info!("Disc folders updated.");
                 }
-                GuiAction::SetArtworkPath(kind, path) => {
-                    let resolved = resolve_config_path(&path);
-                    match kind {
-                        ArtworkPathKind::Covers => { self.covers_path = resolved.clone(); self.bindings.ui_shortcuts.covers_path = path; }
-                        ArtworkPathKind::Cd => { self.cd_art_path = resolved.clone(); self.bindings.ui_shortcuts.cd_art_path = path; }
-                        ArtworkPathKind::Bezels => { self.bezels_path = resolved.clone(); self.bindings.ui_shortcuts.bezels_path = path; }
-                    }
-                    if kind == ArtworkPathKind::Cd {
-                        self.boot_disc_art = self.current_disc_path.as_deref().and_then(|p| library::load_disc_artwork(p, &self.cd_art_path).or_else(|| library::load_disc_artwork(p, &self.managed_cd_path)));
-                    }
-                    self.bindings.save_to_ini();
-                    self.refresh_library();
-                    info!("Artwork path updated: {:?}", resolved);
-                }
+                GuiAction::SwitchBios(path) => self.switch_bios(path),
                 GuiAction::TakeScreenshot => {
                     save_screenshot(self.frame_count, &self.m.bus.mcd212.framebuffer[..]);
                 }
@@ -2000,8 +2334,8 @@ impl App {
                         #[cfg(target_os = "windows")]
                         gui::update_dvc_menu(false);
                     } else {
-                        if let Some(dvc_path) = self.dvc_arg.clone().or_else(find_dvc_rom) {
-                            if let Ok(_) = self.m.load_dvc_rom(&dvc_path) {
+                        if let Some(dvc_path) = self.dvc_arg.clone().or_else(|| find_dvc_rom(self.m.bus.board)) {
+                            if let Ok(_) = self.m.load_dvc(&dvc_path) {
                                 info!("Inserted Digital Video Cartridge (DVC) from {:?}", dvc_path);
                                 #[cfg(target_os = "windows")]
                                 gui::update_dvc_menu(true);
@@ -2022,46 +2356,16 @@ impl App {
                     #[cfg(target_os = "windows")]
                     gui::post_menu_command(self.hwnd(), gui::ID_HELP_ABOUT);
                 }
-                GuiAction::QuickSaveState => {
-                    let st_path = savestate_path_for(&self.current_game_name, 1);
-                    match opencdi::savestate::save_state_to_file(&st_path, &self.m.cpu, &self.m.bus, self.disc_launched, self.shell_ready_count, self.pad_x, self.pad_y) {
-                        Ok(_) => info!("Quick Save State (Slot 1) salvato con successo: {:?}", st_path),
-                        Err(e) => error!("Errore salvataggio Quick Save State (Slot 1): {:?}", e),
-                    }
-                }
-                GuiAction::QuickLoadState => {
-                    let st_path = savestate_path_for(&self.current_game_name, 1);
-                    match opencdi::savestate::load_state_from_file(&st_path, &mut self.m.cpu, &mut self.m.bus, &mut self.disc_launched, &mut self.shell_ready_count, &mut self.pad_x, &mut self.pad_y) {
-                        Ok(_) => {
-                            self.pad_x_f = self.pad_x as f32;
-                            self.pad_y_f = self.pad_y as f32;
-                            self.reset_telemetry();
-                            info!("Quick Load State (Slot 1) caricato con successo: {:?}", st_path);
-                        }
-                        Err(e) => error!("Errore caricamento Quick Load State (Slot 1): {:?}", e),
-                    }
-                }
-                GuiAction::SaveState(slot) => {
-                    let st_path = savestate_path_for(&self.current_game_name, slot);
-                    match opencdi::savestate::save_state_to_file(&st_path, &self.m.cpu, &self.m.bus, self.disc_launched, self.shell_ready_count, self.pad_x, self.pad_y) {
-                        Ok(_) => info!("Save State (Slot {}) salvato con successo: {:?}", slot, st_path),
-                        Err(e) => error!("Errore salvataggio Save State (Slot {}): {:?}", slot, e),
-                    }
-                }
-                GuiAction::LoadState(slot) => {
-                    let st_path = savestate_path_for(&self.current_game_name, slot);
-                    match opencdi::savestate::load_state_from_file(&st_path, &mut self.m.cpu, &mut self.m.bus, &mut self.disc_launched, &mut self.shell_ready_count, &mut self.pad_x, &mut self.pad_y) {
-                        Ok(_) => {
-                            self.pad_x_f = self.pad_x as f32;
-                            self.pad_y_f = self.pad_y as f32;
-                            self.reset_telemetry();
-                            info!("Load State (Slot {}) caricato con successo: {:?}", slot, st_path);
-                        }
-                        Err(e) => error!("Errore caricamento Load State (Slot {}): {:?}", slot, e),
-                    }
-                }
+                GuiAction::QuickSaveState => self.state_slot(1, false),
+                GuiAction::QuickLoadState => self.state_slot(1, true),
+                GuiAction::SaveState(slot) => self.state_slot(slot, false),
+                GuiAction::LoadState(slot) => self.state_slot(slot, true),
                 GuiAction::ClearNvram => {
-                    let _ = self.m.bus.nvram.clear();
+                    if let Some(board) = self.m.bus.mono4.as_deref_mut() {
+                        board.nvram.clear();
+                    } else {
+                        let _ = self.m.bus.nvram.clear();
+                    }
                     if let Some(ref path) = self.nvram_path {
                         let _ = std::fs::remove_file(path);
                     }
@@ -2094,18 +2398,18 @@ impl App {
                     m.bus.peek_long(0x0000C000u32.wrapping_add(0xFFFF9172)).unwrap_or(0)
                 };
 
-                if shell_state >= 2 {
+                if shell_state >= 2 && m.bus.mono4.is_none() {
                     self.shell_ready_count += 1;
                     let click_phase = self.shell_ready_count % 120;
                     if self.shell_ready_count == 1 {
                         info!("CD-i shell is ready; automatically selecting Play CD-i while the disc boots...");
                     }
                     if click_phase == 10 {
-                        m.bus.slave.update_mouse(575, 335, 0);
+                        send_pointer(&mut m.bus, 575, 335, 0);
                     } else if click_phase == 20 {
-                        m.bus.slave.update_mouse(575, 335, 1);
+                        send_pointer(&mut m.bus, 575, 335, 1);
                     } else if click_phase == 35 {
-                        m.bus.slave.update_mouse(575, 335, 0);
+                        send_pointer(&mut m.bus, 575, 335, 0);
                     }
                 }
             }
@@ -2118,7 +2422,7 @@ impl App {
                     self.pad_y = 280;
                     self.pad_x_f = 384.0;
                     self.pad_y_f = 280.0;
-                    m.bus.slave.update_mouse(384, 280, 0);
+                    send_pointer(&mut m.bus, 384, 280, 0);
                 }
             }
         }
@@ -2180,6 +2484,7 @@ impl App {
 
         // Gamepad handling via Gilrs (Xbox / PlayStation / USB)
         let mut menu_pad_down = false;
+        let mut play_pad_down = false;
         let mut back_pad_down = false;
         let capturing_mapping = self.controller_config.as_ref().is_some_and(|config| config.listening);
         let mut exit_pad_down = false;
@@ -2245,6 +2550,7 @@ impl App {
                     dir_y += pad_dir_y;
 
                     if gamepad.is_pressed(pad_btn1) {
+                        play_pad_down = true;
                         key_btn |= 1;
                     }
                     if gamepad.is_pressed(pad_btn2) {
@@ -2259,16 +2565,20 @@ impl App {
         }
         pause_pad_down |= self.bindings.ui_shortcuts.pause_pad.contains(&gilrs::Button::Mode) && xbox_guide_pressed();
         if let Some(button) = captured_button {
-            let mut save = false;
+            let mut assigned_row = None;
             if let Some(config) = self.controller_config.as_mut() {
                 if config.listening && config.target == ControllerConfigTarget::Gamepad {
                     if config.row == 7 { self.bindings.ui_shortcuts.set_pause_combo(vec![button]); }
                     else { self.bindings.set_pad_binding(config.row, button); }
                     config.listening = false;
-                    save = true;
+                    assigned_row = Some(config.row);
                 }
             }
-            if save { self.save_input_settings(); }
+            match assigned_row {
+                Some(7) => self.save_global_shortcuts(),
+                Some(_) => self.save_input_settings(),
+                None => {}
+            }
         }
         let mut save_combo = false;
         if let Some(config) = self.controller_config.as_mut() {
@@ -2286,7 +2596,7 @@ impl App {
                 }
             }
         }
-        if save_combo { self.save_input_settings(); }
+        if save_combo { self.save_global_shortcuts(); }
         if let Some(config) = self.controller_config.as_mut() {
             if !config.listening {
                 if cfg_up && !self.config_prev_up { config.row = (config.row + controller_config::ROWS - 1) % controller_config::ROWS; }
@@ -2294,14 +2604,21 @@ impl App {
                 if (cfg_left && !self.config_prev_left) || (cfg_right && !self.config_prev_right) {
                     config.target = if config.target == ControllerConfigTarget::Keyboard { ControllerConfigTarget::Gamepad } else { ControllerConfigTarget::Keyboard };
                 }
-                if cfg_confirm && !self.config_prev_confirm { config.listening = true; }
+                config.confirm_gamepad(cfg_confirm, self.config_prev_confirm);
             }
         }
         self.config_prev_up = cfg_up; self.config_prev_down = cfg_down;
         self.config_prev_left = cfg_left; self.config_prev_right = cfg_right; self.config_prev_confirm = cfg_confirm;
         let back_pressed = back_pad_down && !self.previous_back_pad;
         self.previous_back_pad = back_pad_down;
+        let play_pressed = play_pad_down && !self.previous_play_pad;
+        self.previous_play_pad = play_pad_down;
         if !capturing_mapping && back_pressed && self.go_back() { return; }
+        if self.preview_started.is_some() && self.controller_config.is_none() {
+            if play_pressed { push_action(GuiAction::PlaySelectedDisc); }
+            if exit_pad_down { self.exit_requested = true; }
+            return;
+        }
         if self.controller_config.is_some() { return; }
         if menu_pad_down && !self.prev_menu_pad { self.toggle_menu(); }
         self.prev_menu_pad = menu_pad_down;
@@ -2348,7 +2665,9 @@ impl App {
             }
         }
 
-        if !self.disc_launched && m.bus.cdrom.is_some() && self.skip_shell {
+        if self.boot_details_until.is_some_and(|until| Instant::now() < until)
+            || (!self.disc_launched && m.bus.cdrom.is_some() && self.skip_shell && m.bus.mono4.is_none())
+        {
             // Keep host input from interfering with the automatic Play CD-i selection.
         } else {
             match self.input_device_mode {
@@ -2366,7 +2685,7 @@ impl App {
                         moved = true;
                     }
                     if moved || key_btn != self.prev_key_btn {
-                        m.bus.slave.update_mouse(self.pad_x, self.pad_y, key_btn);
+                        send_pointer(&mut m.bus, self.pad_x, self.pad_y, key_btn);
                     }
                     self.prev_key_btn = key_btn;
                 }
@@ -2375,19 +2694,25 @@ impl App {
                     self.pad_y = mouse_y;
                     self.pad_x_f = mouse_x as f32;
                     self.pad_y_f = mouse_y as f32;
-                    m.bus.slave.update_mouse(self.pad_x, self.pad_y, mouse_btn | key_btn);
+                    send_pointer(&mut m.bus, self.pad_x, self.pad_y, mouse_btn | key_btn);
                 }
             }
         }
 
         // Audio hotkeys (+ / - = Volume, held)
-        let audio = &mut self.m.bus.cdic.audio;
         if self.keys.contains(&Key::Equal) || self.keys.contains(&Key::NumpadAdd) {
-            audio.volume = (audio.volume + 0.02).min(2.0);
+            self.volume = (self.volume + 0.02).min(2.0);
+            self.publish_gain();
         }
         if self.keys.contains(&Key::Minus) || self.keys.contains(&Key::NumpadSubtract) {
-            audio.volume = (audio.volume - 0.02).max(0.0);
+            self.volume = (self.volume - 0.02).max(0.0);
+            self.publish_gain();
         }
+    }
+
+    fn publish_gain(&self) {
+        let g = if self.muted { 0.0f32 } else { self.volume };
+        self.audio_gain.store(g.to_bits(), Ordering::Relaxed);
     }
 
     // Start a fresh speed window (pause, video mode switch, reset, fast-forward toggle)
@@ -2446,6 +2771,12 @@ impl App {
 
     // Title bar from the last measurements; shows PAUSED instead of the speed while paused
     fn refresh_title(&self) {
+        if self.preview_started.is_some() {
+            if let Some(window) = &self.window {
+                window.set_title(&format!("OpenCDi – {} | Ready to play", self.current_game_name));
+            }
+            return;
+        }
         let m = &self.m;
         let video_mode = match m.bus.mcd212.video_mode {
             VideoMode::Pal => "50Hz (PAL)",
@@ -2504,7 +2835,7 @@ impl App {
             }
             return true;
         }
-        if self.library_mode {
+        if self.library_mode || self.preview_started.is_some() {
             self.update_input();
             if self.exit_requested { return false; }
             if let Some(window) = &self.window { window.request_redraw(); }
@@ -2513,7 +2844,7 @@ impl App {
         self.autoplay();
         self.m.run_frame();
         if self.frame_count % 300 == 0 {
-            self.m.bus.nvram.flush_if_dirty();
+            flush_nvram(&mut self.m.bus);
         }
 
         let curr_vsr = (self.m.bus.mcd212.get_vsr::<0>(), self.m.bus.mcd212.get_vsr::<1>());
@@ -2525,14 +2856,15 @@ impl App {
         self.update_input();
         if self.exit_requested { return false; }
         // Emulation runs on the timer; only the picture is skipped while the window is hidden
+        self.audio_buf.clear();
+        self.m.drain_audio(&mut self.audio_buf);
         if self.fast_forward {
-            // Drop fast-forward audio so the queues never hold sped-up backlog
-            let audio = &self.m.bus.cdic.audio;
-            for q in [&audio.sample_queue, &audio.sfx_queue] {
-                if let Ok(mut q) = q.lock() {
-                    q.clear();
-                }
+            // Drop fast-forward audio so the ring never holds sped-up backlog
+            if let Ok(mut q) = self.audio_ring.lock() {
+                q.clear();
             }
+        } else {
+            audio::feed_ring(&self.audio_ring, &self.audio_buf);
         }
         // While fast-forwarding, present at most about 60 times a second
         let due = !self.in_modal_pump && (!self.fast_forward || self.last_present.elapsed() >= Duration::from_millis(16));
@@ -2589,31 +2921,39 @@ impl App {
 
     fn present(&mut self) {
         let render_pause_menu = self.paused && self.disc_launched && self.m.bus.cdrom.is_some();
-        let (Some(window), Some(surface)) = (&self.window, &mut self.surface) else { return };
+        let Some(window) = &self.window else { return };
         let size = window.inner_size();
         let (Some(w), Some(h)) = (std::num::NonZeroU32::new(size.width), std::num::NonZeroU32::new(size.height)) else { return };
+        let (dw, dh) = (size.width as usize, size.height as usize);
+        let show_details = self.showing_disc_details();
+        self.image_rect = self.content_rect(dw, dh);
+        let Some(surface) = &mut self.surface else { return };
         if surface.resize(w, h).is_err() {
             return;
         }
         self.last_present = Instant::now();
-        let (dw, dh) = (size.width as usize, size.height as usize);
-        self.image_rect = if self.library_mode || self.controller_config.is_some() { (0,0,dw,dh) } else { image_rect(dw, dh) };
         if let Ok(mut buffer) = surface.buffer_mut() {
             if let Some(state) = &self.controller_config {
                 controller_config::render_native(&mut buffer,dw,dh,self.image_rect,&self.bindings,&self.bindings.ui_shortcuts,self.input_device_mode,state,self.controller_art.as_ref(),self.mouse_art.as_ref());
             } else if self.library_mode {
-                library::render_native(&mut buffer,dw,dh,self.image_rect,&self.library_items,self.library_selected,self.bindings.ui_shortcuts.artwork_size,self.menu_visible,self.display_mode,self.toolbar_popup,self.optical_disc,&self.library_search);
+                library::render_native(&mut buffer,dw,dh,self.image_rect,&self.library_items,self.library_selected,self.bindings.ui_shortcuts.artwork_size,self.menu_visible,self.display_mode,self.toolbar_popup,self.optical_disc,&self.library_search,self.artwork_progress.as_ref());
             } else {
-                let show_details = self.pause_info || (self.skip_shell && self.m.bus.cdrom.is_some() && !self.disc_launched);
                 let mut frame = self.m.bus.mcd212.framebuffer.to_vec();
                 if show_details {
-                    let animation_frame = if self.pause_info { u64::from(self.paused_ticks) } else { self.frame_count };
+                    let animation_frame = if let Some(started) = self.preview_started {
+                        (started.elapsed().as_millis() / 20) as u64
+                    } else if self.pause_info { u64::from(self.paused_ticks) } else { self.frame_count };
                     library::render_boot(&mut frame, self.boot_disc_art.as_ref(), animation_frame);
                 }
                 blit_aspect(&mut buffer, dw, dh, &frame, self.image_rect);
                 if show_details {
                     library::render_boot_details(&mut buffer, dw, dh, self.image_rect,
                         &self.current_game_name, &self.disc_details, self.boot_synopsis.as_deref());
+                    if self.preview_started.is_some() {
+                        library::render_preview_actions(&mut buffer, dw, dh, self.image_rect);
+                    }
+                } else {
+                    draw_bezel(&mut buffer, dw, dh, self.image_rect);
                 }
             }
             if render_pause_menu && self.controller_config.is_none() && !self.pause_info {
@@ -2657,7 +2997,7 @@ impl ApplicationHandler for App {
             }
         }
         let size = window.inner_size();
-        self.image_rect = if self.library_mode || self.controller_config.is_some() { (0,0,size.width as usize,size.height as usize) } else { image_rect(size.width as usize, size.height as usize) };
+        self.image_rect = self.content_rect(size.width as usize, size.height as usize);
         self.focused = window.has_focus();
         self.window = Some(window);
         #[cfg(windows)]
@@ -2695,7 +3035,7 @@ impl ApplicationHandler for App {
                 self.present();
             }
             WindowEvent::Resized(size) => {
-                self.image_rect = if self.library_mode || self.controller_config.is_some() { (0,0,size.width as usize,size.height as usize) } else { image_rect(size.width as usize, size.height as usize) };
+                self.image_rect = self.content_rect(size.width as usize, size.height as usize);
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -2750,8 +3090,9 @@ impl ApplicationHandler for App {
                     self.library_scroll_accum += amount;
                     let rows = self.library_scroll_accum.trunc() as isize;
                     if rows != 0 {
-                        let columns = library::layout(self.bindings.ui_shortcuts.artwork_size).columns as isize;
-                        self.move_library_selection(-rows * columns);
+                        let step = if self.library_search.collection.missing_offset.is_some() { 1 }
+                            else { library::layout(self.bindings.ui_shortcuts.artwork_size).columns as isize };
+                        self.move_library_selection(-rows * step);
                         self.library_scroll_accum -= rows as f64;
                     }
                 }
@@ -2770,6 +3111,19 @@ impl ApplicationHandler for App {
                     return;
                 }
                 if self.pause_info { return; }
+                if self.preview_started.is_some() && self.controller_config.is_none() {
+                    if down && button == MouseButton::Right {
+                        self.stop_to_library();
+                    } else if down && button == MouseButton::Left && let Some(pos) = self.cursor {
+                        let (x, y) = cursor_to_cdi(pos, self.image_rect);
+                        match library::preview_hit(x, y) {
+                            Some(library::PreviewAction::Play) => push_action(GuiAction::PlaySelectedDisc),
+                            Some(library::PreviewAction::Back) => self.stop_to_library(),
+                            None => {}
+                        }
+                    }
+                    return;
+                }
                 if down && button == MouseButton::Left && self.paused && self.controller_config.is_none() {
                     if let Some(pos) = self.cursor {
                         let (width, height) = self.window.as_ref().map(|w| { let s = w.inner_size(); (s.width as usize, s.height as usize) }).unwrap_or((0, 0));
@@ -2798,6 +3152,30 @@ impl ApplicationHandler for App {
                     }
                 }
                 if down && button == MouseButton::Left && self.library_mode && self.controller_config.is_none() {
+                    if let Some(pos) = self.cursor {
+                        let (x, y) = cursor_to_cdi(pos, self.image_rect);
+                        if let Some(category) = library::category_hit(x, y) {
+                            self.select_library_category(category);
+                            self.mouse_left = true;
+                            return;
+                        }
+                        if library::collection_count_hit(x, y) || (self.library_search.collection.missing_offset.is_some()
+                            && library::missing_close_hit(x, y))
+                        {
+                            self.toggle_missing_titles();
+                            self.mouse_left = true;
+                            return;
+                        }
+                        #[cfg(windows)]
+                        if let Some(offset) = self.library_search.collection.missing_offset
+                            && let Some(row) = library::missing_row_hit(x, y)
+                            && let Some(title) = self.library_search.collection.missing_title(offset + row)
+                        {
+                            gui::open_web_url(&title.url());
+                            self.mouse_left = true;
+                            return;
+                        }
+                    }
                     let hit = self.cursor.and_then(|pos| {
                         let (x, y) = cursor_to_cdi(pos, self.image_rect);
                         library::search_hit(x, y)
@@ -2864,7 +3242,9 @@ impl ApplicationHandler for App {
                 if self.library_mode && down && button == MouseButton::Left {
                     if let Some(pos) = self.cursor {
                         let (x, y) = cursor_to_cdi(pos, self.image_rect);
-                        if let Some(slot) = library::slot_at(x.max(0) as usize, y.max(0) as usize, self.bindings.ui_shortcuts.artwork_size) {
+                        if self.library_search.collection.missing_offset.is_none()
+                            && let Some(slot) = library::slot_at(x.max(0) as usize, y.max(0) as usize, self.bindings.ui_shortcuts.artwork_size)
+                        {
                             let per_page = library::layout(self.bindings.ui_shortcuts.artwork_size).visible_count();
                             let index = (self.library_selected / per_page) * per_page + slot;
                             if index < self.library_search.len(&self.library_items) {
@@ -2976,6 +3356,21 @@ mod tests {
         tx.send(DownloadedArtwork { title: "One".into(), kind: launchbox::ArtworkKind::Disc, image, preferred: false }).ok().unwrap();
         assert!(rx.try_recv().unwrap().apply(&mut items));
         assert!(items[0].disc.is_some());
+    }
+
+    #[test]
+    fn bezel_keeps_game_picture_and_mouse_inside_its_opening() {
+        let (w, h) = (1672, 941);
+        let game = bezel_game_rect(w, h);
+        assert!(game.0 >= 226 && game.1 >= 28);
+        assert!(game.0 + game.2 <= 1446 && game.1 + game.3 <= 914);
+        let mut pixels = vec![0xff000000; w * h];
+        let frame = vec![0xff336699; SCREEN_WIDTH * SCREEN_HEIGHT];
+        blit_aspect(&mut pixels, w, h, &frame, game);
+        draw_bezel(&mut pixels, w, h, game);
+        assert_eq!(pixels[game.1 * w + game.0], 0xff336699);
+        assert_ne!(pixels[w * 100 + 100], 0xff000000);
+        assert_eq!(cursor_to_cdi(PhysicalPosition::new(game.0 as f64, game.1 as f64), game), (0, 0));
     }
 
     #[test]

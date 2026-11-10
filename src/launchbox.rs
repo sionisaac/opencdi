@@ -36,6 +36,7 @@ struct ParsedRecords { games: Vec<GameRecord>, images: Vec<ImageRecord> }
 pub enum ArtworkKind { Cover, Disc, Boxart, Back, Logo }
 
 impl ArtworkKind {
+    pub const DOWNLOADS: [Self; 4] = [Self::Cover, Self::Disc, Self::Back, Self::Logo];
     pub const ALL: [Self; 5] = [Self::Cover, Self::Disc, Self::Boxart, Self::Back, Self::Logo];
 
     pub fn folder(self) -> &'static str {
@@ -54,23 +55,41 @@ impl ArtworkKind {
     }
 }
 
+#[derive(Clone, Default)]
+pub struct LookupProgress {
+    pub phase: &'static str,
+    pub checked: usize,
+    pub total: usize,
+    pub current: String,
+    pub saved: usize,
+    pub missing: usize,
+    pub finished: bool,
+}
+
 pub fn fetch_missing_artwork(
     targets: &[FetchTarget],
     artwork_root: &Path,
     cache_dir: &Path,
     mut image_ready: impl FnMut(&str, ArtworkKind, &Path),
-    prefer_artwork: impl FnOnce(&mut [FetchTarget], &mut dyn FnMut(&str, ArtworkKind, &Path)),
+    mut prefer_artwork: impl FnMut(&mut [FetchTarget], &[ArtworkKind], Option<&'static str>, &mut dyn FnMut(&str, ArtworkKind, &Path)),
+    mut progress: impl FnMut(LookupProgress),
 ) -> usize {
     let media_marks = cache_dir.join("LaunchBox-Media");
     let marker = |title: &str| media_marks.join(format!("{}.done", safe_name(title)));
     let needs_media = |target: &FetchTarget| !marker(&target.title).is_file();
     let mut pending: Vec<_> = targets.iter().filter(|t| !t.missing.is_empty() || t.download_all || t.synopsis_path.is_some() || needs_media(t)).cloned().collect();
     if pending.is_empty() { return 0; }
-    let bezels_dir = artwork_root.join("Bezels");
+    let mut state = LookupProgress { phase: "Preparing artwork lookup", total: pending.len(), ..Default::default() };
+    progress(state.clone());
+    let saved_images = std::cell::Cell::new(0);
+    let mut notify = |title: &str, kind, path: &Path| {
+        saved_images.set(saved_images.get() + 1);
+        image_ready(title, kind, path);
+    };
     let media_dir = artwork_root.join("LaunchBox");
     // Resolve and publish synopsis text before any network-heavy artwork work.
     let prepared = (|| {
-        if fs::create_dir_all(&bezels_dir).is_err() || fs::create_dir_all(&media_dir).is_err() || fs::create_dir_all(cache_dir).is_err() { return None; }
+        if fs::create_dir_all(&media_dir).is_err() || fs::create_dir_all(cache_dir).is_err() { return None; }
         let archive = cache_dir.join("LaunchBox-Metadata.zip");
         if !metadata_is_fresh(&archive) {
             if let Some(bytes) = http_get(METADATA_URL, METADATA_MAX_BYTES) {
@@ -85,7 +104,11 @@ pub fn fetch_missing_artwork(
             }
         }
         let zip = fs::read(&archive).ok()?;
-        let Some(entries) = zip_entries(&zip) else { log::warn!("LaunchBox metadata archive could not be read"); return None; };
+        let Some(mut entries) = zip_entries(&zip) else { log::warn!("LaunchBox metadata archive could not be read"); return None; };
+        // The standard archive keeps games and artwork together in Metadata.xml.
+        if entries.iter().any(|entry| entry.name.eq_ignore_ascii_case("Metadata.xml")) {
+            entries.retain(|entry| entry.name.eq_ignore_ascii_case("Metadata.xml"));
+        }
         let wanted: HashSet<String> = HashSet::new();
         let mut records = ParsedRecords::default();
         for entry in &entries {
@@ -104,7 +127,8 @@ pub fn fetch_missing_artwork(
                     .map(|game| game.id.clone()));
             }
             exact.sort(); exact.dedup();
-            if exact.is_empty() {
+            // The 1991 music disc is separate from the Golden Oldies arcade games.
+            if exact.is_empty() && key != "goldenoldiesjukebox" {
                 let mut scored: Vec<(f32, &GameRecord)> = records.games.iter().filter(|g| !g.id.is_empty()).map(|g| (title_similarity(&key, &normalize_title(&g.title)), g)).collect();
                 scored.sort_by(|a, b| b.0.total_cmp(&a.0));
                 if let Some((score, game)) = scored.first().copied() {
@@ -124,9 +148,7 @@ pub fn fetch_missing_artwork(
         }
         Some((zip, entries, records, matched))
     })();
-    prefer_artwork(&mut pending, &mut image_ready);
-    let Some((zip, entries, mut records, matched)) = prepared else { return 0; };
-    if !pending.iter().any(|t| !t.missing.is_empty() || t.download_all || needs_media(t)) { return 0; }
+    let (zip, entries, mut records, matched) = prepared.unwrap_or_default();
     let ids: HashSet<String> = matched.values().flatten().cloned().collect();
     records.images.clear();
     for entry in &entries {
@@ -134,63 +156,146 @@ pub fn fetch_missing_artwork(
         let Some(stream) = entry.open(&zip) else { continue; };
         parse_xml(&mut io::BufReader::new(stream), &HashSet::new(), &ids, &mut records);
     }
+    let mut images_by_game = HashMap::<&str, Vec<&ImageRecord>>::new();
+    for image in &records.images {
+        images_by_game.entry(&image.id).or_default().push(image);
+    }
     let mut saved = 0;
+    let mut downloaded = HashMap::new();
+    let mut publish = |target: &mut FetchTarget, kind: ArtworkKind, image: &ImageRecord,
+                       notify: &mut dyn FnMut(&str, ArtworkKind, &Path)| {
+        let ext = if matches!(kind, ArtworkKind::Cover | ArtworkKind::Disc) { "png" } else { extension(&image.file) };
+        let path = artwork_root.join(kind.folder()).join(kind.filename(&target.title, ext));
+        let cached = supplemental_path(&media_dir, &target.title, image);
+        let published = match cached {
+            Some(cached) if !path.is_file() => {
+                cache_image(image, &cached, &mut downloaded);
+                copy_image(&cached, &path)
+            }
+            None => download_image(image, &path),
+            _ => false,
+        };
+        if published {
+            saved += 1;
+            notify(&target.title, kind, &path);
+        }
+        if published || path.is_file() {
+            target.missing.remove(&kind);
+            return true;
+        }
+        false
+    };
     let mut extras = Vec::new();
     let mut completed_media = HashMap::new();
-    for target in pending.iter().filter(|t| !t.missing.is_empty() || t.download_all || needs_media(t)) {
-        let key = normalize_title(&target.title);
-        let Some(game_ids) = matched.get(&key) else { continue };
-        for game_id in game_ids {
-            let candidates: Vec<&ImageRecord> = records.images.iter().filter(|i| i.id == *game_id).collect();
-            for kind in ArtworkKind::ALL {
-                if !target.missing.contains(&kind) && !target.download_all { continue; }
-                if let Some(image) = choose_image(&candidates, kind, &target.title) {
-                    let path = artwork_root.join(kind.folder()).join(kind.filename(&target.title, extension(&image.file)));
-                    let restored = supplemental_path(&media_dir, &bezels_dir, &target.title, image)
-                        .and_then(|cached| fs::read(cached).ok())
-                        .is_some_and(|bytes| crate::synopsis::publish_new(&path, &bytes));
-                    if restored || download_image(image, &path) {
-                        saved += 1;
-                        image_ready(&target.title, kind, &path);
+    for (phase, kinds) in [
+        ("Downloading covers", &[ArtworkKind::Cover][..]),
+        ("Downloading other media", &[ArtworkKind::Back, ArtworkKind::Logo][..]),
+    ] {
+        state.phase = phase;
+        state.checked = 0;
+        for target in &mut pending {
+            state.current = target.title.clone();
+            state.saved = saved_images.get();
+            progress(state.clone());
+            prefer_artwork(std::slice::from_mut(target), kinds, None, &mut notify);
+            let key = normalize_title(&target.title);
+            let candidates: Vec<_> = matched.get(&key).into_iter().flatten()
+                .filter_map(|id| images_by_game.get(id.as_str())).collect();
+            for images in &candidates {
+                for &kind in kinds {
+                    if !target.missing.contains(&kind) && !target.download_all { continue; }
+                    if let Some(image) = choose_image(images, kind, &target.title) {
+                        publish(target, kind, image, &mut notify);
                     }
                 }
             }
-            if needs_media(target) || target.download_all {
-                extras.push((target, candidates));
+            if kinds.contains(&ArtworkKind::Back) {
+                let kind = ArtworkKind::Disc;
+                if target.missing.contains(&kind) || target.download_all {
+                    for region in crate::screenscraper::disc_regions(&target.title) {
+                        prefer_artwork(std::slice::from_mut(target), &[kind], Some(region), &mut notify);
+                        if !target.missing.contains(&kind) && !target.download_all { break; }
+                        let mut images = candidates.iter().flat_map(|images| images.iter().copied())
+                            .filter(|image| crate::screenscraper::region_code(&image.region) == Some(region)
+                                && supported_image(&image.file))
+                            .filter_map(|image| {
+                                let rank = match image.kind.to_ascii_lowercase().as_str() {
+                                    "disc" => 0,
+                                    "fanart - disc" => 1,
+                                    _ => return None,
+                                };
+                                Some((rank, image))
+                            }).collect::<Vec<_>>();
+                        images.sort_by_key(|(rank, _)| *rank);
+                        if images.into_iter().any(|(_, image)| publish(target, kind, image, &mut notify)) {
+                            break;
+                        }
+                    }
+                }
+                if needs_media(target) || target.download_all {
+                    for images in candidates {
+                        extras.push((target.clone(), images));
+                    }
+                }
             }
+            if crate::boxart::generated_path(artwork_root, &target.title).is_file() {
+                target.missing.remove(&ArtworkKind::Boxart);
+            }
+            state.checked += 1;
+            state.saved = saved_images.get();
+            progress(state.clone());
         }
     }
+    crate::world_of_cdi::fill_missing(&pending);
+    state.phase = "Downloading additional media";
+    state.current.clear();
+    progress(state.clone());
     // Fill the library and boot screen before downloading supplemental media.
     for (target, candidates) in extras {
         let mut stored = HashSet::new();
         let mut complete = !candidates.is_empty();
-        for image in candidates.iter().copied() {
+        for &image in candidates {
             if !supported_image(&image.file) || image.kind.is_empty() { continue; }
-            let Some(destination) = supplemental_path(&media_dir, &bezels_dir, &target.title, image) else { continue; };
+            let Some(destination) = supplemental_path(&media_dir, &target.title, image) else { continue; };
             if !stored.insert(destination.clone()) { continue; }
-            if download_image(image, &destination) { saved += 1; }
+            if cache_image(image, &destination, &mut downloaded) {
+                saved += 1;
+                saved_images.set(saved_images.get() + 1);
+                state.saved = saved_images.get();
+                state.current = target.title.clone();
+                progress(state.clone());
+            }
             complete &= destination.is_file();
         }
-        *completed_media.entry(&target.title).or_insert(true) &= complete;
+        *completed_media.entry(target.title.clone()).or_insert(true) &= complete;
     }
     if fs::create_dir_all(&media_marks).is_ok() {
         for (title, complete) in completed_media {
-            if complete { let _ = fs::write(marker(title), []); }
+            if complete { let _ = fs::write(marker(&title), []); }
         }
     }
+    state.phase = "Artwork check complete";
+    state.current.clear();
+    state.saved = saved_images.get();
+    state.missing = pending.iter().filter(|target| !target.missing.is_empty()
+        || target.synopsis_path.as_ref().is_some_and(|path| !fs::read_to_string(path).is_ok_and(|text| !text.trim().is_empty()))).count();
+    state.finished = true;
+    progress(state);
     log::info!("LaunchBox artwork lookup saved {} image(s)", saved);
     saved
 }
 
-fn supplemental_path(media_dir: &Path, bezels_dir: &Path, title: &str, image: &ImageRecord) -> Option<std::path::PathBuf> {
-    if !supported_image(&image.file) || image.kind.is_empty() { return None; }
+fn supplemental_path(media_dir: &Path, title: &str, image: &ImageRecord) -> Option<std::path::PathBuf> {
+    if !supported_image(&image.file) || image.kind.is_empty()
+        || image.kind.to_ascii_lowercase().contains("3d")
+        || image.kind.to_ascii_lowercase().contains("background") { return None; }
     let filename = image.file.rsplit('/').next()?;
     let stem = Path::new(filename).file_stem()?.to_str()?;
     let kind = image.kind.to_ascii_lowercase();
     let folder = if kind.contains("disc") { media_dir.join("Disc") }
-        else if kind.contains("fanart - background") || kind == "background" { bezels_dir.to_path_buf() }
         else { media_dir.join(safe_name(&image.kind)) };
-    Some(folder.join(format!("{}--{}.{}", safe_name(title), safe_name(stem), extension(&image.file))))
+    let extension = if kind.contains("box - front") || kind.contains("disc") { "png" } else { extension(&image.file) };
+    Some(folder.join(format!("{}--{}.{}", safe_name(title), safe_name(stem), extension)))
 }
 
 fn metadata_is_fresh(path: &Path) -> bool {
@@ -210,7 +315,7 @@ pub(crate) fn normalize_title(s: &str) -> String {
             let mut tag = String::new();
             while let Some(c) = chars.next() { if c == closing { break; } tag.push(c); }
             let tag_l = tag.to_ascii_lowercase();
-            let is_dump_tag = ["usa", "eur", "europe", "european", "japan", "japanese", "world", "disc", "disk", "cd", "dvc", "track", "rev", "revision", "version", "beta", "proto", "demo", "pal", "ntsc", "en,", "fr,", "de,"]
+            let is_dump_tag = matches!(tag_l.trim(), "sweden" | "netherlands") || ["usa", "eur", "europe", "european", "japan", "japanese", "world", "disc", "disk", "cd", "dvc", "track", "rev", "revision", "version", "beta", "proto", "demo", "pal", "ntsc", "en,", "fr,", "de,"]
                 .iter().any(|needle| tag_l.contains(needle));
             if !is_dump_tag { normalized.extend(tag.chars().filter(|c| c.is_alphanumeric()).map(|c| c.to_ascii_lowercase())); }
         } else if ch.is_alphanumeric() { normalized.push(ch.to_ascii_lowercase()); }
@@ -260,7 +365,7 @@ fn choose_image<'a>(images: &[&'a ImageRecord], kind: ArtworkKind, title: &str) 
     let priorities: &[&str] = match kind {
         ArtworkKind::Cover => &["Box - Front", "Box - Front - Reconstructed", "Fanart - Box - Front"],
         ArtworkKind::Disc => &["Disc", "Fanart - Disc"],
-        ArtworkKind::Boxart => &["Box - 3D"],
+        ArtworkKind::Boxart => &[],
         ArtworkKind::Back => &["Box - Back", "Box - Back - Reconstructed", "Fanart - Box - Back"],
         ArtworkKind::Logo => &["Clear Logo"],
     };
@@ -294,18 +399,39 @@ fn extension(file: &str) -> &'static str {
     }
 }
 
+fn copy_image(source: &Path, destination: &Path) -> bool {
+    !destination.exists() && fs::read(source).is_ok_and(|bytes| crate::synopsis::publish_new(destination, &bytes))
+}
+
+fn cache_image(record: &ImageRecord, destination: &Path, downloaded: &mut HashMap<(String, String), std::path::PathBuf>) -> bool {
+    let key = (record.file.clone(), record.kind.clone());
+    let created = if let Some(source) = downloaded.get(&key) {
+        copy_image(source, destination)
+    } else {
+        download_image(record, destination)
+    };
+    if destination.is_file() {
+        downloaded.entry(key).or_insert_with(|| destination.to_path_buf());
+    }
+    created
+}
+
 fn download_image(record: &ImageRecord, destination: &Path) -> bool {
+    if record.kind.to_ascii_lowercase().contains("3d")
+        || record.kind.to_ascii_lowercase().contains("background") { return false; }
     if destination.exists() { return false; }
     let file = record.file.trim_start_matches('/');
     if file.contains("..") || file.contains('\\') { return false; }
     let Some(bytes) = http_get(&format!("{IMAGE_BASE_URL}{file}"), IMAGE_MAX_BYTES) else { return false; };
     if !bytes.starts_with(&[137,80,78,71,13,10,26,10]) && !bytes.starts_with(&[0xFF,0xD8,0xFF]) { return false; }
-    let Some(parent) = destination.parent() else { return false; };
-    if fs::create_dir_all(parent).is_err() { return false; }
-    let tmp = destination.with_extension(format!("{}.download", extension(&record.file)));
-    if fs::write(&tmp, bytes).is_err() { return false; }
-    if fs::rename(&tmp, destination).is_err() { let _ = fs::remove_file(&tmp); return false; }
-    true
+    let kind = if record.kind.to_ascii_lowercase().contains("box - front") {
+        ArtworkKind::Cover
+    } else if record.kind.to_ascii_lowercase().contains("disc") {
+        ArtworkKind::Disc
+    } else {
+        ArtworkKind::Back
+    };
+    crate::boxart::publish_media(kind, destination, &bytes)
 }
 
 #[cfg(windows)]
@@ -442,13 +568,82 @@ mod tests {
         let titles = ["7th Guest, The - The Game (EUR) [DVC]", "Backgammon (EUR)", "Brain Dead 13 (EUR) [DVC]", "Burn - Cycle (EUR)"];
         let targets: Vec<_> = titles.iter().map(|title| FetchTarget { title: (*title).into(), missing: ArtworkKind::ALL.into_iter().collect(), download_all: true, synopsis_path: None }).collect();
         let _ = env_logger::builder().is_test(true).filter_level(log::LevelFilter::Info).try_init();
-        let count = fetch_missing_artwork(&targets, &root.join("artwork"), &root.join("cache"), |_, _, _| {}, |_, _| {});
+        let count = fetch_missing_artwork(&targets, &root.join("artwork"), &root.join("cache"), |_, _, _| {}, |_, _, _, _| {}, |_| {});
         println!("Downloaded {count} images");
         for title in titles {
             let found = fs::read_dir(root.join("artwork/Covers")).unwrap().flatten().any(|entry| entry.path().file_stem().unwrap().to_string_lossy() == safe_name(title));
             assert!(found, "No cover downloaded for {title}");
         }
         assert!(count >= 4);
+    }
+
+    #[test]
+    fn reuses_cached_launchbox_image_for_another_disc() {
+        let root = std::env::temp_dir().join(format!("opencdi-image-reuse-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.png");
+        let destination = root.join("destination.png");
+        fs::write(&source, b"prepared artwork").unwrap();
+        let image = ImageRecord { file: "../no-network.png".into(), kind: "Box - Front".into(), ..Default::default() };
+        let mut downloaded = HashMap::new();
+        assert!(!cache_image(&image, &source, &mut downloaded));
+        assert!(cache_image(&image, &destination, &mut downloaded));
+        assert_eq!(fs::read(&destination).unwrap(), b"prepared artwork");
+        assert!(!cache_image(&image, &destination, &mut downloaded));
+        fs::remove_file(destination).unwrap();
+        fs::remove_file(source).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn cover_pass_publishes_each_disc_before_fetching_other_media() {
+        let root = std::env::temp_dir().join(format!("opencdi-cover-queue-{}", std::process::id()));
+        let cache = root.join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        // An unreadable cached catalogue exercises the independent ScreenScraper path
+        // without making network requests.
+        fs::write(cache.join("LaunchBox-Metadata.zip"), b"invalid cached archive").unwrap();
+        let targets: Vec<_> = ["First", "Second"].into_iter().map(|title| FetchTarget {
+            title: title.into(), missing: ArtworkKind::DOWNLOADS.into_iter().collect(),
+            download_all: false, synopsis_path: None,
+        }).collect();
+        let events = std::cell::RefCell::new(Vec::new());
+        let mut states = Vec::new();
+        let mut disc_regions = Vec::new();
+        fetch_missing_artwork(&targets, &root, &cache,
+            |title, kind, _| events.borrow_mut().push(format!("saved {title} {}", kind.folder())),
+            |pending, kinds, region, notify| {
+                assert_eq!(pending.len(), 1);
+                if kinds == [ArtworkKind::Disc] {
+                    disc_regions.push(region);
+                    if region != Some("eu") { return; }
+                }
+                let target = &mut pending[0];
+                for &kind in kinds {
+                    events.borrow_mut().push(format!("check {} {}", target.title, kind.folder()));
+                    notify(&target.title, kind, &root.join("test.png"));
+                    target.missing.remove(&kind);
+                }
+            },
+            |state| states.push(state));
+        assert_eq!(disc_regions, [Some("us"), Some("uk"), Some("eu"), Some("us"), Some("uk"), Some("eu")]);
+        let events = events.into_inner();
+        assert_eq!(&events[..4], &[
+            "check First Covers", "saved First Covers",
+            "check Second Covers", "saved Second Covers",
+        ]);
+        let final_state = states.last().unwrap();
+        assert!(final_state.finished);
+        assert_eq!(final_state.checked, 2);
+        assert_eq!(final_state.total, 2);
+        assert_eq!(final_state.saved, 8);
+        assert_eq!(final_state.missing, 0);
+        assert!(states.iter().any(|state| state.phase == "Downloading covers" && state.checked == 1 && state.saved == 1));
+        fs::remove_file(cache.join("LaunchBox-Metadata.zip")).unwrap();
+        fs::remove_dir(cache.join("LaunchBox-Media")).unwrap();
+        fs::remove_dir(cache).unwrap();
+        fs::remove_dir(root.join("LaunchBox")).unwrap();
+        fs::remove_dir(root).unwrap();
     }
 
     #[test]
@@ -468,6 +663,9 @@ mod tests {
             ("Brain Dead 13 (EUR) [DVC].chd", "Brain Dead 13"),
             ("Burn - Cycle (EUR).chd", "Burn:Cycle"),
             ("7th Guest, The (Europe).chd", "The 7th Guest"),
+            ("Joker's Wild! Jr., The (USA).chd", "The Joker's Wild! Jr."),
+            ("Alfapet (Sweden).chd", "Alfapet"),
+            ("Archeon CD-i Quiz (Netherlands).chd", "Archeon: CD-i Quiz"),
         ] {
             assert_eq!(normalize_title(filename), normalize_title(title), "{filename}");
         }

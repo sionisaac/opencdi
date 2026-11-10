@@ -1591,7 +1591,7 @@ fn process_macroblock(
     mb_row: usize,
     mb_col: usize,
     mb_width: usize,
-    mb_height: usize,
+    _mb_height: usize,
     motion_h: i32,
     motion_v: i32,
     block_size: usize,
@@ -1741,6 +1741,7 @@ impl Frame {
         let sh = self.height.max(1);
         let yw = self.y.width;
         let cw = self.cr.width;
+        let studio = crate::mcd212::studio_levels();
 
         for ty in 0..dst_h {
             let sy = (ty * sh / dst_h).min(sh - 1);
@@ -1754,10 +1755,12 @@ impl Frame {
                 let cr = self.cr.data[ci] as i32 - 128;
                 let cb = self.cb.data[ci] as i32 - 128;
 
-                let yy = ((yv - 16) * 76309) >> 16;
-                let r = (cr * 104597) >> 16;
-                let g = (cb * 25674 + cr * 53278) >> 16;
-                let b = (cb * 132201) >> 16;
+                let (yy, r, g, b) = if studio {
+                    // Studio level: luma keeps its pedestal, chroma is scaled by 219/255.
+                    (yv, (cr * 89827 + 32768) >> 16, (cb * 22049 + cr * 45758 + 32768) >> 16, (cb * 113538 + 32768) >> 16)
+                } else {
+                    (((yv - 16) * 76309) >> 16, (cr * 104597) >> 16, (cb * 25674 + cr * 53278) >> 16, (cb * 132201) >> 16)
+                };
 
                 let rr = clamp_u8(yy + r) as u32;
                 let gg = clamp_u8(yy - g) as u32;
@@ -1806,3 +1809,24 @@ mod edge_mc_tests {
         assert_eq!(d[last], s[last]);
     }
 }
+
+// Savestate: the decoder is created on demand, so a state may need one before loading into it.
+impl Default for Video {
+    fn default() -> Self {
+        Video::new(Vec::new())
+    }
+}
+
+opencdi::impl_state!(Plane { width, height, data } skip {});
+opencdi::impl_state!(Frame { width, height, y, cr, cb } skip {});
+opencdi::impl_state!(Motion { full_px, is_set, r_size, h, v } skip {});
+
+opencdi::impl_state!(Video {
+    buffer, framerate, pixel_aspect_ratio, time, last_frame_time, frames_decoded,
+    width, height, mb_width, mb_height, mb_size, luma_width, luma_height, chroma_width, chroma_height,
+    start_code, picture_type, motion_forward, motion_backward, has_sequence_header,
+    quantizer_scale, slice_begin, macroblock_address, mb_row, mb_col, macroblock_type, macroblock_intra,
+    dc_predictor, frames, cur, fwd, bwd, block_data, intra_quant_matrix, non_intra_quant_matrix,
+    has_reference_frame, assume_no_b_frames, sequence_end_seen, sequence_header_seen,
+    gop_header_seen, last_gop_timecode, prpa,
+} skip {});

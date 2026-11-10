@@ -14,13 +14,21 @@ pub enum Hit { Binding(usize, Target), Hotkey(Target), Device(InputDeviceMode), 
 pub enum Action { Close, AssignedKey(usize, Key), AssignedPauseKey(Key), AssignedExitKey(Key), Cancelled, Handled }
 
 #[derive(Debug, Clone)]
-pub struct State { pub row: usize, pub target: Target, pub listening: bool, pub pending_combo: Vec<gilrs::Button> }
+pub struct State { pub row: usize, pub target: Target, pub listening: bool, pub pending_combo: Vec<gilrs::Button>, gamepad_confirm_ready: bool }
 
 impl Default for State {
-    fn default() -> Self { Self { row: 0, target: Target::Keyboard, listening: false, pending_combo: Vec::new() } }
+    fn default() -> Self { Self { row: 0, target: Target::Keyboard, listening: false, pending_combo: Vec::new(), gamepad_confirm_ready: false } }
 }
 
 impl State {
+    pub fn confirm_gamepad(&mut self, pressed: bool, previously_pressed: bool) {
+        if !pressed { self.gamepad_confirm_ready = true; }
+        if self.gamepad_confirm_ready && pressed && !previously_pressed {
+            self.listening = true;
+        }
+    }
+
+
     pub fn click(&mut self, hit: Hit) -> Option<Hit> {
         match hit {
             Hit::Binding(row, target) => { self.row = row; self.target = target; self.listening = true; self.pending_combo.clear(); None }
@@ -220,5 +228,23 @@ fn profile_name(profile: InputProfile) -> &'static str {
         InputProfile::Wasd => "WASD",
         InputProfile::Numpad => "NUMPAD",
         InputProfile::Custom => "CUSTOM",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opening_press_requires_release_before_a_new_binding_can_start() {
+        let mut state = State::default();
+        state.confirm_gamepad(true, false);
+        assert!(!state.listening);
+        state.confirm_gamepad(true, true);
+        assert!(!state.listening);
+        state.confirm_gamepad(false, true);
+        assert!(!state.listening);
+        state.confirm_gamepad(true, false);
+        assert!(state.listening);
     }
 }

@@ -16,7 +16,7 @@ Press the configured pause binding during emulation to open the pause screen. Ch
 
 See [Quick Start for Windows](docs/QUICK_START_WINDOWS.md) for setup, controls, paths, and per-disc configuration details.
 
-The [screenshots folder](screenshots/README.md) contains the user-provided UI reference images used to guide this interface update. They are design references, not captures from this release build.
+See the [interface screenshot gallery](screenshots/README.md) for the library, controller settings, Settings menu, and About dialog.
 
 ## Build from source
 

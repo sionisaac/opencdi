@@ -1,9 +1,21 @@
-# UI Reference Images
+# OpenCDi Interface
 
-These user-provided images document the target interface style for the library, controller settings, pause menu, and toolbar. They are design references, not screenshots captured from this release build.
+## Library
 
-- `library-reference.png` — library preview.
-- `controller-settings-reference.png` — controller settings preview.
-- `pause-menu-reference.png` — pause menu preview.
-- `toolbar-current-reference.png` — user screenshot of the earlier toolbar.
-- `toolbar-target-reference.png` — user screenshot of the target toolbar.
+![CD-i library with category tabs, artwork, and collection counts](library.png)
+
+## Controller Settings
+
+![Gamepad mode and its button mapping](controller-gamepad.png)
+
+![Mouse mode and its button mapping](controller-mouse.png)
+
+## Settings Menu
+
+![Library Settings menu with display modes, Add Disc Folder, and Switch BIOS](library-settings.png)
+
+## About
+
+![About OpenCDi dialog with project credits](about.png)
+
+The earlier [design references](reference/) are also available.

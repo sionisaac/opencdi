@@ -121,26 +121,9 @@ pub struct UiShortcuts {
     pub skip_shell: bool,
     pub nvram_mode: NvramMode,
     pub disc_paths: Vec<PathBuf>,
-    pub covers_path: PathBuf,
-    pub cd_art_path: PathBuf,
-    pub bezels_path: PathBuf,
+    pub bios_path: Option<PathBuf>,
     pub artwork_size: u8,
     pub input_device: InputDeviceMode,
-}
-
-fn artwork_config_path(value: &str) -> PathBuf {
-    let path = PathBuf::from(value.trim());
-    if !path.is_absolute() && path.components().next().is_some_and(|c| c.as_os_str().to_string_lossy().eq_ignore_ascii_case("Artwork")) {
-        return app_data_dir().join(path);
-    }
-    #[cfg(windows)]
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        let previous = PathBuf::from(appdata).join("OpenCDI");
-        if previous != app_data_dir() {
-            if let Ok(relative) = path.strip_prefix(&previous) { return app_data_dir().join(relative); }
-        }
-    }
-    path
 }
 
 fn parse_pad_button(s: &str) -> Option<gilrs::Button> {
@@ -176,10 +159,10 @@ impl Default for UiShortcuts {
         let _ = std::fs::create_dir_all(artwork.join("Covers"));
         let _ = std::fs::create_dir_all(artwork.join("CD"));
         let _ = std::fs::create_dir_all(artwork.join("Bezels"));
-        Self { menu_binding_text: "F10".into(), exit_binding_text: "Start+Select".into(), pause_binding_text: "F1".into(), exit_key: None, menu_key: Some(Key::F10), pause_key: Some(Key::F1), pause_pad: vec![gilrs::Button::North], menu_mouse: None,
+        Self { menu_binding_text: "F10".into(), exit_binding_text: "Start+Select".into(), pause_binding_text: "F1".into(), exit_key: None, menu_key: Some(Key::F10), pause_key: Some(Key::F1), pause_pad: vec![gilrs::Button::Start], menu_mouse: None,
         menu_pad: vec![],
-        exit_pad: vec![gilrs::Button::Start, gilrs::Button::Select], skip_shell: true, nvram_mode: NvramMode::Global,
-        disc_paths: Vec::new(), covers_path: artwork.join("Covers"), cd_art_path: artwork.join("CD"), bezels_path: artwork.join("Bezels"), artwork_size: ART_SIZE_DEFAULT, input_device: InputDeviceMode::Gamepad }
+        exit_pad: vec![gilrs::Button::Start, gilrs::Button::Select], skip_shell: true, nvram_mode: NvramMode::PerDisc,
+        disc_paths: Vec::new(), bios_path: None, artwork_size: ART_SIZE_DEFAULT, input_device: InputDeviceMode::Gamepad }
     }
 }
 
@@ -210,18 +193,13 @@ impl UiShortcuts {
                     "skip_shell" => out.skip_shell = matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
                     "nvram_mode" => out.nvram_mode = if v.trim().eq_ignore_ascii_case("per_disc") || v.trim().eq_ignore_ascii_case("per-disc") { NvramMode::PerDisc } else { NvramMode::Global },
                     "disc_path" if !v.trim().is_empty() => out.disc_paths.push(PathBuf::from(v.trim())),
-                    "covers_path" if !v.trim().is_empty() => out.covers_path = PathBuf::from(v.trim()),
-                    "cd_art_path" if !v.trim().is_empty() => out.cd_art_path = PathBuf::from(v.trim()),
-                    "bezels_path" if !v.trim().is_empty() => out.bezels_path = PathBuf::from(v.trim()),
+                    "bios_path" if !v.trim().is_empty() => out.bios_path = Some(PathBuf::from(v.trim())),
                     "artwork_size" => out.artwork_size = v.trim().parse::<u8>().unwrap_or(ART_SIZE_DEFAULT).clamp(ART_SIZE_MIN, ART_SIZE_MAX),
                     "input_device" => out.input_device = if v.trim().eq_ignore_ascii_case("mouse") { InputDeviceMode::Mouse } else { InputDeviceMode::Gamepad },
                     _ => {}
                 }
             }
         }
-        out.covers_path = artwork_config_path(&out.covers_path.to_string_lossy());
-        out.cd_art_path = artwork_config_path(&out.cd_art_path.to_string_lossy());
-        out.bezels_path = artwork_config_path(&out.bezels_path.to_string_lossy());
         out
     }
 
@@ -255,9 +233,6 @@ pub enum DisplayMode { BorderlessFullscreen, DecoratedFullscreen, Windowed }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NvramMode { Global, PerDisc }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArtworkPathKind { Covers, Cd, Bezels }
 
 pub fn key_to_string(key: Key) -> &'static str {
     match key {
@@ -469,10 +444,6 @@ impl KeyBindings {
                 "pad_up"=>if let Some(b)=string_to_pad_button(value){self.pad_up=b}, "pad_down"=>if let Some(b)=string_to_pad_button(value){self.pad_down=b},
                 "pad_left"=>if let Some(b)=string_to_pad_button(value){self.pad_left=b}, "pad_right"=>if let Some(b)=string_to_pad_button(value){self.pad_right=b},
                 "pad_btn1"=>if let Some(b)=string_to_pad_button(value){self.pad_btn1=b}, "pad_btn2"=>if let Some(b)=string_to_pad_button(value){self.pad_btn2=b}, "pad_btn3"=>if let Some(b)=string_to_pad_button(value){self.pad_btn3=b},
-                "pause_toggle" => { self.ui_shortcuts.pause_binding_text=value.into(); if let Some(button)=parse_pad_button(value){self.ui_shortcuts.pause_pad=vec![button];}else if let Some(key)=string_to_key(value){self.ui_shortcuts.pause_key=Some(key);} },
-                "pause_gamepad"=>self.ui_shortcuts.pause_pad=value.split('+').filter_map(parse_pad_button).collect(),
-                "exit_hotkey"=>self.ui_shortcuts.exit_key=string_to_key(value),
-                "exit_gamepad_combo"=>{self.ui_shortcuts.exit_binding_text=value.into();self.ui_shortcuts.exit_pad=value.split('+').filter_map(parse_pad_button).collect();},
                 "input_device"=>self.ui_shortcuts.input_device=if value.eq_ignore_ascii_case("mouse"){InputDeviceMode::Mouse}else{InputDeviceMode::Gamepad},
                 _=>{}
             }
@@ -482,11 +453,9 @@ impl KeyBindings {
     pub fn save_disc_config(&self, path: &Path) {
         if let Some(parent)=path.parent(){let _=std::fs::create_dir_all(parent);}
         let profile=match self.profile{InputProfile::Standard=>"Standard",InputProfile::Wasd=>"WASD",InputProfile::Numpad=>"Numpad",InputProfile::Custom=>"Custom"};
-        let pause_gamepad=self.ui_shortcuts.pause_pad.iter().map(|b|pad_button_to_string(*b)).collect::<Vec<_>>().join("+");
-        let content=format!("profile={profile}\nup={}\ndown={}\nleft={}\nright={}\nbtn1={}\nbtn2={}\nbtn3={}\npad_up={}\npad_down={}\npad_left={}\npad_right={}\npad_btn1={}\npad_btn2={}\npad_btn3={}\npause_toggle={}\npause_gamepad={}\nexit_hotkey={}\nexit_gamepad_combo={}\ninput_device={}\n",
+        let content=format!("profile={profile}\nup={}\ndown={}\nleft={}\nright={}\nbtn1={}\nbtn2={}\nbtn3={}\npad_up={}\npad_down={}\npad_left={}\npad_right={}\npad_btn1={}\npad_btn2={}\npad_btn3={}\ninput_device={}\n",
             key_to_string(self.up),key_to_string(self.down),key_to_string(self.left),key_to_string(self.right),key_to_string(self.btn1),key_to_string(self.btn2),key_to_string(self.btn3),
             pad_button_to_string(self.pad_up),pad_button_to_string(self.pad_down),pad_button_to_string(self.pad_left),pad_button_to_string(self.pad_right),pad_button_to_string(self.pad_btn1),pad_button_to_string(self.pad_btn2),pad_button_to_string(self.pad_btn3),
-            self.ui_shortcuts.pause_binding_text,pause_gamepad,self.ui_shortcuts.exit_key.map(key_to_string).unwrap_or("None"),self.ui_shortcuts.exit_binding_text,
             if self.ui_shortcuts.input_device==InputDeviceMode::Mouse{"mouse"}else{"gamepad"});
         let _=std::fs::write(path,content);
     }
@@ -568,9 +537,7 @@ impl KeyBindings {
              nvram_mode={}\n\
              # Repeat disc_path=... to add scan folders\n\
              {}\n\
-             covers_path={}\n\
-             cd_art_path={}\n\
-             bezels_path={}\n\
+             bios_path={}\n\
              artwork_size={}\n\
              input_device={}\n",
             prof_str,
@@ -596,9 +563,7 @@ impl KeyBindings {
             self.ui_shortcuts.skip_shell,
             match self.ui_shortcuts.nvram_mode { NvramMode::Global => "global", NvramMode::PerDisc => "per_disc" },
             disc_paths_ini,
-            self.ui_shortcuts.covers_path.to_string_lossy(),
-            self.ui_shortcuts.cd_art_path.to_string_lossy(),
-            self.ui_shortcuts.bezels_path.to_string_lossy(),
+            self.ui_shortcuts.bios_path.as_deref().unwrap_or_else(|| Path::new("")).to_string_lossy(),
             self.ui_shortcuts.artwork_size,
             if self.ui_shortcuts.input_device == InputDeviceMode::Mouse { "mouse" } else { "gamepad" },
         );
@@ -656,6 +621,7 @@ impl KeyBindings {
 pub enum GuiAction {
     InsertDisc(PathBuf),
     OpenDisc(PathBuf),
+    PlaySelectedDisc,
     EjectDisc,
     Reset,
     Exit,
@@ -672,7 +638,7 @@ pub enum GuiAction {
     ToggleSkipShell,
     SetNvramMode(NvramMode),
     AddDiscPath(PathBuf),
-    SetArtworkPath(ArtworkPathKind, PathBuf),
+    SwitchBios(PathBuf),
     StopToLibrary,
     TakeScreenshot,
     SetVideoMode(crate::mcd212::VideoMode),
@@ -754,5 +720,30 @@ pub fn disc_display_name(path: &std::path::Path) -> String {
     match crate::cdrom::parse_drive_letter(path) {
         Some(letter) => format!("Real Optical CD Drive ({}:)", letter),
         None => path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "CD-i Disc".to_string()),
+    }
+}
+#[cfg(all(test, feature = "host"))]
+mod disc_config_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_disc_shortcuts_are_ignored_and_removed_when_saved() {
+        let path = std::env::temp_dir().join(format!("opencdi-disc-config-{}.ini", std::process::id()));
+        std::fs::write(&path, "profile=Standard\nbtn1=A\npause_gamepad=North\npause_toggle=F2\nexit_hotkey=F3\nexit_gamepad_combo=East\ninput_device=mouse\n").unwrap();
+        let mut bindings = KeyBindings::new();
+        bindings.ui_shortcuts = UiShortcuts::default();
+        bindings.load_disc_config(&path);
+        assert_eq!(bindings.btn1, Key::KeyA);
+        assert_eq!(bindings.ui_shortcuts.input_device, InputDeviceMode::Mouse);
+        assert_eq!(bindings.ui_shortcuts.pause_key, Some(Key::F1));
+        assert_eq!(bindings.ui_shortcuts.pause_pad, [gilrs::Button::Start]);
+        assert_eq!(bindings.ui_shortcuts.exit_key, None);
+        assert_eq!(bindings.ui_shortcuts.exit_pad, [gilrs::Button::Start, gilrs::Button::Select]);
+        bindings.save_disc_config(&path);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let keys: Vec<_> = saved.lines().map(|line| line.split_once('=').unwrap().0).collect();
+        assert_eq!(keys, ["profile", "up", "down", "left", "right", "btn1", "btn2", "btn3",
+            "pad_up", "pad_down", "pad_left", "pad_right", "pad_btn1", "pad_btn2", "pad_btn3", "input_device"]);
     }
 }

@@ -1,27 +1,7 @@
-#[path = "../audio.rs"]
-mod audio;
-#[path = "../bus.rs"]
-mod bus;
-#[path = "../cdic.rs"]
-mod cdic;
-#[path = "../cdrom.rs"]
-mod cdrom;
-#[path = "../dma.rs"]
-mod dma;
-#[path = "../dvc.rs"]
-mod dvc;
-#[path = "../mcd212.rs"]
-mod mcd212;
-#[path = "../nvram.rs"]
-mod nvram;
-#[path = "../scc_timer.rs"]
-mod scc_timer;
-#[path = "../slave.rs"]
-mod slave;
-
+use opencdi::mcd212;
 use std::path::{Path, PathBuf};
 use m68k::{CpuCore, CpuType, AddressBus};
-use crate::bus::CdiBus;
+use opencdi::bus::CdiBus;
 
 fn find_file(relative_subpath: &str) -> Option<PathBuf> {
     let candidates = [
@@ -38,7 +18,7 @@ fn find_file(relative_subpath: &str) -> Option<PathBuf> {
     None
 }
 
-fn save_bmp(bus: &bus::CdiBus, path: &str) -> std::io::Result<()> {
+fn save_bmp(bus: &CdiBus, path: &str) -> std::io::Result<()> {
     let width = mcd212::SCREEN_WIDTH as i32;
     let height = mcd212::SCREEN_HEIGHT as i32;
     let file_size = 54 + (width * height * 4) as u32;
