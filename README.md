@@ -4,7 +4,7 @@ OpenCDi is an open source Philips CD-i emulator written in Rust. This fork adds 
 
 ## Windows download
 
-Download **OpenCDi-Windows-PreviewUI.zip** from the [Releases](../../releases) page and extract it. Run `opencdi.exe`. The archive includes a quick-start guide. Windows x64 is required.
+Download **OpenCDi-Windows-x64.zip** from the [Releases](../../releases) page and extract it. Run `opencdi.exe`. The archive includes a quick-start guide. Windows x64 is required.
 
 OpenCDi does not include Philips firmware. Place a legally obtained system BIOS named `cdi220b.rom` in `%APPDATA%\OpenCDI\bios`. For FMV titles, place `vmpega.rom` in the same folder. Create a `Portable` folder beside `opencdi.exe` before first launch to keep settings, firmware, artwork, saves, and profiles beside the app instead.
 
