@@ -195,7 +195,7 @@ impl UiShortcuts {
                     "disc_path" if !v.trim().is_empty() => out.disc_paths.push(PathBuf::from(v.trim())),
                     "bios_path" if !v.trim().is_empty() => out.bios_path = Some(PathBuf::from(v.trim())),
                     "artwork_size" => out.artwork_size = v.trim().parse::<u8>().unwrap_or(ART_SIZE_DEFAULT).clamp(ART_SIZE_MIN, ART_SIZE_MAX),
-                    "input_device" => out.input_device = if v.trim().eq_ignore_ascii_case("mouse") { InputDeviceMode::Mouse } else { InputDeviceMode::Gamepad },
+                    "input_device" => out.input_device = InputDeviceMode::from_setting(v),
                     _ => {}
                 }
             }
@@ -226,6 +226,20 @@ pub enum InputProfile {
 pub enum InputDeviceMode {
     Gamepad, // Controller CD-i (Gamepad USB / Joystick / Tastiera centrate)
     Mouse,   // Mouse Philips CD-i (Cursore Fisico Host)
+    Peacekeeper,
+}
+
+impl InputDeviceMode {
+    pub fn from_setting(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "mouse" => Self::Mouse,
+            "peacekeeper" => Self::Peacekeeper,
+            _ => Self::Gamepad,
+        }
+    }
+    pub fn setting(self) -> &'static str {
+        match self { Self::Gamepad => "gamepad", Self::Mouse => "mouse", Self::Peacekeeper => "peacekeeper" }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -365,8 +379,23 @@ pub fn string_to_key(s: &str) -> Option<Key> {
     }
 }
 
+fn peacekeeper_disc(disc: &Path) -> bool {
+    let stem = disc.file_stem().unwrap_or_default().to_string_lossy();
+    let title: String = stem.split(['(', '[']).next().unwrap_or("")
+        .chars().filter(char::is_ascii_alphanumeric).flat_map(char::to_lowercase).collect();
+    matches!(title.as_str(),
+        "crimepatrol" | "drugwars" | "drugwarscrimepatrolii" | "crimepatrolii" |
+        "crimepatrol2" | "crimepatroliidrugwars" | "crimepatrol2drugwars" |
+        "thelastbountyhunter" | "lastbountyhunterthe" | "lastbountyhunter" |
+        "maddogmccree" | "maddog2" | "maddogii" | "maddog2thelostgold" |
+        "maddogiithelostgold" | "maddogmccree2thelostgold" |
+        "thunderinparadise" | "thunderinparadiseinteractive" | "caraibesoffshore" |
+        "whoshotjohnnyrock")
+}
+
 #[derive(Debug, Clone)]
 pub struct KeyBindings {
+    peacekeeper_preset_applied: bool,
     pub ui_shortcuts: UiShortcuts,
     pub profile: InputProfile,
     pub up: Key,
@@ -388,6 +417,7 @@ pub struct KeyBindings {
 impl KeyBindings {
     pub fn new() -> Self {
         let mut bindings = Self {
+            peacekeeper_preset_applied: false,
             ui_shortcuts: UiShortcuts::load(),
             profile: InputProfile::Standard,
             up: Key::ArrowUp,
@@ -432,6 +462,7 @@ impl KeyBindings {
     }
 
     pub fn load_disc_config(&mut self, path: &Path) {
+        self.peacekeeper_preset_applied = false;
         let Ok(text) = std::fs::read_to_string(path) else { return; };
         for line in text.lines() {
             let Some((name, value)) = line.split_once('=') else { continue; };
@@ -444,9 +475,18 @@ impl KeyBindings {
                 "pad_up"=>if let Some(b)=string_to_pad_button(value){self.pad_up=b}, "pad_down"=>if let Some(b)=string_to_pad_button(value){self.pad_down=b},
                 "pad_left"=>if let Some(b)=string_to_pad_button(value){self.pad_left=b}, "pad_right"=>if let Some(b)=string_to_pad_button(value){self.pad_right=b},
                 "pad_btn1"=>if let Some(b)=string_to_pad_button(value){self.pad_btn1=b}, "pad_btn2"=>if let Some(b)=string_to_pad_button(value){self.pad_btn2=b}, "pad_btn3"=>if let Some(b)=string_to_pad_button(value){self.pad_btn3=b},
-                "input_device"=>self.ui_shortcuts.input_device=if value.eq_ignore_ascii_case("mouse"){InputDeviceMode::Mouse}else{InputDeviceMode::Gamepad},
+                "input_device"=>self.ui_shortcuts.input_device=InputDeviceMode::from_setting(value),
+                "peacekeeper_preset"=>self.peacekeeper_preset_applied=value=="1",
                 _=>{}
             }
+        }
+    }
+
+    pub fn load_disc_config_for(&mut self, disc: &Path, config: &Path) {
+        self.load_disc_config(config);
+        if !self.peacekeeper_preset_applied && peacekeeper_disc(disc) {
+            self.ui_shortcuts.input_device = InputDeviceMode::Peacekeeper;
+            self.peacekeeper_preset_applied = true;
         }
     }
 
@@ -456,7 +496,8 @@ impl KeyBindings {
         let content=format!("profile={profile}\nup={}\ndown={}\nleft={}\nright={}\nbtn1={}\nbtn2={}\nbtn3={}\npad_up={}\npad_down={}\npad_left={}\npad_right={}\npad_btn1={}\npad_btn2={}\npad_btn3={}\ninput_device={}\n",
             key_to_string(self.up),key_to_string(self.down),key_to_string(self.left),key_to_string(self.right),key_to_string(self.btn1),key_to_string(self.btn2),key_to_string(self.btn3),
             pad_button_to_string(self.pad_up),pad_button_to_string(self.pad_down),pad_button_to_string(self.pad_left),pad_button_to_string(self.pad_right),pad_button_to_string(self.pad_btn1),pad_button_to_string(self.pad_btn2),pad_button_to_string(self.pad_btn3),
-            if self.ui_shortcuts.input_device==InputDeviceMode::Mouse{"mouse"}else{"gamepad"});
+            self.ui_shortcuts.input_device.setting());
+        let content = format!("{content}peacekeeper_preset={}\n", u8::from(self.peacekeeper_preset_applied));
         let _=std::fs::write(path,content);
     }
 
@@ -565,7 +606,7 @@ impl KeyBindings {
             disc_paths_ini,
             self.ui_shortcuts.bios_path.as_deref().unwrap_or_else(|| Path::new("")).to_string_lossy(),
             self.ui_shortcuts.artwork_size,
-            if self.ui_shortcuts.input_device == InputDeviceMode::Mouse { "mouse" } else { "gamepad" },
+            self.ui_shortcuts.input_device.setting(),
         );
         let _ = std::fs::write(settings_file_path(), content);
     }
@@ -727,6 +768,30 @@ mod disc_config_tests {
     use super::*;
 
     #[test]
+    fn peacekeeper_presets_migrate_once_and_preserve_later_choices() {
+        for title in ["Crime Patrol (USA).chd", "Drug Wars (Europe).chd", "Last Bounty Hunter, The (USA).chd",
+            "Mad Dog McCree (USA).chd", "Mad Dog II - The Lost Gold (Europe).chd",
+            "Thunder in Paradise Interactive (Europe).chd", "Who Shot Johnny Rock (USA).chd"] {
+            assert!(peacekeeper_disc(Path::new(title)), "{title}");
+        }
+        for title in ["CD Shoot (Europe).chd", "Burn-Cycle (USA).chd", "Chaos Control (USA).chd", "Crime Patrol Demo.chd"] {
+            assert!(!peacekeeper_disc(Path::new(title)), "{title}");
+        }
+        let config = std::env::temp_dir().join(format!("opencdi-preset-{}.ini", std::process::id()));
+        std::fs::write(&config, "input_device=gamepad\nbtn1=A\n").unwrap();
+        let disc = Path::new("Mad Dog McCree (USA).chd");
+        let mut bindings = KeyBindings::new();
+        bindings.load_disc_config_for(disc, &config);
+        assert_eq!(bindings.ui_shortcuts.input_device, InputDeviceMode::Peacekeeper);
+        assert_eq!(bindings.btn1, Key::KeyA);
+        bindings.ui_shortcuts.input_device = InputDeviceMode::Mouse;
+        bindings.save_disc_config(&config);
+        bindings.load_disc_config_for(disc, &config);
+        assert_eq!(bindings.ui_shortcuts.input_device, InputDeviceMode::Mouse);
+        std::fs::remove_file(config).unwrap();
+    }
+
+    #[test]
     fn legacy_disc_shortcuts_are_ignored_and_removed_when_saved() {
         let path = std::env::temp_dir().join(format!("opencdi-disc-config-{}.ini", std::process::id()));
         std::fs::write(&path, "profile=Standard\nbtn1=A\npause_gamepad=North\npause_toggle=F2\nexit_hotkey=F3\nexit_gamepad_combo=East\ninput_device=mouse\n").unwrap();
@@ -744,6 +809,6 @@ mod disc_config_tests {
         std::fs::remove_file(path).unwrap();
         let keys: Vec<_> = saved.lines().map(|line| line.split_once('=').unwrap().0).collect();
         assert_eq!(keys, ["profile", "up", "down", "left", "right", "btn1", "btn2", "btn3",
-            "pad_up", "pad_down", "pad_left", "pad_right", "pad_btn1", "pad_btn2", "pad_btn3", "input_device"]);
+            "pad_up", "pad_down", "pad_left", "pad_right", "pad_btn1", "pad_btn2", "pad_btn3", "input_device", "peacekeeper_preset"]);
     }
 }

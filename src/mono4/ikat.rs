@@ -107,6 +107,12 @@ impl Ikat {
         }
     }
 
+    /// A light gun must retain its absolute aim even if the title repositions its cursor.
+    pub fn update_absolute_pointer(&mut self, x: i32, y: i32, buttons: u8) {
+        self.reported = None;
+        self.update_pointer(x, y, buttons);
+    }
+
     // Moves up to 127 per axis go out as relative reports so a position the title set itself stays valid; larger jumps and the enable report are absolute: x and y scaled to 0..1023, second byte bit 4 always set (never read by the BIOS); the third button presses buttons 1 and 2.
     fn send_pointer(&mut self) {
         let (x, y, b) = self.pointer;
@@ -461,6 +467,21 @@ mod tests {
         k.push_pointer(0, -3);
         let r: Vec<u8> = (0..4).map(|_| k.read(0x0B, 0)).collect();
         assert_eq!(r, [0x4C, 0x00, 0x3D, 0x00]);
+    }
+
+    #[test]
+    fn lightgun_small_moves_remain_absolute() {
+        let mut k = Ikat { pointer: (384, 280, 0), ..Ikat::default() };
+        k.write(0x1B, 0x08, 0);
+        (0..4).for_each(|_| { k.read(0x0B, 0); });
+        k.update_absolute_pointer(385, 281, 1);
+        let report: Vec<u8> = (0..4).map(|_| k.read(0x0B, 0)).collect();
+        assert_eq!(report[1] & 0x10, 0x10);
+        assert_ne!(report[3] & 0x80, 0);
+        let x = (385 * 1023 / 767) as u16;
+        let y = (281 * 1023 / 559) as u16;
+        assert_eq!(report, [0x60 | ((x >> 6) & 15) as u8,
+            0x10 | ((y >> 6) & 15) as u8, (x & 63) as u8, 0x80 | (y & 63) as u8]);
     }
 
     #[test]

@@ -156,3 +156,63 @@ generated cases.
 New cover downloads from both sources are saved as 600 x 600 PNGs. Existing
 downloaded covers in the managed Covers folder are normalised during the
 background artwork pass. Rectangular covers are resized to a square.
+
+### Peacekeeper with a DolphinBar
+
+In Controller Settings, choose **Peacekeeper** or press **3**. Set the DolphinBar
+to **Mode 4** and sync an upright Wiimote. OpenCDi reads the remote directly on
+Windows and displays connection and infrared tracking status.
+
+Choose **Calibrate aim** or press **C**, then point at each target and press and
+release **B**. Calibrate from your playing position and repeat after moving the
+sensor bar or changing the display setup. Calibration is saved in the app data
+folder. Escape cancels without replacing the previous calibration.
+
+- **A** sends CD-i Button I while pointing.
+- **B** sends CD-i Button II while pointing and returns from menus.
+- **D-pad** navigates the library and pause menu; the sideways grip rotates it.
+- **Home** opens or closes Pause.
+- **B** or **Minus** returns from previews, settings, and pause screens.
+
+Wiimote controls work with Gamepad, Mouse, or Peacekeeper selected. Pointing at
+the sensor bar automatically enables mouse control after 0.1 seconds of stable
+tracking. A clicks in menus, B returns, and the Windows mouse pointer shows where
+you are pointing. Press A once on a library cover to open its details.
+
+After half a second without tracking, controls switch to a sideways grip with
+the D-pad on the left and buttons 1 and 2 on the right. The D-pad rotates to match
+the grip. Button 1 sends CD-i Button I or confirms a menu selection. Button 2
+sends Button II or returns from a menu. A and B also confirm and return.
+Home still opens Pause. The switch uses sensor-bar visibility because a standard
+Wiimote cannot reliably distinguish every sideways turn from its accelerometer.
+Pointing away from the sensor bar also activates sideways control.
+
+Pointing uses A for CD-i Button I and B for Button II with every controller selected.
+The Windows pointer is controlled directly from infrared reports in the library,
+pause menu, and running disc. Pointer movement stops when OpenCDi loses focus.
+Existing aim calibration applies to the pointer. Release held
+buttons after changing mode or returning focus to the app.
+
+Both infrared points must be visible for aiming. Losing tracking, pointing
+outside the calibrated picture, or leaving the app releases the trigger. Release
+B before shooting again after tracking returns. Reloading and holstering follow
+the game's own controls.
+
+Chaos Control applies an automatic correction to its shooting reticle so the
+game's crosshair aligns with the Wiimote pointer. The correction is limited to
+that title's active shooting cursor. It was measured against the USA disc in
+headless gameplay captures; regional variants still need hands-on checking.
+This is an experimental Wiimote aiming implementation using the core's absolute
+pointer reports. Native Mode 4 communication has been tested with a DolphinBar.
+Exact Peacekeeper identification and compatibility with every game remain
+unverified. One Wiimote is supported at a time. Close other programs using the
+remote before connecting.
+
+Press Plus and Minus together on the Wiimote to exit OpenCDi.
+
+Peacekeeper is selected automatically for Crime Patrol, Drug Wars / Crime Patrol II,
+The Last Bounty Hunter, Mad Dog McCree, Mad Dog II: The Lost Gold,
+Thunder in Paradise Interactive and Who Shot Johnny Rock?. This preset applies
+once per disc, including existing configurations; later controller choices are
+remembered. Custom button bindings are preserved. CD Shoot, Burn:Cycle and
+Chaos Control are left for manual selection and testing.

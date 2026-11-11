@@ -34,6 +34,7 @@ mod disc_art;
 #[cfg(windows)]
 mod updater;
 mod controller_config;
+mod wiimote;
 
 const LIBRARY_SCAN_INTERVAL: Duration = Duration::from_secs(3);
 const ARTWORK_RETRY_INTERVAL: Duration = Duration::from_secs(10 * 60);
@@ -216,6 +217,13 @@ fn send_pointer(bus: &mut opencdi::bus::CdiBus, x: i32, y: i32, buttons: u8) {
         Some(m4) => m4.ikat.update_pointer(x, y, buttons),
         None => bus.slave.update_mouse(x, y, buttons),
     }
+}
+
+fn disc_program_started(pc: u32, frames: u64, shell_state: u32, shell_click_frames: u32) -> bool {
+    // DVC RAM also contains shell routines. A RAM PC alone is not proof that
+    // the shell handed control to the disc; finish the click and leave its menu first.
+    frames > 250 && shell_click_frames >= 35 && !matches!(shell_state, 2 | 3)
+        && ((0x00010000..0x00300000).contains(&pc) || (0x00D00000..0x00E00000).contains(&pc))
 }
 
 fn savestate_path_for(game_name: &str, slot: usize) -> PathBuf {
@@ -627,7 +635,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut bindings = KeyBindings::new();
     let global_bindings = bindings.clone();
     let active_disc_config_path = current_disc_path.as_deref().map(disc_config_path);
-    if let Some(path) = &active_disc_config_path { bindings.load_disc_config(path); bindings.save_disc_config(path); }
+    if let (Some(path), Some(disc)) = (&active_disc_config_path, &current_disc_path) {
+        bindings.load_disc_config_for(disc, path);
+        bindings.save_disc_config(path);
+    }
     let skip_shell = bindings.ui_shortcuts.skip_shell;
     let disc_paths = bindings.ui_shortcuts.disc_paths.iter().map(|p| resolve_config_path(p)).collect::<Vec<_>>();
     let managed_artwork_root = app_data_dir().join("Artwork");
@@ -665,6 +676,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         controller_config: None,
         controller_art: controller_config::load_controller_art(),
         mouse_art: controller_config::load_mouse_art(),
+        peacekeeper_art: controller_config::load_peacekeeper_art(),
+        wiimote: None,
+        wiimote_auto: wiimote::AutoControl::default(),
+        wiimote_cursor: None,
+        wiimote_mouse_buttons: 0,
+        wiimote_sample: None,
+        wiimote_buttons: 0,
+        wiimote_pressed: 0,
+        wiimote_trigger_ready: false,
+        gun_calibration: wiimote::Calibration::load(),
+        gun_calibrating: None,
+        gun_notice: String::new(),
         controller_config_was_captured: false,
         config_prev_up: false,
         config_prev_down: false,
@@ -966,6 +989,18 @@ struct App {
     controller_config: Option<ControllerConfigState>,
     controller_art: Option<library::Artwork>,
     mouse_art: Option<library::Artwork>,
+    peacekeeper_art: Option<library::Artwork>,
+    wiimote: Option<wiimote::Wiimote>,
+    wiimote_auto: wiimote::AutoControl,
+    wiimote_cursor: Option<PhysicalPosition<f64>>,
+    wiimote_mouse_buttons: u8,
+    wiimote_sample: Option<wiimote::Sample>,
+    wiimote_buttons: u16,
+    wiimote_pressed: u16,
+    wiimote_trigger_ready: bool,
+    gun_calibration: wiimote::Calibration,
+    gun_calibrating: Option<Option<(f64, f64)>>,
+    gun_notice: String,
     controller_config_was_captured: bool,
     config_prev_up: bool,
     config_prev_down: bool,
@@ -1255,11 +1290,319 @@ impl App {
         true
     }
 
+    fn on_cursor_moved(&mut self, position: PhysicalPosition<f64>) {
+                self.cursor = Some(position);
+                if self.library_size_dragging {
+                    let (x, y) = cursor_to_cdi(position, self.image_rect);
+                    if (library::H as i32-58..library::H as i32-12).contains(&y) {
+                        self.set_artwork_size(library::size_from_slider_x(x.max(0) as usize));
+                    }
+                }
+    }
+
+    fn on_mouse_input(&mut self, state: ElementState, button: MouseButton) {
+        self.on_pointer_input(state, button, false);
+    }
+
+    fn on_pointer_input(&mut self, state: ElementState, button: MouseButton, single_press_details: bool) {
+                let down = state == ElementState::Pressed;
+                if self.gun_calibrating.is_some() { return; }
+                if self.controller_config.is_some() && self.input_device_mode == InputDeviceMode::Peacekeeper
+                    && down && button == MouseButton::Left && let Some(pos) = self.cursor {
+                    let (x, y) = cursor_to_cdi(pos, self.image_rect);
+                    if (390..730).contains(&x) && (320..350).contains(&y) {
+                        self.gun_calibrating = Some(None);
+                        self.gun_notice.clear();
+                        return;
+                    }
+                }
+                if self.toolbar_popup == Some(library::ToolbarPopup::About) {
+                    if down && button == MouseButton::Left && self.cursor.is_some_and(|pos| {
+                        let (x, y) = cursor_to_cdi(pos, self.image_rect);
+                        x >= 0 && y >= 0 && library::about_close_hit(x as usize, y as usize)
+                    }) {
+                        self.toolbar_popup = None;
+                        if let Some(window) = &self.window { window.request_redraw(); }
+                    }
+                    self.mouse_left = false;
+                    return;
+                }
+                if self.pause_info { return; }
+                if self.preview_started.is_some() && self.controller_config.is_none() {
+                    if down && button == MouseButton::Right {
+                        self.stop_to_library();
+                    } else if down && button == MouseButton::Left && let Some(pos) = self.cursor {
+                        let (x, y) = cursor_to_cdi(pos, self.image_rect);
+                        match library::preview_hit(x, y) {
+                            Some(library::PreviewAction::Play) => push_action(GuiAction::PlaySelectedDisc),
+                            Some(library::PreviewAction::Back) => self.stop_to_library(),
+                            None => {}
+                        }
+                    }
+                    return;
+                }
+                if down && button == MouseButton::Left && self.paused && self.controller_config.is_none() {
+                    if let Some(pos) = self.cursor {
+                        let (width, height) = self.window.as_ref().map(|w| { let s = w.inner_size(); (s.width as usize, s.height as usize) }).unwrap_or((0, 0));
+                        if let Some(row) = library::pause_menu_hit_full(pos.x.max(0.0) as usize, pos.y.max(0.0) as usize, width, height) {
+                            self.pause_menu_selected = row;
+                            self.choose_pause_action();
+                            self.mouse_left = true;
+                            return;
+                        }
+                    }
+                }
+                if down && button == MouseButton::Left && self.library_mode && self.controller_config.is_none() && self.menu_visible {
+                    if let Some(pos) = self.cursor {
+                        let (x, y) = cursor_to_cdi(pos, self.image_rect);
+                        let px = x.max(0) as usize;
+                        let py = y.max(0) as usize;
+                        let on_toolbar = (0..library::TOOLBAR_HEIGHT as i32).contains(&y);
+                        let on_popup = library::toolbar_popup_hit(px, py, self.toolbar_popup);
+                        if on_toolbar || on_popup {
+                            self.set_search_focus(false);
+                            if let Some(action) = library::toolbar_hit(px, py, self.toolbar_popup, self.optical_disc) { self.handle_toolbar_action(action); }
+                            else { self.toolbar_popup = None; }
+                            self.mouse_left = true;
+                            return;
+                        }
+                    }
+                }
+                if down && button == MouseButton::Left && self.library_mode && self.controller_config.is_none() {
+                    if let Some(pos) = self.cursor {
+                        let (x, y) = cursor_to_cdi(pos, self.image_rect);
+                        if let Some(category) = library::category_hit(x, y) {
+                            self.select_library_category(category);
+                            self.mouse_left = true;
+                            return;
+                        }
+                        if library::collection_count_hit(x, y) || (self.library_search.collection.missing_offset.is_some()
+                            && library::missing_close_hit(x, y))
+                        {
+                            self.toggle_missing_titles();
+                            self.mouse_left = true;
+                            return;
+                        }
+                        #[cfg(windows)]
+                        if let Some(offset) = self.library_search.collection.missing_offset
+                            && let Some(row) = library::missing_row_hit(x, y)
+                            && let Some(title) = self.library_search.collection.missing_title(offset + row)
+                        {
+                            gui::open_web_url(&title.url());
+                            self.mouse_left = true;
+                            return;
+                        }
+                    }
+                    let hit = self.cursor.and_then(|pos| {
+                        let (x, y) = cursor_to_cdi(pos, self.image_rect);
+                        library::search_hit(x, y)
+                    });
+                    if let Some(clear) = hit {
+                        self.toolbar_popup = None;
+                        self.set_search_focus(true);
+                        self.library_search.caret = self.library_search.query.len();
+                        if clear && !self.library_search.query.is_empty() {
+                            self.library_search.clear();
+                            self.search_changed();
+                        }
+                        self.mouse_left = true;
+                        return;
+                    }
+                    if self.library_search.focused { self.set_search_focus(false); }
+                }
+                if self.controller_config.is_some() {
+                    if down && button == MouseButton::Left {
+                        if let Some(pos) = self.cursor {
+                            let (x, y) = cursor_to_cdi(pos, self.image_rect);
+                            if let Some(hit) = controller_config::hit_test(x as usize, y as usize) {
+                                if self.input_device_mode == InputDeviceMode::Peacekeeper
+                                    && matches!(hit, ControllerConfigHit::Binding(_, _) | ControllerConfigHit::Hotkey(_)) { return; }
+                                match hit {
+                                    ControllerConfigHit::Binding(_, _) | ControllerConfigHit::Hotkey(_) => {
+                                        if let Some(config) = self.controller_config.as_mut() { config.click(hit); }
+                                    }
+                                    ControllerConfigHit::Device(mode) => {
+                                        if let Some(config) = self.controller_config.as_mut() { config.listening = false; }
+                                        self.input_device_mode = mode;
+                                        self.bindings.ui_shortcuts.input_device = mode;
+                                        self.save_input_settings();
+                                    }
+                                    ControllerConfigHit::Close => {
+                                        if let Some(config) = self.controller_config.as_mut() { config.click(hit); }
+                                        self.controller_config = None;
+                                        self.mouse_captured = self.controller_config_was_captured;
+                                        self.apply_grab();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    self.mouse_left = down;
+                    return;
+                }
+                if self.library_mode && button == MouseButton::Left {
+                    if !down && self.library_size_dragging {
+                        self.library_size_dragging = false;
+                        self.bindings.save_to_ini();
+                        self.mouse_left = false;
+                        return;
+                    }
+                    if down {
+                        if let Some(pos) = self.cursor {
+                            let (x, y) = cursor_to_cdi(pos, self.image_rect);
+                            if library::size_slider_hit(x.max(0) as usize, y.max(0) as usize) {
+                                self.library_size_dragging = true;
+                                self.set_artwork_size(library::size_from_slider_x(x.max(0) as usize));
+                                self.mouse_left = true;
+                                return;
+                            }
+                        }
+                    }
+                }
+                if self.library_mode && down && button == MouseButton::Left {
+                    if let Some(pos) = self.cursor {
+                        let (x, y) = cursor_to_cdi(pos, self.image_rect);
+                        if self.library_search.collection.missing_offset.is_none()
+                            && let Some(slot) = library::slot_at(x.max(0) as usize, y.max(0) as usize, self.bindings.ui_shortcuts.artwork_size)
+                        {
+                            let per_page = library::layout(self.bindings.ui_shortcuts.artwork_size).visible_count();
+                            let index = (self.library_selected / per_page) * per_page + slot;
+                            if index < self.library_search.len(&self.library_items) {
+                                if single_press_details || (self.library_selected == index && self.library_click.is_some_and(|(prev, t)| prev == index && t.elapsed() < Duration::from_millis(500))) {
+                                    self.library_selected = index;
+                                    self.launch_library_selection();
+                                } else { self.library_selected = index; }
+                                self.library_click = Some((index, Instant::now()));
+                            }
+                        }
+                    }
+                }
+                if down && self.bindings.ui_shortcuts.menu_mouse == Some(button) { self.toggle_menu(); }
+                match button {
+                    MouseButton::Left => self.mouse_left = down,
+                    MouseButton::Right => self.mouse_right = down,
+                    MouseButton::Middle => self.mouse_middle = down,
+                    _ => {}
+                }
+    }
+
+    fn update_wiimote(&mut self) {
+        let enabled = self.host_input;
+        if enabled && self.wiimote.is_none() { self.wiimote = Some(wiimote::Wiimote::new()); }
+        if !enabled {
+            self.wiimote = None;
+            self.gun_calibrating = None;
+        }
+        self.wiimote_sample = self.wiimote.as_ref().and_then(|w| w.sample());
+        if !self.focused {
+            self.wiimote_auto.suppress_held(self.wiimote_sample.map_or(0, |s| s.buttons));
+        }
+        let filtered = self.wiimote_auto.update(self.wiimote_sample, Instant::now());
+        let buttons = if self.focused { filtered } else { 0 };
+        self.wiimote_pressed = buttons & !self.wiimote_buttons;
+        self.wiimote_buttons = buttons;
+        if buttons & (wiimote::PLUS | wiimote::MINUS) == (wiimote::PLUS | wiimote::MINUS) {
+            self.exit_requested = true;
+            self.wiimote_buttons = 0;
+            self.wiimote_pressed = 0;
+            return;
+        }
+        let aim = self.wiimote_sample.and_then(|s| s.aim);
+        let inside_picture = self.wiimote_position().is_some_and(|pos| {
+            let (x,y,w,h) = self.image_rect;
+            pos.x >= x as f64 && pos.y >= y as f64 && pos.x < (x+w) as f64 && pos.y < (y+h) as f64
+        });
+        if !self.focused || !inside_picture
+            || self.controller_config.is_some() {
+            self.wiimote_trigger_ready = false;
+        } else if buttons & (wiimote::A | wiimote::B) == 0 {
+            self.wiimote_trigger_ready = true;
+        }
+        if self.controller_config.is_none() { self.gun_calibrating = None; }
+        let calibrating = self.gun_calibrating.is_some();
+        if self.gun_calibrating.is_some() && self.wiimote_pressed & wiimote::B != 0
+            && let Some(aim) = aim {
+            match self.gun_calibrating {
+                Some(None) => self.gun_calibrating = Some(Some(aim)),
+                Some(Some(first)) => {
+                    let calibration = wiimote::Calibration { first, second: aim };
+                    if calibration.valid() {
+                        self.gun_calibration = calibration;
+                        self.gun_notice = match calibration.save() {
+                            Ok(()) => "Calibration saved".into(),
+                            Err(_) => "Calibration active; settings could not be saved".into(),
+                        };
+                        self.gun_calibrating = None;
+                    } else {
+                        self.gun_notice = "Targets too close. Press C to try again.".into();
+                        self.gun_calibrating = None;
+                    }
+                }
+                None => {}
+            }
+        }
+        if calibrating {
+            // A calibration press belongs only to the target capture, including
+            // the tick that completes calibration and returns to the settings page.
+            self.wiimote_auto.suppress_held(self.wiimote_buttons);
+            self.wiimote_buttons = 0;
+            self.wiimote_pressed = 0;
+        }
+    }
+
+    fn wiimote_position(&self) -> Option<PhysicalPosition<f64>> {
+        let aim = self.wiimote_sample?.aim.and_then(|p| self.gun_calibration.map(p))?;
+        let size = self.window.as_ref()?.inner_size();
+        Some(PhysicalPosition::new(aim.0 * size.width.saturating_sub(1) as f64,
+            aim.1 * size.height.saturating_sub(1) as f64))
+    }
+
+    fn update_wiimote_mouse(&mut self) {
+        let ui = self.library_mode || self.preview_started.is_some() || self.controller_config.is_some() || self.paused;
+        let previous_cursor = self.wiimote_cursor;
+        self.wiimote_cursor = None;
+        let mut buttons = 0;
+        if self.focused && self.wiimote_auto.mode == wiimote::ControlMode::Pointer
+            && let Some(position) = self.wiimote_position() {
+            self.wiimote_cursor = Some(position);
+            if ui {
+                self.on_cursor_moved(position);
+                if self.wiimote_buttons & wiimote::A != 0 { buttons |= 1; }
+                if self.wiimote_buttons & wiimote::B != 0 { buttons |= 2; }
+            }
+        }
+        let previous = self.wiimote_mouse_buttons;
+        #[cfg(windows)]
+        if let Some(remote) = &self.wiimote {
+            let target = (self.host_input && self.focused && self.wiimote_cursor.is_some())
+                .then(|| self.hwnd() as isize);
+            remote.set_pointer_target(target, self.gun_calibration);
+        }
+        self.wiimote_mouse_buttons = buttons;
+        for (mask,button) in [(1,MouseButton::Left),(2,MouseButton::Right)] {
+            if (previous ^ buttons) & mask != 0 {
+                self.on_pointer_input(if buttons & mask != 0 { ElementState::Pressed } else { ElementState::Released }, button, true);
+            }
+        }
+        self.apply_grab();
+        if self.paused && previous_cursor != self.wiimote_cursor
+            && let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
     fn update_pause_input(&mut self) {
         let mut guide = self.bindings.ui_shortcuts.pause_pad.contains(&gilrs::Button::Mode) && xbox_guide_pressed();
         let mut exit = false;
         let mut up = false; let mut down = false; let mut confirm = false;
         let mut back = false;
+        guide |= self.wiimote_buttons & wiimote::HOME != 0;
+        let (_,remote_y) = self.wiimote_auto.directions(self.wiimote_buttons);
+        up |= remote_y < 0;
+        down |= remote_y > 0;
+        confirm |= self.wiimote_buttons & wiimote::ONE != 0
+            || self.wiimote_auto.mode == wiimote::ControlMode::Sideways && self.wiimote_buttons & wiimote::A != 0;
+        back |= self.wiimote_buttons & (wiimote::B | wiimote::TWO | wiimote::MINUS) != 0;
         if let Some(g) = self.gilrs.as_mut() {
             while g.next_event().is_some() {}
             for (_, pad) in g.gamepads().filter(|_| self.host_input) {
@@ -1706,7 +2049,7 @@ impl App {
     fn activate_disc_settings(&mut self, path: &Path) {
         self.bindings = self.global_bindings.clone();
         let config = disc_config_path(path);
-        self.bindings.load_disc_config(&config);
+        self.bindings.load_disc_config_for(path, &config);
         self.bindings.save_disc_config(&config);
         self.input_device_mode = self.bindings.ui_shortcuts.input_device;
         self.active_disc_config_path = Some(config);
@@ -1957,7 +2300,9 @@ impl App {
     // Hide and confine the host cursor while captured and focused (Win32 ShowCursor/ClipCursor before)
     fn apply_grab(&mut self) {
         let Some(window) = &self.window else { return };
-        let want = self.host_input && self.focused && self.mouse_captured && !self.library_mode && self.controller_config.is_none();
+        let pointing = self.host_input && self.focused && self.wiimote_cursor.is_some();
+        let want = self.host_input && self.focused && self.mouse_captured && !self.library_mode && self.controller_config.is_none() && !pointing;
+        window.set_cursor_visible(!want);
         if self.grab_applied == Some(want) {
             return;
         }
@@ -1970,7 +2315,6 @@ impl App {
             }
             None => (self.pad_x as f64, self.pad_y as f64),
         });
-        window.set_cursor_visible(!want);
         let mode = if want { CursorGrabMode::Confined } else { CursorGrabMode::None };
         if let Err(e) = window.set_cursor_grab(mode) {
             info!("Cursor grab {:?} not available: {}", mode, e);
@@ -2001,6 +2345,30 @@ impl App {
     }
 
     fn on_key_pressed(&mut self, el: &ActiveEventLoop, code: Key) {
+        if self.controller_config.is_some() {
+            if self.gun_calibrating.is_some() {
+                if code == Key::Escape { self.gun_calibrating = None; }
+                return;
+            }
+            if !self.controller_config.as_ref().is_some_and(|s| s.listening) {
+                let mode = match code {
+                    Key::Digit1 => Some(InputDeviceMode::Gamepad),
+                    Key::Digit2 => Some(InputDeviceMode::Mouse),
+                    Key::Digit3 => Some(InputDeviceMode::Peacekeeper),
+                    _ => None,
+                };
+                if let Some(mode) = mode {
+                    self.input_device_mode = mode;
+                    self.save_input_settings();
+                    return;
+                }
+                if self.input_device_mode == InputDeviceMode::Peacekeeper && code == Key::KeyC {
+                    self.gun_calibrating = Some(None);
+                    self.gun_notice.clear();
+                    return;
+                }
+            }
+        }
         if code == self.bindings.btn2 && self.go_back() { return; }
         if self.preview_started.is_some() && self.controller_config.is_none() {
             if code == Key::Escape {
@@ -2015,6 +2383,14 @@ impl App {
             if matches!(code, Key::Escape | Key::Enter | Key::NumpadEnter | Key::Space) {
                 self.toolbar_popup = None;
                 if let Some(window) = &self.window { window.request_redraw(); }
+            }
+            return;
+        }
+        if self.controller_config.is_some() && self.input_device_mode == InputDeviceMode::Peacekeeper {
+            if code == Key::Escape {
+                self.controller_config = None;
+                self.mouse_captured = self.controller_config_was_captured;
+                self.apply_grab();
             }
             return;
         }
@@ -2082,7 +2458,8 @@ impl App {
             Key::F9 => {
                 let next_mode = match self.input_device_mode {
                     InputDeviceMode::Gamepad => InputDeviceMode::Mouse,
-                    InputDeviceMode::Mouse => InputDeviceMode::Gamepad,
+                    InputDeviceMode::Mouse => InputDeviceMode::Peacekeeper,
+                    InputDeviceMode::Peacekeeper => InputDeviceMode::Gamepad,
                 };
                 push_action(GuiAction::SetInputDevice(next_mode));
             }
@@ -2412,9 +2789,13 @@ impl App {
                         send_pointer(&mut m.bus, 575, 335, 0);
                     }
                 }
-            }
-            if self.skip_shell {
-                if ((m.cpu.pc >= 0x00010000 && m.cpu.pc < 0x00300000) || (m.cpu.pc >= 0x00D00000 && m.cpu.pc < 0x00E00000)) && self.frame_count > 250 {
+                let started = if m.bus.mono4.is_some() {
+                    // Mono4 does not use this Mono1 shell-state location or click sequence.
+                    disc_program_started(m.cpu.pc, self.frame_count, 0, 35)
+                } else {
+                    disc_program_started(m.cpu.pc, self.frame_count, shell_state, self.shell_ready_count)
+                };
+                if started {
                     info!("Disc program started (PC=0x{:06X}); automatic boot complete.", m.cpu.pc);
                     self.disc_launched = true;
                     m.bus.emulate_wait_states = true;
@@ -2563,6 +2944,26 @@ impl App {
                 }
             }
         }
+        {
+            let buttons = self.wiimote_buttons;
+            let (remote_x,remote_y) = self.wiimote_auto.directions(buttons);
+            let sideways = self.wiimote_auto.mode == wiimote::ControlMode::Sideways;
+            lib_left |= remote_x < 0; lib_right |= remote_x > 0;
+            lib_up |= remote_y < 0; lib_down |= remote_y > 0;
+            let confirm = buttons & wiimote::ONE != 0 || sideways && buttons & wiimote::A != 0;
+            lib_confirm |= confirm;
+            play_pad_down |= confirm;
+            if is_active && sideways {
+                dir_x += remote_x; dir_y += remote_y;
+                if buttons & (wiimote::ONE | wiimote::A) != 0 { key_btn |= 1; }
+                if buttons & (wiimote::TWO | wiimote::B) != 0 { key_btn |= 2; }
+            }
+            // B is Back in menus and previews, and remains the trigger during play.
+            back_pad_down |= buttons & wiimote::MINUS != 0 || sideways && buttons & wiimote::TWO != 0
+                || (self.library_mode || self.preview_started.is_some() || self.controller_config.is_some())
+                    && buttons & wiimote::B != 0;
+            pause_pad_down |= buttons & wiimote::HOME != 0;
+        }
         pause_pad_down |= self.bindings.ui_shortcuts.pause_pad.contains(&gilrs::Button::Mode) && xbox_guide_pressed();
         if let Some(button) = captured_button {
             let mut assigned_row = None;
@@ -2653,6 +3054,13 @@ impl App {
             }
         }
 
+        let wiimote_aim = self.wiimote_position().filter(|pos| {
+            let (x,y,w,h) = self.image_rect;
+            pos.x >= x as f64 && pos.y >= y as f64 && pos.x < (x+w) as f64 && pos.y < (y+h) as f64
+        }).map(|pos| {
+            let (x,y) = cursor_to_cdi(pos,self.image_rect);
+            wiimote::correct_game_aim(&self.current_game_name,self.m.bus.mcd212.cursor_control,x,y)
+        });
         let m = &mut self.m;
         if m.bus.slave.device_mouse_updated {
             self.pad_x = m.bus.slave.device_mouse_x;
@@ -2670,7 +3078,13 @@ impl App {
         {
             // Keep host input from interfering with the automatic Play CD-i selection.
         } else {
-            match self.input_device_mode {
+            let effective_device = if self.wiimote_sample.is_some() {
+                match self.wiimote_auto.mode {
+                    wiimote::ControlMode::Pointer => InputDeviceMode::Peacekeeper,
+                    wiimote::ControlMode::Sideways => InputDeviceMode::Gamepad,
+                }
+            } else { self.input_device_mode };
+            match effective_device {
                 InputDeviceMode::Gamepad => {
                     const PAD_SPEED: f32 = 2.5;
                     let mut moved = false;
@@ -2688,6 +3102,23 @@ impl App {
                         send_pointer(&mut m.bus, self.pad_x, self.pad_y, key_btn);
                     }
                     self.prev_key_btn = key_btn;
+                }
+                InputDeviceMode::Peacekeeper => {
+                    let mut buttons = 0;
+                    if is_active && let Some((x, y)) = wiimote_aim {
+                        self.pad_x = x;
+                        self.pad_y = y;
+                        self.pad_x_f = self.pad_x as f32;
+                        self.pad_y_f = self.pad_y as f32;
+                        if self.wiimote_trigger_ready {
+                            if self.wiimote_buttons & wiimote::A != 0 { buttons |= 1; }
+                            if self.wiimote_buttons & wiimote::B != 0 { buttons |= 2; }
+                        }
+                    }
+                    match m.bus.mono4.as_deref_mut() {
+                        Some(m4) => m4.ikat.update_absolute_pointer(self.pad_x, self.pad_y, buttons),
+                        None => m.bus.slave.update_mouse(self.pad_x, self.pad_y, buttons),
+                    }
                 }
                 InputDeviceMode::Mouse => {
                     self.pad_x = mouse_x;
@@ -2810,6 +3241,9 @@ impl App {
 
     // One emulated frame plus host input; returns false when the loop must stop
     fn tick(&mut self) -> bool {
+        self.update_wiimote();
+        if self.exit_requested { return false; }
+        self.update_wiimote_mouse();
         if !self.handle_actions() {
             return false;
         }
@@ -2934,7 +3368,7 @@ impl App {
         self.last_present = Instant::now();
         if let Ok(mut buffer) = surface.buffer_mut() {
             if let Some(state) = &self.controller_config {
-                controller_config::render_native(&mut buffer,dw,dh,self.image_rect,&self.bindings,&self.bindings.ui_shortcuts,self.input_device_mode,state,self.controller_art.as_ref(),self.mouse_art.as_ref());
+                controller_config::render_native(&mut buffer,dw,dh,self.image_rect,&self.bindings,&self.bindings.ui_shortcuts,self.input_device_mode,state,self.controller_art.as_ref(),self.mouse_art.as_ref(),self.peacekeeper_art.as_ref(),self.wiimote_sample,&self.gun_notice,self.gun_calibrating,self.wiimote_auto.mode);
             } else if self.library_mode {
                 library::render_native(&mut buffer,dw,dh,self.image_rect,&self.library_items,self.library_selected,self.bindings.ui_shortcuts.artwork_size,self.menu_visible,self.display_mode,self.toolbar_popup,self.optical_disc,&self.library_search,self.artwork_progress.as_ref());
             } else {
@@ -3070,15 +3504,7 @@ impl ApplicationHandler for App {
                     }
                 }
             }
-            WindowEvent::CursorMoved { position, .. } => {
-                self.cursor = Some(position);
-                if self.library_size_dragging {
-                    let (x, y) = cursor_to_cdi(position, self.image_rect);
-                    if (library::H as i32-58..library::H as i32-12).contains(&y) {
-                        self.set_artwork_size(library::size_from_slider_x(x.max(0) as usize));
-                    }
-                }
-            }
+            WindowEvent::CursorMoved { position, .. } => self.on_cursor_moved(position),
             WindowEvent::CursorLeft { .. } => self.cursor = None,
             WindowEvent::MouseWheel { .. } if !self.host_input => {}
             WindowEvent::MouseWheel { delta, .. } => {
@@ -3097,174 +3523,7 @@ impl ApplicationHandler for App {
                     }
                 }
             }
-            WindowEvent::MouseInput { state, button, .. } => {
-                let down = state == ElementState::Pressed;
-                if self.toolbar_popup == Some(library::ToolbarPopup::About) {
-                    if down && button == MouseButton::Left && self.cursor.is_some_and(|pos| {
-                        let (x, y) = cursor_to_cdi(pos, self.image_rect);
-                        x >= 0 && y >= 0 && library::about_close_hit(x as usize, y as usize)
-                    }) {
-                        self.toolbar_popup = None;
-                        if let Some(window) = &self.window { window.request_redraw(); }
-                    }
-                    self.mouse_left = false;
-                    return;
-                }
-                if self.pause_info { return; }
-                if self.preview_started.is_some() && self.controller_config.is_none() {
-                    if down && button == MouseButton::Right {
-                        self.stop_to_library();
-                    } else if down && button == MouseButton::Left && let Some(pos) = self.cursor {
-                        let (x, y) = cursor_to_cdi(pos, self.image_rect);
-                        match library::preview_hit(x, y) {
-                            Some(library::PreviewAction::Play) => push_action(GuiAction::PlaySelectedDisc),
-                            Some(library::PreviewAction::Back) => self.stop_to_library(),
-                            None => {}
-                        }
-                    }
-                    return;
-                }
-                if down && button == MouseButton::Left && self.paused && self.controller_config.is_none() {
-                    if let Some(pos) = self.cursor {
-                        let (width, height) = self.window.as_ref().map(|w| { let s = w.inner_size(); (s.width as usize, s.height as usize) }).unwrap_or((0, 0));
-                        if let Some(row) = library::pause_menu_hit_full(pos.x.max(0.0) as usize, pos.y.max(0.0) as usize, width, height) {
-                            self.pause_menu_selected = row;
-                            self.choose_pause_action();
-                            self.mouse_left = true;
-                            return;
-                        }
-                    }
-                }
-                if down && button == MouseButton::Left && self.library_mode && self.controller_config.is_none() && self.menu_visible {
-                    if let Some(pos) = self.cursor {
-                        let (x, y) = cursor_to_cdi(pos, self.image_rect);
-                        let px = x.max(0) as usize;
-                        let py = y.max(0) as usize;
-                        let on_toolbar = (0..library::TOOLBAR_HEIGHT as i32).contains(&y);
-                        let on_popup = library::toolbar_popup_hit(px, py, self.toolbar_popup);
-                        if on_toolbar || on_popup {
-                            self.set_search_focus(false);
-                            if let Some(action) = library::toolbar_hit(px, py, self.toolbar_popup, self.optical_disc) { self.handle_toolbar_action(action); }
-                            else { self.toolbar_popup = None; }
-                            self.mouse_left = true;
-                            return;
-                        }
-                    }
-                }
-                if down && button == MouseButton::Left && self.library_mode && self.controller_config.is_none() {
-                    if let Some(pos) = self.cursor {
-                        let (x, y) = cursor_to_cdi(pos, self.image_rect);
-                        if let Some(category) = library::category_hit(x, y) {
-                            self.select_library_category(category);
-                            self.mouse_left = true;
-                            return;
-                        }
-                        if library::collection_count_hit(x, y) || (self.library_search.collection.missing_offset.is_some()
-                            && library::missing_close_hit(x, y))
-                        {
-                            self.toggle_missing_titles();
-                            self.mouse_left = true;
-                            return;
-                        }
-                        #[cfg(windows)]
-                        if let Some(offset) = self.library_search.collection.missing_offset
-                            && let Some(row) = library::missing_row_hit(x, y)
-                            && let Some(title) = self.library_search.collection.missing_title(offset + row)
-                        {
-                            gui::open_web_url(&title.url());
-                            self.mouse_left = true;
-                            return;
-                        }
-                    }
-                    let hit = self.cursor.and_then(|pos| {
-                        let (x, y) = cursor_to_cdi(pos, self.image_rect);
-                        library::search_hit(x, y)
-                    });
-                    if let Some(clear) = hit {
-                        self.toolbar_popup = None;
-                        self.set_search_focus(true);
-                        self.library_search.caret = self.library_search.query.len();
-                        if clear && !self.library_search.query.is_empty() {
-                            self.library_search.clear();
-                            self.search_changed();
-                        }
-                        self.mouse_left = true;
-                        return;
-                    }
-                    if self.library_search.focused { self.set_search_focus(false); }
-                }
-                if self.controller_config.is_some() {
-                    if down && button == MouseButton::Left {
-                        if let Some(pos) = self.cursor {
-                            let (x, y) = cursor_to_cdi(pos, self.image_rect);
-                            if let Some(hit) = controller_config::hit_test(x as usize, y as usize) {
-                                match hit {
-                                    ControllerConfigHit::Binding(_, _) | ControllerConfigHit::Hotkey(_) => {
-                                        if let Some(config) = self.controller_config.as_mut() { config.click(hit); }
-                                    }
-                                    ControllerConfigHit::Device(mode) => {
-                                        self.input_device_mode = mode;
-                                        self.bindings.ui_shortcuts.input_device = mode;
-                                        self.save_input_settings();
-                                    }
-                                    ControllerConfigHit::Close => {
-                                        if let Some(config) = self.controller_config.as_mut() { config.click(hit); }
-                                        self.controller_config = None;
-                                        self.mouse_captured = self.controller_config_was_captured;
-                                        self.apply_grab();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    self.mouse_left = down;
-                    return;
-                }
-                if self.library_mode && button == MouseButton::Left {
-                    if !down && self.library_size_dragging {
-                        self.library_size_dragging = false;
-                        self.bindings.save_to_ini();
-                        self.mouse_left = false;
-                        return;
-                    }
-                    if down {
-                        if let Some(pos) = self.cursor {
-                            let (x, y) = cursor_to_cdi(pos, self.image_rect);
-                            if library::size_slider_hit(x.max(0) as usize, y.max(0) as usize) {
-                                self.library_size_dragging = true;
-                                self.set_artwork_size(library::size_from_slider_x(x.max(0) as usize));
-                                self.mouse_left = true;
-                                return;
-                            }
-                        }
-                    }
-                }
-                if self.library_mode && down && button == MouseButton::Left {
-                    if let Some(pos) = self.cursor {
-                        let (x, y) = cursor_to_cdi(pos, self.image_rect);
-                        if self.library_search.collection.missing_offset.is_none()
-                            && let Some(slot) = library::slot_at(x.max(0) as usize, y.max(0) as usize, self.bindings.ui_shortcuts.artwork_size)
-                        {
-                            let per_page = library::layout(self.bindings.ui_shortcuts.artwork_size).visible_count();
-                            let index = (self.library_selected / per_page) * per_page + slot;
-                            if index < self.library_search.len(&self.library_items) {
-                                if self.library_selected == index && self.library_click.is_some_and(|(prev, t)| prev == index && t.elapsed() < Duration::from_millis(500)) {
-                                    self.library_selected = index;
-                                    self.launch_library_selection();
-                                } else { self.library_selected = index; }
-                                self.library_click = Some((index, Instant::now()));
-                            }
-                        }
-                    }
-                }
-                if down && self.bindings.ui_shortcuts.menu_mouse == Some(button) { self.toggle_menu(); }
-                match button {
-                    MouseButton::Left => self.mouse_left = down,
-                    MouseButton::Right => self.mouse_right = down,
-                    MouseButton::Middle => self.mouse_middle = down,
-                    _ => {}
-                }
-            }
+            WindowEvent::MouseInput { state, button, .. } => self.on_mouse_input(state, button),
             _ => {}
         }
     }
@@ -3330,12 +3589,24 @@ impl ApplicationHandler for App {
     fn exiting(&mut self, _el: &ActiveEventLoop) {
         // Restore host cursor and release mouse confinement on exit
         self.mouse_captured = false;
+        self.wiimote_cursor = None;
         self.apply_grab();
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn autoplay_does_not_release_input_while_the_shell_is_still_active() {
+        // Observed with the saved Mad Dog McCree setup: DVC code is executing,
+        // but shell state 2 still denotes its menu.
+        assert!(!super::disc_program_started(0x00df4fce, 630, 2, 192));
+        assert!(!super::disc_program_started(0x00df4fce, 630, 3, 192));
+        assert!(!super::disc_program_started(0x00df4fce, 630, 0, 20));
+        assert!(super::disc_program_started(0x00df4fce, 630, 0, 192));
+        assert!(super::disc_program_started(0x00020000, 700, 0, 192));
+        assert!(!super::disc_program_started(0x00408108, 700, 0, 192));
+    }
     use super::*;
 
     #[test]

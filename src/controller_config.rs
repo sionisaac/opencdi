@@ -62,8 +62,9 @@ impl State {
 
 pub fn hit_test(x: usize, y: usize) -> Option<Hit> {
     if (12..124).contains(&x) && (8..34).contains(&y) { return Some(Hit::Close); }
-    if (27..171).contains(&x) && (124..151).contains(&y) { return Some(Hit::Device(InputDeviceMode::Gamepad)); }
-    if (174..318).contains(&x) && (124..151).contains(&y) { return Some(Hit::Device(InputDeviceMode::Mouse)); }
+    if (27..127).contains(&x) && (124..151).contains(&y) { return Some(Hit::Device(InputDeviceMode::Gamepad)); }
+    if (132..232).contains(&x) && (124..151).contains(&y) { return Some(Hit::Device(InputDeviceMode::Mouse)); }
+    if (237..337).contains(&x) && (124..151).contains(&y) { return Some(Hit::Device(InputDeviceMode::Peacekeeper)); }
     if (472..592).contains(&x) || (602..744).contains(&x) {
         let row = y.checked_sub(145)? / 29;
         if row < ROWS && y < 145 + row * 29 + 24 {
@@ -78,6 +79,10 @@ pub fn hit_test(x: usize, y: usize) -> Option<Hit> {
 
 pub fn load_controller_art() -> Option<Artwork> {
     library::load_png_bytes(include_bytes!("../assets/cdi_gamepad.png"))
+}
+
+pub fn load_peacekeeper_art() -> Option<Artwork> {
+    library::load_png_bytes(include_bytes!("../assets/cdi_peacekeeper.png"))
 }
 
 pub fn load_mouse_art() -> Option<Artwork> { library::load_png_bytes(include_bytes!("../assets/cdi_mouse.png")) }
@@ -146,18 +151,35 @@ pub fn render(dst: &mut [u32], bindings: &KeyBindings, shortcuts: &UiShortcuts, 
     library::text(dst, 650, 538, "ESC: DONE", 0xFFB1C0CF, 1);
 }
 
-pub fn render_native(dst:&mut [u32],width:usize,height:usize,view:(usize,usize,usize,usize),bindings:&KeyBindings,shortcuts:&UiShortcuts,mode:InputDeviceMode,state:&State,gamepad_art:Option<&Artwork>,mouse_art:Option<&Artwork>){
+pub fn render_native(dst:&mut [u32],width:usize,height:usize,view:(usize,usize,usize,usize),bindings:&KeyBindings,shortcuts:&UiShortcuts,mode:InputDeviceMode,state:&State,gamepad_art:Option<&Artwork>,mouse_art:Option<&Artwork>,peacekeeper_art:Option<&Artwork>,wiimote:Option<crate::wiimote::Sample>,notice:&str,calibrating:Option<Option<(f64,f64)>>,automatic:crate::wiimote::ControlMode){
     let mut c=library::NativeCanvas::new(dst,width,height,view);
     for y in 0..library::H { let t=y as u32*8/library::H as u32;c.rect(0,y,library::W,1,0xFF000000|((11+t)<<16)|((20+t)<<8)|(34+t*2)); }
+    if let Some(first) = calibrating {
+        let (x,y) = if first.is_none() { (115,84) } else { (653,476) };
+        c.text(180,28,"Peacekeeper calibration",0xFFF1F5FA,2);
+        c.text(175,55,"Aim at the target and press B. Escape cancels.",0xFFB7C6D5,1);
+        c.rect(x-12,y-1,25,3,0xFFFFFFFF);
+        c.rect(x-1,y-12,3,25,0xFFFFFFFF);
+        c.rect(x-3,y-3,7,7,0xFF3B9DE5);
+        c.text(220,520,if wiimote.is_some_and(|s| s.aim.is_some()) {
+            "Tracking ready - keep the Wiimote upright"
+        } else { "Point towards the sensor bar until both lights are visible" },0xFF80C4FF,1);
+        return;
+    }
     c.rect(0,0,library::W,42,0xFF0C1726);c.rect(0,41,library::W,1,0xFF26374A);
     c.round_rect(12,8,112,26,7,0xFF1D2D40);c.text(21,15,"<  Back",0xFFD9E4EF,1);
     c.text(20,54,"Controller Settings",0xFFF1F5FA,2);
     c.round_rect(14,92,338,300,12,0xFF131F2E);c.round_rect(364,92,390,300,12,0xFF131F2E);
-    c.text(28,106,if mode==InputDeviceMode::Mouse{"CD-i Mouse"}else{"CD-i Gamepad"},0xFFEAF0F6,1);
-    c.round_rect(27,124,144,27,7,if mode==InputDeviceMode::Gamepad{0xFF3B9DE5}else{0xFF202D3E});
-    c.round_rect(174,124,144,27,7,if mode==InputDeviceMode::Mouse{0xFF3B9DE5}else{0xFF202D3E});
-    c.text(68,132,"Gamepad",0xFFF1F6FA,1);c.text(226,132,"Mouse",0xFFF1F6FA,1);
-    let art=if mode==InputDeviceMode::Mouse{mouse_art}else{gamepad_art};
+    c.text(28,106,match mode { InputDeviceMode::Mouse => "CD-i Mouse", InputDeviceMode::Gamepad => "CD-i Gamepad", InputDeviceMode::Peacekeeper => "CD-i Peacekeeper" },0xFFEAF0F6,1);
+    for (x,device,label) in [
+        (27,InputDeviceMode::Gamepad,"1 Gamepad"),
+        (132,InputDeviceMode::Mouse,"2 Mouse"),
+        (237,InputDeviceMode::Peacekeeper,"3 Peacekeeper"),
+    ] {
+        c.round_rect(x,124,100,27,7,if mode==device{0xFF3B9DE5}else{0xFF202D3E});
+        c.text(x+9,132,label,0xFFF1F6FA,1);
+    }
+    let art=match mode { InputDeviceMode::Mouse=>mouse_art, InputDeviceMode::Gamepad=>gamepad_art, InputDeviceMode::Peacekeeper=>peacekeeper_art };
     let art_box=(20,158,326,190);
     if let Some(art)=art{c.art_fit(art,art_box.0,art_box.1,art_box.2,art_box.3);}
     if mode==InputDeviceMode::Gamepad{
@@ -169,7 +191,44 @@ pub fn render_native(dst:&mut [u32],width:usize,height:usize,view:(usize,usize,u
             c.ring_art(art,art_box,(661.0,136.0),41.0,0xFFB49CF4);
         }
     }
-    c.round_rect(27,354,312,27,7,0xFF202D3E);c.text(41,362,"Philips CD-i input device",0xFFB7C6D5,1);
+    c.round_rect(27,354,312,27,7,0xFF202D3E);c.text(41,362,if wiimote.is_some() {
+        match automatic {
+            crate::wiimote::ControlMode::Pointer => "Wiimote - pointing mouse",
+            crate::wiimote::ControlMode::Sideways => "Wiimote - sideways controller",
+        }
+    } else { "Philips CD-i input device" },0xFFB7C6D5,1);
+
+    if mode == InputDeviceMode::Peacekeeper {
+        c.text(382,106,"DolphinBar Mode 4",0xFFEAF0F6,1);
+        let status = match wiimote {
+            None => "Waiting for a Wiimote. Press its SYNC button.",
+            Some(sample) if sample.aim.is_none() => "Connected. Aim towards the sensor bar.",
+            Some(_) => "Connected - infrared aim detected",
+        };
+        c.text(382,137,status,0xFF80C4FF,1);
+        for (row,(label,value)) in [
+            ("Aim","Point the Wiimote at the screen"),
+            ("Mouse / Button I","A"),
+            ("Button II","B"),
+            ("Pause menu","Home"),
+            ("Sideways Buttons I / II","1 / 2"),
+            ("Library confirm / back","1 / 2 or A / B"),
+        ].into_iter().enumerate() {
+            let y=172+row*23;
+            c.text(382,y,label,0xFFB7C6D5,1);
+            c.text(535,y,value,0xFFF1F6FA,1);
+        }
+        c.round_rect(390,320,340,30,7,0xFF243B53);
+        c.text(463,330,"Calibrate aim (C)",0xFFEAF0F6,1);
+        c.text(382,365,notice,0xFF80C4FF,1);
+        c.round_rect(14,404,740,128,12,0xFF131F2E);
+        c.text(28,418,"Peacekeeper controls",0xFFEAF0F6,1);
+        c.text(28,445,"Point for mouse control. Hold sideways with the D-pad on the left.",0xFFB7C6D5,1);
+        c.text(28,466,"Calibrate from your playing position. A clicks in menus; B returns.",0xFFB7C6D5,1);
+        c.text(28,487,"After half a second without tracking, sideways controls take over.",0xFFB7C6D5,1);
+        c.text(28,508,"Press Plus and Minus together to exit OpenCDi.",0xFFB7C6D5,1);
+        return;
+    }
 
     c.text(382,106,"Button Mapping",0xFFEAF0F6,1);c.text(481,128,"Keyboard",0xFF91A9C1,1);c.text(631,128,"Controller",0xFF91A9C1,1);
     let names=["UP","DOWN","LEFT","RIGHT","BUTTON I","BUTTON II","BUTTON I/II","PAUSE MENU"];
@@ -234,6 +293,26 @@ fn profile_name(profile: InputProfile) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peacekeeper_has_its_own_device_target_and_embedded_picture() {
+        assert_eq!(hit_test(280,135), Some(Hit::Device(InputDeviceMode::Peacekeeper)));
+        assert_eq!(hit_test(180,135), Some(Hit::Device(InputDeviceMode::Mouse)));
+        assert_eq!(hit_test(75,135), Some(Hit::Device(InputDeviceMode::Gamepad)));
+        let picture = load_peacekeeper_art().expect("embedded Peacekeeper photograph");
+        assert!(picture.w > 100 && picture.h > 100);
+        if let Ok(path) = std::env::var("OPENCDI_CONTROLLER_PREVIEW") {
+            let mut pixels = vec![0u32;1920*1080];
+            render_native(&mut pixels,1920,1080,(0,0,1920,1080),
+                &KeyBindings::new(),&UiShortcuts::default(),InputDeviceMode::Peacekeeper,&State::default(),
+                None,None,Some(&picture),Some(crate::wiimote::Sample { buttons: 0, aim: Some((500.0,400.0)) }),"",None,crate::wiimote::ControlMode::Pointer);
+            let bytes: Vec<u8> = pixels.iter().flat_map(|p| [((p>>16)&255) as u8,((p>>8)&255) as u8,(p&255) as u8]).collect();
+            let mut encoder = png::Encoder::new(std::fs::File::create(path).unwrap(),1920,1080);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.write_header().unwrap().write_image_data(&bytes).unwrap();
+        }
+    }
 
     #[test]
     fn opening_press_requires_release_before_a_new_binding_can_start() {
