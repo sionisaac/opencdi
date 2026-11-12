@@ -24,3 +24,10 @@ Invia_a_GitHub.bat
 
 !assets/emulation_bezel.png
 !assets/cdi_peacekeeper.png
+!tools/validate_bios.py
+!tools/validate_bios_io.py
+!tools/validate_bios_files.py
+
+!tools/validate_490.py
+!screenshots/disc-info.png
+!screenshots/disc-info-loading.png

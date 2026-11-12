@@ -590,6 +590,11 @@ impl Cdic {
     }
 
     pub fn is_mode2_audio_selected(&self, buf: &[u8]) -> bool {
+        // Audio channel selection cannot bypass the selected file. Interleaved
+        // sectors belonging to another file must not reach either CPU or AP.
+        if (buf[20] as u16) << 8 != self.file {
+            return false;
+        }
         let submode = buf[22];
         // Must be Form 2 (0x20) and Audio (0x04)
         if (submode & 0x24) != 0x24 {
@@ -934,6 +939,143 @@ opencdi::impl_state!(Cdic {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct StreamFixture { path: std::path::PathBuf, dir: std::path::PathBuf }
+    impl StreamFixture {
+        fn new(sectors: &[[u8; CD_SECTOR_RAW_SIZE]]) -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let id=NEXT.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+            let dir=std::env::temp_dir().join(format!("opencdi-stream-test-{}-{id}",std::process::id()));
+            std::fs::create_dir(&dir).unwrap();
+            let path=dir.join("synthetic.bin");
+            let mut bytes=vec![0;17*CD_SECTOR_RAW_SIZE];
+            for (i,sector) in sectors.iter().enumerate() {
+                bytes[i*CD_SECTOR_RAW_SIZE..(i+1)*CD_SECTOR_RAW_SIZE].copy_from_slice(sector);
+            }
+            std::fs::write(&path,bytes).unwrap();
+            Self {path,dir}
+        }
+    }
+    impl Drop for StreamFixture {
+        fn drop(&mut self) {
+            let _=std::fs::remove_file(&self.path);
+            let _=std::fs::remove_dir(&self.dir);
+        }
+    }
+    fn stream_sector(lba:u32,file:u8,channel:u8,submode:u8)->[u8;CD_SECTOR_RAW_SIZE] {
+        let mut s=[0;CD_SECTOR_RAW_SIZE];
+        s[1..11].fill(0xff);
+        let at=lba+150;
+        let bcd=|v:u32|(((v/10)<<4)|(v%10)) as u8;
+        s[12..16].copy_from_slice(&[bcd(at/4500),bcd(at/75%60),bcd(at%75),2]);
+        s[16..20].copy_from_slice(&[file,channel,submode,1]);
+        s[20..24].copy_from_slice(&[file,channel,submode,1]);
+        // Original constant-valued ADPCM test groups, not commercial audio.
+        for group in s[24..2328].chunks_exact_mut(128) {group[16..].fill(0x11);}
+        s
+    }
+    #[test]
+    fn foreign_file_audio_is_not_decoded_delivered_or_allowed_to_end_the_read() {
+        let fixture=StreamFixture::new(&[
+            stream_sector(0,2,0,0xe4), // foreign file, selected audio channel, EOF
+            stream_sector(1,1,1,0x64), // correct file, unselected channel
+            stream_sector(2,1,0,0x64), // correct file and channel
+        ]);
+        let mut disc=Some(CdRom::open(&fixture.path).unwrap());
+        let mut c=Cdic::new();
+        c.file=0x0100;c.channel=1;c.audio_channel=1;
+        c.disc_mode=2;c.command=0x2a;c.disc_command=0x2a;
+        let ram=c.ram.clone();
+        c.process_sector(&mut disc);
+        assert_eq!(c.audio.total_sectors_decoded,0,"foreign audio reached decoder");
+        assert_eq!((c.x_buffer,c.data_buffer,c.irq_pending),(0,0,false),"foreign sector was delivered");
+        assert_eq!(&c.ram[..],&ram[..]);
+        assert_eq!(c.disc_command,0x2a,"foreign EOF stopped the selected file");
+        c.curr_lba=1;c.process_sector(&mut disc);
+        assert_eq!(c.audio.total_sectors_decoded,0,"unselected audio channel reached decoder");
+        assert_eq!(c.x_buffer,0);
+        c.curr_lba=2;c.process_sector(&mut disc);
+        assert_eq!(c.audio.total_sectors_decoded,1,"selected audio was lost");
+        assert!(c.irq_pending && c.x_buffer&0x8000!=0);
+        drop(disc);
+    }
+
+    fn start_stream(c:&mut Cdic,file:u16,frame:u16) {
+        c.write_reg(0x06,file);
+        c.write_reg(0x08,0);c.write_reg(0x0a,1);c.write_reg(0x0c,1);
+        c.write_reg(0x02,2);c.write_reg(0x04,frame<<8);
+        c.write_reg(0x00,0x2a);c.write_reg(0x3fe,0xc000);
+    }
+    #[test]
+    fn cancelled_read_stays_quiet_then_restarts_with_the_new_file() {
+        let fixture=StreamFixture::new(&[stream_sector(0,1,0,0x64),stream_sector(1,2,0,0x64)]);
+        let mut disc=Some(CdRom::open(&fixture.path).unwrap());
+        let mut c=Cdic::new();start_stream(&mut c,0x100,0);
+        c.step_cycles(30000,200000,&mut disc);
+        assert_eq!(c.audio.total_sectors_decoded,1);
+        assert!(c.irq_pending);
+        c.write_reg(0x3fe,0); // disable the read/interrupt gate
+        assert_eq!(c.disc_command,0);
+        assert!(!c.irq_pending);
+        let ram=c.ram.clone();
+        c.step_cycles(1000000,200000,&mut disc);
+        assert_eq!(c.audio.total_sectors_decoded,1,"cancelled transfer decoded more audio");
+        assert_eq!(&c.ram[..],&ram[..],"cancelled transfer changed RAM");
+        assert!(!c.irq_pending);
+        c.read_reg(0x3f6); // acknowledge the previously latched sector
+        start_stream(&mut c,0x200,1);
+        c.step_cycles(30000,200000,&mut disc);
+        assert_eq!(c.audio.total_sectors_decoded,2);
+        assert!(c.irq_pending);
+        let base=(c.data_buffer as usize&1)*0xa00;
+        assert_eq!(c.ram[base],0); // header minutes
+        assert_eq!(c.ram[base+1],2); // header seconds
+        assert_eq!(c.ram[base+2],1); // requested sector, not the old location
+        drop(disc);
+    }
+
+    #[test]
+    fn interleaved_file_selection_is_invariant_to_host_tick_chunk_size() {
+        let sectors:Vec<_>=(0..10).map(|n|stream_sector(n,if n%2==0 {1}else{2},0,0x64)).collect();
+        let fixture=StreamFixture::new(&sectors);
+        for mode in [crate::mcd212::VideoMode::Pal,crate::mcd212::VideoMode::Ntsc] {
+            let period=mode.cycles_per_sector();
+            let total=period*10-170000;
+            let mut a=Cdic::new();let mut b=Cdic::new();
+            let mut da=Some(CdRom::open(&fixture.path).unwrap());
+            let mut db=Some(CdRom::open(&fixture.path).unwrap());
+            start_stream(&mut a,0x100,0);start_stream(&mut b,0x100,0);
+            a.step_cycles(total,period,&mut da);
+            let mut remaining=total;
+            while remaining>0 {let n=remaining.min(7777);b.step_cycles(n,period,&mut db);remaining-=n;}
+            assert_eq!((a.curr_lba,a.audio.total_sectors_decoded),(10,5));
+            assert_eq!((b.curr_lba,b.audio.total_sectors_decoded),(10,5));
+            assert_eq!(&a.ram[..],&b.ram[..]);
+            assert_eq!((a.data_buffer,a.x_buffer,a.irq_pending,a.cycle_accumulator),
+                (b.data_buffer,b.x_buffer,b.irq_pending,b.cycle_accumulator));
+            assert_eq!((a.audio.left_state.s0,a.audio.left_state.s1,a.audio.right_state.s0,a.audio.right_state.s1),
+                (b.audio.left_state.s0,b.audio.left_state.s1,b.audio.right_state.s0,b.audio.right_state.s1));
+            drop((da,db));
+        }
+    }
+
+    #[test]
+    fn selected_eof_sector_is_decoded_once_and_stops_further_delivery() {
+        let fixture=StreamFixture::new(&[stream_sector(0,1,0,0xe4),stream_sector(1,1,0,0x64)]);
+        let mut disc=Some(CdRom::open(&fixture.path).unwrap());
+        let mut c=Cdic::new();start_stream(&mut c,0x100,0);
+        c.step_cycles(1000000,200000,&mut disc);
+        assert_eq!(c.audio.total_sectors_decoded,1);
+        assert_eq!(c.disc_command,0);
+        assert!(c.irq_pending);
+        let ram=c.ram.clone();
+        c.read_reg(0x3f6);
+        c.step_cycles(1000000,200000,&mut disc);
+        assert_eq!(&c.ram[..],&ram[..]);
+        assert_eq!(c.audio.total_sectors_decoded,1);
+        assert!(!c.irq_pending);
+        drop(disc);
+    }
 
     #[test]
     fn audio_channels_above_15_are_never_selected() {

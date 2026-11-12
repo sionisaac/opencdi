@@ -154,7 +154,7 @@ Usage: opencdi [options] [disc image (cue, chd, iso, bin)]
 
   --rom <path>        System BIOS (default: search %APPDATA%/OpenCDI/bios and the program directory)
   --frames <n>        Quit after n emulated frames
-  --mouse             Start in mouse mode (host mouse drives the CD-i pointer)
+  --mouse             Select the mouse settings page (all controls stay enabled)
   --recent [n]        List the recent disc images, or boot recent image number n
   --no-host-input     Ignore host keyboard, mouse and gamepads; never grab the cursor
   --bios, --standalone  Boot the BIOS shell without a disc
@@ -202,39 +202,27 @@ fn flush_nvram(bus: &mut opencdi::bus::CdiBus) {
 }
 
 fn load_nvram(bus: &mut opencdi::bus::CdiBus, path: &Path) -> std::io::Result<()> {
-    if let Some(board) = bus.mono4.as_deref_mut() {
-        let mut nvram = opencdi::mono4::nvram::Nvram32::default();
-        nvram.attach_file(path)?;
-        board.nvram = nvram;
-        Ok(())
-    } else {
-        bus.nvram.load_or_initialize(path)
-    }
+    if let Some(board)=bus.mono4.as_deref_mut(){let mut nvram=opencdi::mono4::nvram::Nvram32::default();nvram.attach_file(path)?;board.nvram=nvram;}
+    else{bus.nvram.load_or_initialize(path)?;}
+    if let Some(now)=opencdi::rtc::local_now(){opencdi::rtc::set(bus,now);}Ok(())
 }
 
 fn send_pointer(bus: &mut opencdi::bus::CdiBus, x: i32, y: i32, buttons: u8) {
-    match bus.mono4.as_deref_mut() {
-        Some(m4) => m4.ikat.update_pointer(x, y, buttons),
-        None => bus.slave.update_mouse(x, y, buttons),
-    }
+    opencdi::boot::send_shell_pointer(bus,x,y,buttons);
 }
 
 fn disc_program_started(pc: u32, frames: u64, shell_state: u32, shell_click_frames: u32) -> bool {
-    // DVC RAM also contains shell routines. A RAM PC alone is not proof that
-    // the shell handed control to the disc; finish the click and leave its menu first.
-    frames > 250 && shell_click_frames >= 35 && !matches!(shell_state, 2 | 3)
-        && ((0x00010000..0x00300000).contains(&pc) || (0x00D00000..0x00E00000).contains(&pc))
+    opencdi::boot::disc_program_started(pc, frames, shell_state, shell_click_frames)
 }
 
-fn savestate_path_for(game_name: &str, slot: usize) -> PathBuf {
+fn savestate_path_for(game_name: &str, slot: usize, bios: &str) -> PathBuf {
     let safe_name: String = game_name
         .chars()
         .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' || c == '(' || c == ')' { c } else { '_' })
         .collect();
     let trimmed = safe_name.trim();
     let base = if trimmed.is_empty() { "cdi_bios" } else { trimmed };
-    let dir = migrate_app_data_dir("savestates");
-    let _ = std::fs::create_dir_all(&dir);
+    let dir = app_data_dir().join("Savestates").join(bios);
     dir.join(format!("{}_slot{}_v{}.st", base, slot, opencdi::savestate::VERSION))
 }
 
@@ -248,7 +236,34 @@ fn default_nvram_save_path() -> PathBuf {
     target
 }
 
-fn per_disc_nvram_save_path(global_path: &Path, disc_path: &Path) -> PathBuf {
+fn per_disc_nvram_save_path(global_path: &Path, disc_path: &Path, bios: &str) -> PathBuf {
+    let legacy = legacy_per_disc_nvram_save_path(global_path, disc_path);
+    let mut name = disc_path.file_stem().unwrap_or_else(|| std::ffi::OsStr::new("disc")).to_os_string();
+    name.push(".bin");
+    let base=global_path.parent().filter(|p|!p.as_os_str().is_empty()).unwrap_or_else(||Path::new("."));
+    let target=base.join("NVRAM").join(bios).join(&name);
+    if target.is_file(){return target;}
+    // The old shared file belongs only to the board whose RAM size matches.
+    let size=if bios=="490"{32768}else{8192};
+    for old in [legacy.with_file_name(&name),legacy] {
+        if let Ok(bytes)=std::fs::read(&old) {
+            if bytes.len()==size {
+                if let Err(e)=copy_save_without_overwrite(&target,&bytes){log::warn!("Cannot migrate save {old:?}: {e}");return old;}
+                break;
+            }
+        }
+    }
+    target
+}
+fn copy_save_without_overwrite(target:&Path,bytes:&[u8])->std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent)=target.parent(){std::fs::create_dir_all(parent)?;}
+    let mut file=match std::fs::OpenOptions::new().write(true).create_new(true).open(target){Ok(f)=>f,Err(e) if e.kind()==std::io::ErrorKind::AlreadyExists=>return Ok(()),Err(e)=>return Err(e)};
+    if let Err(e)=file.write_all(bytes).and_then(|()|file.sync_all()){drop(file);let _=std::fs::remove_file(target);return Err(e);}Ok(())
+}
+fn bios_storage_key(machine:&Machine)->&'static str {if machine.bus.mono4.is_some(){"490"}else{"220"}}
+
+fn legacy_per_disc_nvram_save_path(global_path: &Path, disc_path: &Path) -> PathBuf {
     use std::hash::{Hash, Hasher};
     let identity = std::fs::canonicalize(disc_path).unwrap_or_else(|_| disc_path.to_path_buf());
     let identity_text = identity.to_string_lossy().to_ascii_lowercase();
@@ -300,6 +315,8 @@ fn find_file(relative_subpath: &str) -> Option<PathBuf> {
 
 fn find_rom_file(relative_subpath: &str) -> Option<PathBuf> {
     let data_dir = app_data_dir();
+    let canonical=relative_subpath.strip_prefix("bios/").map(|name|data_dir.join("BIOS").join(name));
+    if let Some(path)=canonical.filter(|p|p.is_file()){return Some(path);}
     let local = data_dir.join(relative_subpath);
     if local.is_file() { return Some(local); }
     #[cfg(windows)]
@@ -362,6 +379,7 @@ fn find_dvc_rom(board: opencdi::bus::BoardKind) -> Option<PathBuf> {
 fn store_rom_in_app_data(found: PathBuf, relative_name: &str) -> PathBuf {
     let data_dir = app_data_dir();
     if found.starts_with(&data_dir) { return found; }
+    let relative_name=if let Some(rest)=relative_name.strip_prefix("bios/"){format!("BIOS/{rest}")}else{relative_name.to_owned()};
     let target = data_dir.join(relative_name);
     if target.is_file() { return target; }
     if let Some(parent) = target.parent() { let _ = std::fs::create_dir_all(parent); }
@@ -486,6 +504,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 1. Load BIOS ROM
+    if let Err(error)=opencdi::frontend::prepare_data_folders_at(&app_data_dir()){log::warn!("Cannot prepare BIOS folder: {error}");}
     let preferences = UiShortcuts::load();
     let saved_bios = preferences.bios_path.as_deref().map(|path| app_data_dir().join(path))
         .filter(|path| Machine::read_bios(path).is_ok_and(|(_, image)| image.report.status != opencdi::bios::Status::Error));
@@ -532,14 +551,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     };
-    match m.load_bios(&bios_path) {
-        Ok(report) => info!("Loaded system BIOS from {:?}: {}", bios_path, report.message),
+    let bios_model = match m.load_bios(&bios_path) {
+        Ok(report) => {
+            info!("Loaded system BIOS from {:?}: {}", bios_path, report.message);
+            report.model().unwrap_or("Unknown CD-i BIOS").to_owned()
+        }
         Err(e) => {
             error!("Cannot use system BIOS {:?}: {}", bios_path, e);
             eprintln!("Cannot use system BIOS {:?}: {}", bios_path, e);
             std::process::exit(1);
         }
-    }
+    };
 
     // 2. Load NVRAM if present
     let nvram_arg = args.iter().position(|a| a == "--nvram").and_then(|i| args.get(i + 1)).map(PathBuf::from);
@@ -598,7 +620,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(_) => {
                 current_disc_path = Some(p.clone());
                 if nvram_mode == NvramMode::PerDisc {
-                    current_nvram_path = per_disc_nvram_save_path(&resolved_nvram_path, &p);
+                    current_nvram_path = per_disc_nvram_save_path(&resolved_nvram_path, &p, bios_storage_key(&m));
                     if let Err(e) = load_nvram(&mut m.bus, &current_nvram_path) {
                         log::warn!("Cannot load per-disc NVRAM {:?}: {}", current_nvram_path, e);
                     }
@@ -646,8 +668,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let boot_synopsis = current_disc_path.as_deref().and_then(|p| synopsis::load(&synopsis_root, p));
     let managed_covers_path = managed_artwork_root.join("Covers");
     let managed_cd_path = managed_artwork_root.join("CD");
-    let library_items = if library_mode { library::scan(&disc_paths, &managed_covers_path, &managed_cd_path, &managed_artwork_root) } else { Vec::new() };
+    // Open the window first; the existing library worker discovers discs and
+    // progressively fills artwork without decoding the entire collection here.
+    if let Some(now)=opencdi::rtc::local_now(){opencdi::rtc::set(&mut m.bus,now);}
+    let library_items = Vec::new();
     let mut library_search = library::Search::default();
+    library_search.active_bios = Some((bios_model,bios_path.file_name().unwrap_or_default().to_string_lossy().into_owned()));
     library_search.collection.refresh(&library_items);
     let disc_details = current_disc_path.as_deref().map(|path| library::DiscDetails::load(path, &managed_artwork_root)).unwrap_or_default();
     let boot_disc_art = current_disc_path.as_deref().and_then(|p| library::load_disc_artwork(p, &managed_cd_path));
@@ -696,6 +722,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config_prev_confirm: false,
         skip_shell,
         input_device_mode,
+        input_arbiter: opencdi::host_input::PointerArbiter::default(),
+        physical_mouse_buttons: 0,
+        mouse_activity: false,
         dvc_disabled,
         dvc_arg,
         max_frames,
@@ -706,6 +735,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         current_disc_path,
         preview_started: None,
         boot_details_until: None,
+        boot_fast_until: None,
+        animation_clock: Instant::now(),
+        rtc_last: Instant::now(),
+        boot_scene: library::BootScene::default(),
         previous_play_pad: false,
         nvram_mode,
         window: None,
@@ -783,7 +816,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         library_scan_rx: None,
         optical_disc: None,
         library_scan_at: Instant::now(),
-        library_reload_art: false,
+        library_reload_art: library_mode,
         library_selected: 0,
         library_search,
         disc_paths,
@@ -807,7 +840,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         library_prev_confirm: false,
     };
 
-    info!("Emulation loop started. Shortcuts: [F11]/[Alt+Enter] Fullscreen, [F5]/[H] Reset, [P] Pause, [Space] hold Fast-forward, [F8] Screenshot (PPM), [F12] Screenshot (BMP), [M] Mute, [+]/[-] Volume, [Ctrl+I] Insert Disc, [Ctrl+O] Open & Reset, [Middle Click] Capture/Release Mouse, [Esc] Quit");
+    info!("Emulation loop started. Shortcuts: [F11]/[Alt+Enter] Fullscreen, [F5]/[H] Reset, [P] Pause, [Space] hold Fast-forward, [F8] Screenshot (PPM), [F12] Screenshot (BMP), [M] Mute, [+]/[-] Volume, [Ctrl+I] Insert Disc, [Ctrl+O] Open & Reset, [Middle Click] Pause Menu, [Esc] Quit");
 
     let event_loop = EventLoop::new()?;
     event_loop.run_app(&mut app)?;
@@ -979,6 +1012,7 @@ fn blit_smooth_aspect(dst: &mut [u32], dst_w: usize, dst_h: usize, src: &[u32], 
 struct LibraryScan {
     items: Option<Vec<library::Item>>,
     optical_disc: Option<char>,
+    complete: bool,
 }
 
 struct App {
@@ -1009,6 +1043,9 @@ struct App {
     config_prev_confirm: bool,
     skip_shell: bool,
     input_device_mode: InputDeviceMode,
+    input_arbiter: opencdi::host_input::PointerArbiter,
+    physical_mouse_buttons: u8,
+    mouse_activity: bool,
     dvc_disabled: bool,
     dvc_arg: Option<PathBuf>,
     max_frames: Option<u64>,
@@ -1019,6 +1056,10 @@ struct App {
     current_disc_path: Option<PathBuf>,
     preview_started: Option<Instant>,
     boot_details_until: Option<Instant>,
+    boot_fast_until: Option<Instant>,
+    animation_clock: Instant,
+    rtc_last: Instant,
+    boot_scene: library::BootScene,
     previous_play_pad: bool,
     nvram_mode: NvramMode,
     window: Option<Rc<Window>>,
@@ -1145,20 +1186,26 @@ impl App {
     }
 
     fn state_slot(&mut self, slot: usize, load: bool) {
-        let path = savestate_path_for(&self.current_game_name, slot);
+        let path = savestate_path_for(&self.current_game_name, slot, bios_storage_key(&self.m));
         if load {
-            match read_state_file(&path, &mut self.m) {
+            let canonical_old=app_data_dir().join("Savestates").join(path.file_name().unwrap());
+            let old=if canonical_old.is_file(){canonical_old}else{migrate_app_data_dir("savestates").join(path.file_name().unwrap())};
+            let source=if path.is_file(){path.clone()}else{old};
+            match read_state_file(&source, &mut self.m) {
                 Ok(frontend) => {
                     if let Err(error) = self.set_frontend_state(&frontend) {
                         error!("Could not restore frontend state: {error}");
                     }
                     if let Ok(mut ring) = self.audio_ring.lock() { ring.clear(); }
+                    if source!=path {if let Ok(bytes)=std::fs::read(&source){let _=copy_save_without_overwrite(&path,&bytes);}}
+                    self.rtc_last=Instant::now();
                     self.reset_telemetry();
                     info!("Loaded state slot {slot} from {path:?}");
                 }
                 Err(error) => error!("Could not load state slot {slot}: {error}"),
             }
         } else {
+            if let Some(parent)=path.parent(){let _=std::fs::create_dir_all(parent);}
             match write_state_file(&path, &self.m, &self.frontend_state()) {
                 Ok(_) => info!("Saved state slot {slot} to {path:?}"),
                 Err(error) => error!("Could not save state slot {slot}: {error}"),
@@ -1169,7 +1216,7 @@ impl App {
     fn showing_disc_details(&self) -> bool {
         self.pause_info || self.preview_started.is_some()
             || self.boot_details_until.is_some_and(|until| Instant::now() < until)
-            || (self.skip_shell && self.m.bus.mono4.is_none() && self.m.bus.cdrom.is_some() && !self.disc_launched)
+            || (self.skip_shell && self.m.bus.cdrom.is_some() && !self.disc_launched)
     }
 
     fn content_rect(&self, width: usize, height: usize) -> (usize, usize, usize, usize) {
@@ -1189,13 +1236,20 @@ impl App {
     }
 
     fn pause_is_available(&self) -> bool {
-        !self.library_mode && self.current_disc_path.is_some() && self.disc_launched
+        opencdi::host_input::pause_action(self.library_mode,self.preview_started.is_some(),self.current_disc_path.is_some(),self.disc_launched)
+            != opencdi::host_input::PauseAction::None
     }
 
     fn toggle_pause_menu(&mut self) {
+        if opencdi::host_input::pause_action(self.library_mode,self.preview_started.is_some(),self.current_disc_path.is_some(),self.disc_launched)
+            == opencdi::host_input::PauseAction::ReturnToLibrary {
+            self.stop_to_library();
+            return;
+        }
         if !self.pause_is_available() && !self.paused { return; }
         self.paused = !self.paused;
         self.pause_info = false;
+        self.apply_grab();
         if self.paused { self.pause_menu_selected = 0; }
         self.prev_pause_confirm = false;
         self.reset_telemetry();
@@ -1204,16 +1258,17 @@ impl App {
     }
 
     fn move_pause_selection(&mut self, delta: isize) {
-        self.pause_menu_selected = (self.pause_menu_selected as isize + delta).rem_euclid(5) as usize;
+        self.pause_menu_selected = (self.pause_menu_selected as isize + delta).rem_euclid(library::PAUSE_ACTIONS.len() as isize) as usize;
         if let Some(window) = &self.window { window.request_redraw(); }
     }
 
     fn choose_pause_action(&mut self) {
         match self.pause_menu_selected {
-            0 => self.pause_info = true,
-            1 => { push_action(GuiAction::QuickSaveState); self.paused = false; },
-            2 => { push_action(GuiAction::QuickLoadState); self.paused = false; },
-            3 => {
+            0 => self.toggle_pause_menu(),
+            1 => self.pause_info = true,
+            2 => { push_action(GuiAction::QuickSaveState); self.paused = false; },
+            3 => { push_action(GuiAction::QuickLoadState); self.paused = false; },
+            4 => {
                 self.controller_config_was_captured = self.mouse_captured;
                 self.controller_config = Some(controller_config::State::default());
                 self.mouse_captured = false;
@@ -1221,14 +1276,25 @@ impl App {
                 self.prev_key_btn = 0;
                 self.apply_grab();
             }
-            4 => self.stop_to_library(),
+            5 => self.stop_to_library(),
+            6 => self.exit_requested = true,
             _ => {}
+        }
+        if !self.paused && !self.library_mode {
+            // A menu confirmation belongs to the menu, not the first game frame.
+            self.wiimote_auto.suppress_held(self.wiimote_buttons);
+            self.wiimote_buttons = 0;
+            self.wiimote_pressed = 0;
+            self.wiimote_trigger_ready = false;
+            self.mouse_left = false;
+            self.mouse_right = false;
         }
         self.reset_telemetry();
         if let Some(window) = &self.window { window.request_redraw(); }
     }
 
     fn stop_to_library(&mut self) {
+        self.boot_fast_until = None;
         self.save_active_disc_settings();
         self.paused = false;
         self.pause_info = false;
@@ -1272,6 +1338,8 @@ impl App {
             self.toggle_pause_menu();
         } else if self.preview_started.is_some() {
             self.stop_to_library();
+        } else if !self.library_mode && self.current_disc_path.is_none() {
+            self.stop_to_library();
         } else if !self.library_mode {
             return false;
         } else if self.toolbar_popup.take().is_none() {
@@ -1292,6 +1360,15 @@ impl App {
 
     fn on_cursor_moved(&mut self, position: PhysicalPosition<f64>) {
                 self.cursor = Some(position);
+                self.library_search.pointer = Some(cursor_to_cdi(position, self.image_rect));
+                if self.paused && !self.pause_info && self.controller_config.is_none()
+                    && let Some(window) = &self.window {
+                    let size=window.inner_size();
+                    if let Some(row)=library::pause_menu_hit_full(position.x.max(0.0) as usize,position.y.max(0.0) as usize,size.width as usize,size.height as usize) {
+                        self.pause_menu_selected=row;
+                        window.request_redraw();
+                    }
+                }
                 if self.library_size_dragging {
                     let (x, y) = cursor_to_cdi(position, self.image_rect);
                     if (library::H as i32-58..library::H as i32-12).contains(&y) {
@@ -1301,7 +1378,14 @@ impl App {
     }
 
     fn on_mouse_input(&mut self, state: ElementState, button: MouseButton) {
-        self.on_pointer_input(state, button, false);
+        let mask = match button { MouseButton::Left => 1, MouseButton::Right => 2, _ => 0 };
+        let before = self.physical_mouse_buttons | self.wiimote_mouse_buttons;
+        if state == ElementState::Pressed { self.physical_mouse_buttons |= mask; }
+        else { self.physical_mouse_buttons &= !mask; }
+        if mask != 0 { self.mouse_activity = true; }
+        let after = self.physical_mouse_buttons | self.wiimote_mouse_buttons;
+        if mask != 0 && (before ^ after) & mask == 0 { return; }
+        self.on_pointer_input(state, button, true);
     }
 
     fn on_pointer_input(&mut self, state: ElementState, button: MouseButton, single_press_details: bool) {
@@ -1327,6 +1411,16 @@ impl App {
                     self.mouse_left = false;
                     return;
                 }
+                if down && button == MouseButton::Middle && self.controller_config.is_none()
+                    && self.pause_is_available() && !self.paused {
+                    self.toggle_pause_menu();
+                    return;
+                }
+                if down && button == MouseButton::Right && self.paused && self.controller_config.is_none() {
+                    if self.pause_info { self.pause_info = false; }
+                    self.toggle_pause_menu();
+                    return;
+                }
                 if self.pause_info { return; }
                 if self.preview_started.is_some() && self.controller_config.is_none() {
                     if down && button == MouseButton::Right {
@@ -1347,7 +1441,7 @@ impl App {
                         if let Some(row) = library::pause_menu_hit_full(pos.x.max(0.0) as usize, pos.y.max(0.0) as usize, width, height) {
                             self.pause_menu_selected = row;
                             self.choose_pause_action();
-                            self.mouse_left = true;
+                            self.mouse_left = self.paused;
                             return;
                         }
                     }
@@ -1558,11 +1652,18 @@ impl App {
     }
 
     fn update_wiimote_mouse(&mut self) {
+        self.input_arbiter.remote_mode(self.wiimote_auto.mode == wiimote::ControlMode::Pointer);
+        let remote = (self.wiimote_auto.mode == wiimote::ControlMode::Pointer)
+            .then(|| self.wiimote_position()).flatten()
+            .map(|p| cursor_to_cdi(p,self.image_rect));
+        self.input_arbiter.pointers(std::mem::take(&mut self.mouse_activity),remote,
+            self.wiimote_pressed & (wiimote::A | wiimote::B) != 0);
         let ui = self.library_mode || self.preview_started.is_some() || self.controller_config.is_some() || self.paused;
         let previous_cursor = self.wiimote_cursor;
         self.wiimote_cursor = None;
         let mut buttons = 0;
         if self.focused && self.wiimote_auto.mode == wiimote::ControlMode::Pointer
+            && self.input_arbiter.source() == opencdi::host_input::PointerSource::Wiimote
             && let Some(position) = self.wiimote_position() {
             self.wiimote_cursor = Some(position);
             if ui {
@@ -1580,7 +1681,7 @@ impl App {
         }
         self.wiimote_mouse_buttons = buttons;
         for (mask,button) in [(1,MouseButton::Left),(2,MouseButton::Right)] {
-            if (previous ^ buttons) & mask != 0 {
+            if ((previous | self.physical_mouse_buttons) ^ (buttons | self.physical_mouse_buttons)) & mask != 0 {
                 self.on_pointer_input(if buttons & mask != 0 { ElementState::Pressed } else { ElementState::Released }, button, true);
             }
         }
@@ -1641,6 +1742,16 @@ impl App {
                 self.toolbar_popup = None;
                 push_action(GuiAction::OpenDisc(PathBuf::from(format!("{letter}:"))));
             }
+            T::Start220 | T::Start490 => {
+                let target=if action==T::Start490{"490"}else{"220"};
+                self.handle_toolbar_action(if action==T::Start490{T::Bios490}else{T::Bios220});
+                if bios_storage_key(&self.m)!=target{return;}
+                self.stop_to_library();
+                self.m.bus.reset_system();self.m.reset();self.reset_state();
+                self.library_mode=false;self.mouse_captured=true;
+                self.current_game_name=format!("CD-i {target} System");
+                self.grab_applied=None;self.apply_grab();self.reset_telemetry();
+            }
             T::Controller => push_action(GuiAction::OpenControllerConfig),
             T::About => self.toolbar_popup = Some(library::ToolbarPopup::About),
             T::Settings => self.toolbar_popup = if self.toolbar_popup == Some(library::ToolbarPopup::Settings) { None } else { Some(library::ToolbarPopup::Settings) },
@@ -1658,14 +1769,17 @@ impl App {
                     }
                 }
             }
-            T::SwitchBios => {
+            T::Bios220 | T::Bios490 => {
                 self.toolbar_popup = None;
-                #[cfg(windows)]
-                {
-                    let hwnd = self.hwnd();
-                    if let Some(path) = gui::modal(hwnd, || gui::open_bios_dialog(hwnd)) {
-                        push_action(GuiAction::SwitchBios(path));
-                    }
+                let model=if action==T::Bios490 { "490" } else { "220" };
+                if self.library_search.active_bios.as_ref().is_some_and(|(current,_)| current.contains(model)) { return; }
+                let names: &[&str] = if model=="490" { &["bios/cdi490a.rom","cdi490a.rom"] }
+                    else { &["bios/cdi220b.rom","cdi220b.rom","bios/cdi220.rom","cdi220.rom"] };
+                if let Some(path)=names.iter().find_map(|name| find_rom_file(name)) {
+                    self.switch_bios(path);
+                } else {
+                    #[cfg(windows)]
+                    gui::show_disc_error(self.hwnd(),&format!("BIOS {model} was not found in the BIOS folder."));
                 }
             }
         }
@@ -1743,9 +1857,12 @@ impl App {
         let saved = path.strip_prefix(&data_dir).unwrap_or(&path).to_path_buf();
         self.bindings.ui_shortcuts.bios_path = Some(saved.clone());
         self.global_bindings.ui_shortcuts.bios_path = Some(saved);
+        self.library_search.active_bios = Some((image.report.model().unwrap_or("Unknown CD-i BIOS").to_owned(),path.file_name().unwrap_or_default().to_string_lossy().into_owned()));
         self.bindings.save_to_ini();
         #[cfg(windows)]
         gui::update_dvc_menu(self.m.bus.dvc.is_fitted());
+        #[cfg(windows)]
+        gui::update_bios_menu(image.report.model().unwrap_or(""));
         info!("Selected system BIOS {:?}: {}", path, image.report.message);
         if let Some(window) = &self.window { window.request_redraw(); }
     }
@@ -1817,7 +1934,7 @@ impl App {
         if let Some(rx) = &self.library_scan_rx {
             match rx.try_recv() {
                 Ok(result) => {
-                    self.library_scan_rx = None;
+                    if result.complete { self.library_scan_rx = None; }
                     if self.optical_disc != result.optical_disc {
                         self.optical_disc = result.optical_disc;
                         if let Some(window) = &self.window { window.request_redraw(); }
@@ -1828,18 +1945,21 @@ impl App {
                         }
                         let selected_path = self.library_search.get(&self.library_items, self.library_selected)
                             .map(|item| item.path.clone());
-                        if !self.library_items.iter().map(|item| &item.path).eq(items.iter().map(|item| &item.path)) {
+                        let paths_changed = !self.library_items.iter().map(|item| &item.path).eq(items.iter().map(|item| &item.path));
+                        if paths_changed {
                             self.artwork_retry_at = now;
                             self.library_click = None;
                         }
                         self.library_items = items;
-                        self.library_search.collection.refresh(&self.library_items);
-                        self.library_search.rebuild(&self.library_items);
+                        if paths_changed {
+                            self.library_search.collection.refresh(&self.library_items);
+                            self.library_search.rebuild(&self.library_items);
+                        }
                         self.library_selected = selected_path.and_then(|path| self.library_search.position(&self.library_items, &path))
                             .unwrap_or_else(|| self.library_selected.min(self.library_search.len(&self.library_items).saturating_sub(1)));
                         if let Some(window) = &self.window { window.request_redraw(); }
                     }
-                    self.artwork_during_scan.clear();
+                    if result.complete { self.artwork_during_scan.clear(); }
                 }
                 Err(TryRecvError::Disconnected) => {
                     self.library_scan_rx = None;
@@ -1868,6 +1988,8 @@ impl App {
             self.library_scan_at = now + LIBRARY_SCAN_INTERVAL;
             let roots = self.disc_paths.clone();
             let previous: Vec<_> = self.library_items.iter().map(|item| item.path.clone()).collect();
+            let previous_items = self.library_items.clone();
+            let previous_optical = self.optical_disc;
             let covers = self.managed_covers_path.clone();
             let discs = self.managed_cd_path.clone();
             let managed_artwork = self.managed_artwork_root.clone();
@@ -1879,23 +2001,36 @@ impl App {
             let lookup_running = self.artwork_fetch_rx.is_some();
             let (tx, rx) = std::sync::mpsc::channel();
             if std::thread::Builder::new().name("disc-library-scan".into()).spawn(move || {
-                #[cfg(target_os = "windows")]
-                let optical_disc = gui::get_optical_drives().into_iter().find(|&letter| opencdi::cdrom::optical_drive_has_disc(letter));
-                #[cfg(not(target_os = "windows"))]
-                let optical_disc = None;
                 let paths = library::scan_paths(&roots);
+                library::migrate_artwork_names(&paths, &managed_artwork);
+                let logo_added = missing_logos.iter().any(|path| {
+                    library::managed_art_path(path, &managed_artwork, launchbox::ArtworkKind::Logo).is_some()
+                });
+                if force_reload || paths != previous || logo_added {
+                    let mut items: Vec<_> = paths.iter().map(|path| {
+                        previous_items.iter().find(|item| item.path == *path).cloned().unwrap_or_else(|| library::Item {
+                            path: path.clone(), title: library::disc_title(path), cover: None, disc: None, logo: None,
+                        })
+                    }).collect();
+                    // Titles are immediately usable, then covers arrive a page at a time.
+                    if tx.send(LibraryScan { items: Some(items.clone()), optical_disc: previous_optical, complete: false }).is_err() { return; }
+                    for start in (0..paths.len()).step_by(24) {
+                        let end = (start + 24).min(paths.len());
+                        let loaded = library::load_items(paths[start..end].to_vec(), &covers, &discs, &managed_artwork);
+                        items[start..end].clone_from_slice(&loaded);
+                        if tx.send(LibraryScan { items: Some(items.clone()), optical_disc: previous_optical, complete: false }).is_err() { return; }
+                    }
+                }
                 if let Some(path) = report_path {
                     if let Err(error) = missing_media::refresh(&path, &paths, &managed_artwork, &synopsis_root, lookup_running) {
                         log::debug!("Could not write Missing Media.txt: {error}");
                     }
                 }
-                let logo_added = missing_logos.iter().any(|path| {
-                    library::managed_art_path(path, &managed_artwork, launchbox::ArtworkKind::Logo)
-                        .and_then(|logo| library::load_artwork(&logo)).is_some()
-                });
-                let items = (force_reload || paths != previous || logo_added)
-                    .then(|| library::load_items(paths, &covers, &discs, &managed_artwork));
-                let _ = tx.send(LibraryScan { items, optical_disc });
+                #[cfg(target_os = "windows")]
+                let optical_disc = gui::get_optical_drives().into_iter().find(|&letter| opencdi::cdrom::optical_drive_has_disc(letter));
+                #[cfg(not(target_os = "windows"))]
+                let optical_disc = None;
+                let _ = tx.send(LibraryScan { items: None, optical_disc, complete: true });
             }).is_ok() {
                 self.library_scan_rx = Some(rx);
                 self.library_reload_art = false;
@@ -2068,7 +2203,7 @@ impl App {
 
     fn activate_nvram_for_selection(&mut self) {
         let target = if self.nvram_mode == NvramMode::PerDisc {
-            self.current_disc_path.as_deref().map(|p| per_disc_nvram_save_path(&self.global_nvram_path, p))
+            self.current_disc_path.as_deref().map(|p| per_disc_nvram_save_path(&self.global_nvram_path, p, bios_storage_key(&self.m)))
                 .unwrap_or_else(|| self.global_nvram_path.clone())
         } else { self.global_nvram_path.clone() };
         if self.nvram_path.as_ref() == Some(&target) { return; }
@@ -2288,6 +2423,9 @@ impl App {
     }
 
     fn reset_state(&mut self) {
+        self.boot_fast_until = None;
+        if let Some(now)=opencdi::rtc::local_now(){opencdi::rtc::set(&mut self.m.bus,now);}
+        self.rtc_last=Instant::now();
         self.frame_count = 0;
         self.disc_launched = false;
         self.shell_ready_count = 0;
@@ -2301,8 +2439,9 @@ impl App {
     fn apply_grab(&mut self) {
         let Some(window) = &self.window else { return };
         let pointing = self.host_input && self.focused && self.wiimote_cursor.is_some();
-        let want = self.host_input && self.focused && self.mouse_captured && !self.library_mode && self.controller_config.is_none() && !pointing;
-        window.set_cursor_visible(!want);
+        let ui = self.library_mode || self.paused || self.pause_info || self.preview_started.is_some() || self.controller_config.is_some();
+        let want = self.host_input && self.focused && self.mouse_captured && !ui && !pointing;
+        window.set_cursor_visible(!(want || (pointing && !ui)));
         if self.grab_applied == Some(want) {
             return;
         }
@@ -2447,6 +2586,7 @@ impl App {
             self.toggle_menu();
             return;
         }
+        if code==Key::Escape && !self.library_mode && self.current_disc_path.is_none(){self.stop_to_library();return;}
         if self.bound(code) { return; }
         let ctrl = self.mods.control_key();
         let alt = self.mods.alt_key();
@@ -2455,14 +2595,6 @@ impl App {
             Key::F1 => push_action(GuiAction::OpenFeedback),
             Key::F6 => push_action(GuiAction::QuickSaveState),
             Key::F7 => push_action(GuiAction::QuickLoadState),
-            Key::F9 => {
-                let next_mode = match self.input_device_mode {
-                    InputDeviceMode::Gamepad => InputDeviceMode::Mouse,
-                    InputDeviceMode::Mouse => InputDeviceMode::Peacekeeper,
-                    InputDeviceMode::Peacekeeper => InputDeviceMode::Gamepad,
-                };
-                push_action(GuiAction::SetInputDevice(next_mode));
-            }
             Key::KeyI if ctrl => self.open_dialog_action(false),
             Key::KeyO if ctrl => self.open_dialog_action(true),
             Key::F5 => push_action(GuiAction::Reset),
@@ -2525,6 +2657,7 @@ impl App {
                             self.activate_disc_settings(&path);
                             self.set_search_focus(false);
                             self.preview_started = None;
+                            self.animation_clock = Instant::now();
                             self.grab_applied = None;
                             self.activate_nvram_for_selection();
                             self.add_recent(&path);
@@ -2559,6 +2692,9 @@ impl App {
                             self.m.bus.emulate_wait_states = true;
                             self.next_frame_time = Instant::now();
                             self.boot_details_until = Some(self.next_frame_time + Duration::from_millis(750));
+                            if self.skip_shell {
+                                self.boot_fast_until = Some(self.next_frame_time + Duration::from_secs(30));
+                            }
                             self.reset_telemetry();
                         }
                         Err(e) => {
@@ -2615,7 +2751,7 @@ impl App {
                     self.save_input_settings();
                     #[cfg(target_os = "windows")]
                     gui::update_input_device_menu(mode);
-                    info!("Input device mode set to: {:?}", mode);
+                    info!("Controller settings page selected: {:?}; all input devices remain enabled", mode);
                 }
                 GuiAction::ReloadControls => {
                     self.bindings.load_from_ini();
@@ -2688,6 +2824,7 @@ impl App {
                     info!("Disc folders updated.");
                 }
                 GuiAction::SwitchBios(path) => self.switch_bios(path),
+                GuiAction::SelectBios(model) => self.handle_toolbar_action(if model==490 { library::ToolbarAction::Bios490 } else { library::ToolbarAction::Bios220 }),
                 GuiAction::TakeScreenshot => {
                     save_screenshot(self.frame_count, &self.m.bus.mcd212.framebuffer[..]);
                 }
@@ -2775,29 +2912,15 @@ impl App {
                     m.bus.peek_long(0x0000C000u32.wrapping_add(0xFFFF9172)).unwrap_or(0)
                 };
 
-                if shell_state >= 2 && m.bus.mono4.is_none() {
-                    self.shell_ready_count += 1;
-                    let click_phase = self.shell_ready_count % 120;
-                    if self.shell_ready_count == 1 {
-                        info!("CD-i shell is ready; automatically selecting Play CD-i while the disc boots...");
-                    }
-                    if click_phase == 10 {
-                        send_pointer(&mut m.bus, 575, 335, 0);
-                    } else if click_phase == 20 {
-                        send_pointer(&mut m.bus, 575, 335, 1);
-                    } else if click_phase == 35 {
-                        send_pointer(&mut m.bus, 575, 335, 0);
-                    }
+                if let Some((x,y,b)) = opencdi::boot::shell_play_click(&m.bus, shell_state, &mut self.shell_ready_count) {
+                    send_pointer(&mut m.bus,x,y,b);
                 }
-                let started = if m.bus.mono4.is_some() {
-                    // Mono4 does not use this Mono1 shell-state location or click sequence.
-                    disc_program_started(m.cpu.pc, self.frame_count, 0, 35)
-                } else {
-                    disc_program_started(m.cpu.pc, self.frame_count, shell_state, self.shell_ready_count)
-                };
+                let started = disc_program_started(m.cpu.pc, self.frame_count,
+                    if m.bus.mono4.is_some() { 0 } else { shell_state }, self.shell_ready_count);
                 if started {
                     info!("Disc program started (PC=0x{:06X}); automatic boot complete.", m.cpu.pc);
                     self.disc_launched = true;
+                    self.boot_fast_until = None;
                     m.bus.emulate_wait_states = true;
                     self.pad_x = 384;
                     self.pad_y = 280;
@@ -2812,13 +2935,6 @@ impl App {
     // Keyboard, gamepad and host mouse into the slave controller, once per emulated frame
     fn update_input(&mut self) {
         let is_active = self.focused && self.host_input && self.controller_config.is_none();
-
-        // Middle mouse button (rotellina/tasto centrale): toggle mouse capture / release focus
-        if is_active && self.mouse_middle && !self.prev_middle {
-            self.mouse_captured = !self.mouse_captured;
-            info!("Controllo mouse: {}", if self.mouse_captured { "CATTURATO (focus console, puntatore host nascosto)" } else { "LIBERO (puntatore desktop visibile, rotellina o clic per ricatturare)" });
-        }
-        self.prev_middle = self.mouse_middle;
 
         // Left click inside window re-captures mouse if released
         if is_active && !self.mouse_captured && self.mouse_left && self.cursor.is_some() {
@@ -3049,16 +3165,16 @@ impl App {
                 (mouse_x, mouse_y) = cursor_to_cdi(pos, self.image_rect);
             }
             if self.rel_pointer.is_some() || self.cursor.is_some() {
-                if self.mouse_left { mouse_btn |= 1; }
-                if self.mouse_right { mouse_btn |= 2; }
+                if self.physical_mouse_buttons & 1 != 0 { mouse_btn |= 1; }
+                if self.physical_mouse_buttons & 2 != 0 { mouse_btn |= 2; }
             }
         }
 
-        let wiimote_aim = self.wiimote_position().filter(|pos| {
+        let wiimote_raw_aim = self.wiimote_position().filter(|_| self.wiimote_auto.mode == wiimote::ControlMode::Pointer).filter(|pos| {
             let (x,y,w,h) = self.image_rect;
             pos.x >= x as f64 && pos.y >= y as f64 && pos.x < (x+w) as f64 && pos.y < (y+h) as f64
-        }).map(|pos| {
-            let (x,y) = cursor_to_cdi(pos,self.image_rect);
+        }).map(|pos| cursor_to_cdi(pos,self.image_rect));
+        let wiimote_aim = wiimote_raw_aim.map(|(x,y)| {
             wiimote::correct_game_aim(&self.current_game_name,self.m.bus.mcd212.cursor_control,x,y)
         });
         let m = &mut self.m;
@@ -3074,60 +3190,42 @@ impl App {
         }
 
         if self.boot_details_until.is_some_and(|until| Instant::now() < until)
-            || (!self.disc_launched && m.bus.cdrom.is_some() && self.skip_shell && m.bus.mono4.is_none())
+            || (!self.disc_launched && m.bus.cdrom.is_some() && self.skip_shell)
         {
             // Keep host input from interfering with the automatic Play CD-i selection.
         } else {
-            let effective_device = if self.wiimote_sample.is_some() {
-                match self.wiimote_auto.mode {
-                    wiimote::ControlMode::Pointer => InputDeviceMode::Peacekeeper,
-                    wiimote::ControlMode::Sideways => InputDeviceMode::Gamepad,
+            // All devices feed one CD-i pointer. Motion comes from the last
+            // deliberately used device; held buttons are combined independently.
+            if is_active && (dir_x != 0 || dir_y != 0) {
+                self.input_arbiter.gamepad_motion(wiimote_raw_aim);
+                const PAD_SPEED: f32 = 2.5;
+                self.pad_x_f = (self.pad_x_f + dir_x.clamp(-1,1) as f32 * PAD_SPEED).clamp(0.0,767.0);
+                self.pad_y_f = (self.pad_y_f + dir_y.clamp(-1,1) as f32 * PAD_SPEED).clamp(0.0,559.0);
+                self.pad_x = self.pad_x_f.round() as i32;
+                self.pad_y = self.pad_y_f.round() as i32;
+            } else if is_active {
+                match self.input_arbiter.source() {
+                    opencdi::host_input::PointerSource::Mouse => {
+                        self.pad_x = mouse_x;
+                        self.pad_y = mouse_y;
+                    }
+                    opencdi::host_input::PointerSource::Wiimote => {
+                        if let Some((x,y)) = wiimote_aim { self.pad_x = x; self.pad_y = y; }
+                    }
+                    opencdi::host_input::PointerSource::Gamepad => {}
                 }
-            } else { self.input_device_mode };
-            match effective_device {
-                InputDeviceMode::Gamepad => {
-                    const PAD_SPEED: f32 = 2.5;
-                    let mut moved = false;
-                    if dir_x != 0 {
-                        self.pad_x_f = (self.pad_x_f + (dir_x.clamp(-1, 1) as f32) * PAD_SPEED).clamp(0.0, 767.0);
-                        self.pad_x = self.pad_x_f.round() as i32;
-                        moved = true;
-                    }
-                    if dir_y != 0 {
-                        self.pad_y_f = (self.pad_y_f + (dir_y.clamp(-1, 1) as f32) * PAD_SPEED).clamp(0.0, 559.0);
-                        self.pad_y = self.pad_y_f.round() as i32;
-                        moved = true;
-                    }
-                    if moved || key_btn != self.prev_key_btn {
-                        send_pointer(&mut m.bus, self.pad_x, self.pad_y, key_btn);
-                    }
-                    self.prev_key_btn = key_btn;
-                }
-                InputDeviceMode::Peacekeeper => {
-                    let mut buttons = 0;
-                    if is_active && let Some((x, y)) = wiimote_aim {
-                        self.pad_x = x;
-                        self.pad_y = y;
-                        self.pad_x_f = self.pad_x as f32;
-                        self.pad_y_f = self.pad_y as f32;
-                        if self.wiimote_trigger_ready {
-                            if self.wiimote_buttons & wiimote::A != 0 { buttons |= 1; }
-                            if self.wiimote_buttons & wiimote::B != 0 { buttons |= 2; }
-                        }
-                    }
-                    match m.bus.mono4.as_deref_mut() {
-                        Some(m4) => m4.ikat.update_absolute_pointer(self.pad_x, self.pad_y, buttons),
-                        None => m.bus.slave.update_mouse(self.pad_x, self.pad_y, buttons),
-                    }
-                }
-                InputDeviceMode::Mouse => {
-                    self.pad_x = mouse_x;
-                    self.pad_y = mouse_y;
-                    self.pad_x_f = mouse_x as f32;
-                    self.pad_y_f = mouse_y as f32;
-                    send_pointer(&mut m.bus, self.pad_x, self.pad_y, mouse_btn | key_btn);
-                }
+                self.pad_x_f = self.pad_x as f32;
+                self.pad_y_f = self.pad_y as f32;
             }
+            let mut remote_buttons = 0;
+            if wiimote_aim.is_some() && self.wiimote_trigger_ready {
+                if self.wiimote_buttons & wiimote::A != 0 { remote_buttons |= 1; }
+                if self.wiimote_buttons & wiimote::B != 0 { remote_buttons |= 2; }
+            }
+            let buttons = opencdi::host_input::combined_buttons(is_active,mouse_btn,key_btn,remote_buttons);
+            if m.bus.cdrom.is_none(){opencdi::boot::send_shell_pointer(&mut m.bus,self.pad_x,self.pad_y,buttons);}
+            else{opencdi::boot::send_game_pointer(&mut m.bus,self.pad_x,self.pad_y,buttons);}
+            self.prev_key_btn = key_btn;
         }
 
         // Audio hotkeys (+ / - = Volume, held)
@@ -3233,13 +3331,20 @@ impl App {
         };
         if let Some(window) = &self.window {
             window.set_title(&format!(
-                "OpenCDi – {} | {} | CPU: {:.2} MIPS | CD: {} | Render: {} | WaitStates: {}",
-                self.current_game_name, speed, self.measured_mips, cd_str, render_str, wait_status
+                "OpenCDi – {} | {} | CPU: {:.2} MIPS | CD: {} | Render: {} | WaitStates: {}{}",
+                self.current_game_name, speed, self.measured_mips, cd_str, render_str, wait_status,
+                if !self.disc_launched && self.skip_shell && m.bus.cdrom.is_some() { " | Starting disc" } else { "" }
             ));
         }
     }
 
     // One emulated frame plus host input; returns false when the loop must stop
+    fn boot_accelerating(&self) -> bool {
+        self.boot_fast_until.is_some_and(|until| Instant::now() < until)
+            && !self.disc_launched && self.skip_shell && !self.paused
+            && !self.library_mode && self.preview_started.is_none() && self.m.bus.cdrom.is_some()
+    }
+
     fn tick(&mut self) -> bool {
         self.update_wiimote();
         if self.exit_requested { return false; }
@@ -3372,21 +3477,16 @@ impl App {
             } else if self.library_mode {
                 library::render_native(&mut buffer,dw,dh,self.image_rect,&self.library_items,self.library_selected,self.bindings.ui_shortcuts.artwork_size,self.menu_visible,self.display_mode,self.toolbar_popup,self.optical_disc,&self.library_search,self.artwork_progress.as_ref());
             } else {
-                let mut frame = self.m.bus.mcd212.framebuffer.to_vec();
                 if show_details {
-                    let animation_frame = if let Some(started) = self.preview_started {
-                        (started.elapsed().as_millis() / 20) as u64
-                    } else if self.pause_info { u64::from(self.paused_ticks) } else { self.frame_count };
-                    library::render_boot(&mut frame, self.boot_disc_art.as_ref(), animation_frame);
-                }
-                blit_aspect(&mut buffer, dw, dh, &frame, self.image_rect);
-                if show_details {
-                    library::render_boot_details(&mut buffer, dw, dh, self.image_rect,
-                        &self.current_game_name, &self.disc_details, self.boot_synopsis.as_deref());
-                    if self.preview_started.is_some() {
-                        library::render_preview_actions(&mut buffer, dw, dh, self.image_rect);
-                    }
+                    // The library preview is stationary until Play. Once started,
+                    // use real time even in the in-game pause/Info screen.
+                    let animation_frame = if self.preview_started.is_some() { 0 }
+                        else { (self.animation_clock.elapsed().as_millis() / 20) as u64 };
+                    self.boot_scene.render(&mut buffer, dw, dh, self.image_rect,
+                        &self.current_game_name, &self.disc_details, self.boot_synopsis.as_deref(),
+                        self.preview_started.is_some(), self.boot_disc_art.as_ref(), animation_frame);
                 } else {
+                    blit_aspect(&mut buffer, dw, dh, &self.m.bus.mcd212.framebuffer[..], self.image_rect);
                     draw_bezel(&mut buffer, dw, dh, self.image_rect);
                 }
             }
@@ -3448,6 +3548,7 @@ impl ApplicationHandler for App {
             gui::update_skip_shell_menu(self.skip_shell);
             gui::update_nvram_mode_menu(self.nvram_mode);
             gui::update_dvc_menu(self.m.bus.dvc.is_fitted());
+            gui::update_bios_menu(self.library_search.active_bios.as_ref().map_or("",|(model,_)|model.as_str()));
         }
         let now = Instant::now();
         self.run_at = now;
@@ -3477,6 +3578,9 @@ impl ApplicationHandler for App {
             WindowEvent::Focused(f) => {
                 self.focused = f;
                 if !f {
+                    self.physical_mouse_buttons = 0;
+                    self.input_arbiter = Default::default();
+                    self.mouse_activity = false;
                     self.keys.clear();
                     self.mouse_left = false;
                     self.mouse_right = false;
@@ -3529,6 +3633,9 @@ impl ApplicationHandler for App {
     }
 
     fn device_event(&mut self, _el: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
+        if let DeviceEvent::MouseMotion { delta: (dx,dy) } = &event {
+            if self.focused && self.host_input && (*dx != 0.0 || *dy != 0.0) { self.mouse_activity = true; }
+        }
         // Relative motion in host pixels, scaled like the letterboxed picture
         if let (DeviceEvent::MouseMotion { delta: (dx, dy) }, Some((x, y))) = (event, self.rel_pointer) {
             let (_, _, w, h) = self.image_rect;
@@ -3552,8 +3659,11 @@ impl ApplicationHandler for App {
                 return;
             }
         }
+        let seconds=self.rtc_last.elapsed().as_secs();
+        if seconds>0 {opencdi::rtc::advance(&mut self.m.bus,seconds);self.rtc_last+=Duration::from_secs(seconds);}
         self.update_library(Instant::now());
-        let ff = self.host_input && self.focused && self.key(Key::Space) && !self.bound(Key::Space);
+        let boot_fast = self.boot_accelerating();
+        let ff = boot_fast || (self.host_input && self.focused && self.key(Key::Space) && !self.bound(Key::Space));
         if ff != self.fast_forward {
             self.fast_forward = ff;
             info!("Fast-forward: {}", if ff { "ON" } else { "OFF" });
@@ -3570,9 +3680,19 @@ impl ApplicationHandler for App {
                 std::hint::spin_loop();
             }
         }
+        let burst_started = Instant::now();
         if !self.tick() {
             el.exit();
             return;
+        }
+        if boot_fast {
+            // Windows presentation may wait for the monitor refresh. Run a short
+            // batch between paints rather than limiting boot to one emulated frame
+            // per presentation. Recheck the handover before every additional frame.
+            for _ in 0..7 {
+                if !self.boot_accelerating() || burst_started.elapsed() >= Duration::from_millis(12) { break; }
+                if !self.tick() { el.exit(); return; }
+            }
         }
         if ff {
             // Uncapped: next frame as soon as pending events are handled
@@ -3596,6 +3716,88 @@ impl ApplicationHandler for App {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "Writes the matching screen previews; requires OPENCDI_THEME_PREVIEWS"]
+    fn render_matching_theme_previews() {
+        let folder=PathBuf::from(std::env::var("OPENCDI_THEME_PREVIEWS").unwrap());
+        std::fs::create_dir_all(&folder).unwrap();
+        let save=|name:&str,pixels:&[u32]| {
+            let bytes:Vec<_>=pixels.iter().flat_map(|p| [((p>>16)&255) as u8,((p>>8)&255) as u8,(p&255) as u8]).collect();
+            let mut encoder=png::Encoder::new(std::fs::File::create(folder.join(name)).unwrap(),1920,1080);
+            encoder.set_color(png::ColorType::Rgb);encoder.set_depth(png::BitDepth::Eight);
+            encoder.write_header().unwrap().write_image_data(&bytes).unwrap();
+        };
+        let gamepad=controller_config::load_controller_art().unwrap();
+        let mouse=controller_config::load_mouse_art().unwrap();
+        let gun=controller_config::load_peacekeeper_art().unwrap();
+        let bindings=KeyBindings::new();let shortcuts=UiShortcuts::default();
+        for (name,mode) in [("controller-gamepad.png",InputDeviceMode::Gamepad),("controller-mouse.png",InputDeviceMode::Mouse),("controller-peacekeeper.png",InputDeviceMode::Peacekeeper)] {
+            let mut pixels=vec![0;1920*1080];
+            controller_config::render_native(&mut pixels,1920,1080,(0,0,1920,1080),&bindings,&shortcuts,mode,&controller_config::State::default(),Some(&gamepad),Some(&mouse),Some(&gun),None,"",None,wiimote::ControlMode::Pointer);
+            save(name,&pixels);
+        }
+        let mut pixels=vec![0xFF152637;1920*1080];
+        library::render_pause_menu_full(&mut pixels,1920,1080,"Mad Dog McCree (USA, Europe)",None,0);
+        save("pause-menu.png",&pixels);
+        let mut search=library::Search::default();
+        let items=vec![library::Item{path:PathBuf::from("Mad Dog McCree (USA, Europe).chd"),title:"Mad Dog McCree (USA, Europe)".into(),cover:None,disc:None,logo:None}];
+        search.collection.refresh(&items);
+        library::render_native(&mut pixels,1920,1080,(0,0,1920,1080),&items,0,shortcuts.artwork_size,true,DisplayMode::Windowed,None,Some('V'),&search,None);
+        save("category-tabs.png",&pixels);
+        search.active_bios=Some(("Philips CD-i 490".into(),"cdi490a.rom".into()));
+        library::render_native(&mut pixels,1920,1080,(0,0,1920,1080),&items,0,shortcuts.artwork_size,true,DisplayMode::Windowed,Some(library::ToolbarPopup::Settings),Some('V'),&search,None);
+        save("settings-bios.png",&pixels);
+        pixels.fill(0xFF080E17);
+        library::render_preview_actions(&mut pixels,1920,1080,(0,0,1920,1080));
+        save("disc-actions.png",&pixels);
+        if let (Ok(path),Ok(root))=(std::env::var("OPENCDI_PREVIEW_DISC"),std::env::var("OPENCDI_PREVIEW_ART")) {
+            let path=PathBuf::from(path);let root=PathBuf::from(root);
+            let details=library::DiscDetails::load(&path,&root);
+            let disc=library::load_disc_artwork(&path,&root.join("CD"));
+            let synopsis=synopsis::load(&root.parent().unwrap_or(&root).join("Synopses"),&path);
+            let mut scene=library::BootScene::default();
+            scene.render(&mut pixels,1920,1080,(0,0,1920,1080),"The 7th Guest",&details,synopsis.as_deref(),true,disc.as_ref(),0);
+            save("disc-info.png",&pixels);
+            scene.render(&mut pixels,1920,1080,(0,0,1920,1080),"The 7th Guest",&details,synopsis.as_deref(),false,disc.as_ref(),30);
+            save("disc-info-loading.png",&pixels);
+        }
+
+    }
+    #[test]
+    fn readable_nvram_names_are_separate_and_preserve_old_saves() {
+        let root=std::env::temp_dir().join(format!("opencdi-nvram-split-{}",std::process::id()));
+        let global=root.join("nvram.bin");let disc=root.join("Joker's Wild! Jr., The (USA).chd");
+        let old=legacy_per_disc_nvram_save_path(&global,&disc);std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        let bytes=vec![0x42;8192];std::fs::write(&old,&bytes).unwrap();
+        let first=per_disc_nvram_save_path(&global,&disc,"220");let second=per_disc_nvram_save_path(&global,&disc,"490");
+        assert_eq!(first,root.join("NVRAM/220/Joker's Wild! Jr., The (USA).bin"));
+        assert_eq!(second,root.join("NVRAM/490/Joker's Wild! Jr., The (USA).bin"));
+        assert_eq!(std::fs::read(&first).unwrap(),bytes);assert_eq!(std::fs::read(&old).unwrap(),bytes);assert!(!second.exists());
+        std::fs::write(&first,vec![0x77;8192]).unwrap();assert_eq!(per_disc_nvram_save_path(&global,&disc,"220"),first);assert_eq!(std::fs::read(first).unwrap(),vec![0x77;8192]);
+        // A shared 32 KB save must be imported only into the 490 folder.
+        std::fs::write(&old,vec![0x33;32768]).unwrap();assert_eq!(std::fs::read(per_disc_nvram_save_path(&global,&disc,"490")).unwrap(),vec![0x33;32768]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn save_state_folders_do_not_collide_between_bioses(){
+        let a=savestate_path_for("Test Game",1,"220");let b=savestate_path_for("Test Game",1,"490");
+        assert_ne!(a,b);assert_eq!(a.file_name(),b.file_name());assert!(a.parent().unwrap().ends_with("Savestates/220"));assert!(b.parent().unwrap().ends_with("Savestates/490"));
+    }
+    #[test]
+    #[ignore = "Measures local library decoding; requires OPENCDI_BENCH_DISCS and OPENCDI_BENCH_ART"]
+    fn profile_library_loading() {
+        let root = PathBuf::from(std::env::var("OPENCDI_BENCH_DISCS").unwrap());
+        let art = PathBuf::from(std::env::var("OPENCDI_BENCH_ART").unwrap());
+        let started = Instant::now();
+        let paths = library::scan_paths(&[root]);
+        println!("Titles: {} in {:?}", paths.len(), started.elapsed());
+        let page_started = Instant::now();
+        let page = library::load_items(paths.iter().take(24).cloned().collect(), &art.join("Covers"), &art.join("CD"), &art);
+        println!("First artwork page: {} in {:?}", page.len(), page_started.elapsed());
+        let remaining = Instant::now();
+        let rest = library::load_items(paths.into_iter().skip(24).collect(), &art.join("Covers"), &art.join("CD"), &art);
+        println!("Remaining artwork: {} in {:?}; total {:?}", rest.len(), remaining.elapsed(), started.elapsed());
+    }
     #[test]
     fn autoplay_does_not_release_input_while_the_shell_is_still_active() {
         // Observed with the saved Mad Dog McCree setup: DVC code is executing,

@@ -20,6 +20,13 @@ fn find_in_path(file_name: &str) -> Option<PathBuf> {
 }
 
 fn main() {
+    // Cargo reruns when source changes; timestamp distinguishes rebuilds of the same release.
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    let stamp=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let revision=Command::new("git").args(["rev-parse","--short","HEAD"]).output().ok().filter(|o|o.status.success()).map(|o|String::from_utf8_lossy(&o.stdout).trim().to_owned()).unwrap_or_else(||"source".into());
+    println!("cargo:rustc-env=OPENCDI_BUILD_ID={revision}-{stamp}");
+    println!("cargo:rerun-if-env-changed=OPENCDI_RELEASE_COMMIT");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=icon.ico");
 

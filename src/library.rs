@@ -13,19 +13,21 @@ pub const TOOLBAR_HEIGHT: usize = 42;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ToolbarPopup { Settings, About }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ToolbarAction { OpenDisc, PlayDisc(char), Controller, Settings, About, Exit, AddDiscFolder, SwitchBios, Borderless, Decorated, Windowed }
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ToolbarAction { OpenDisc, PlayDisc(char), Controller, Start220, Start490, Settings, About, Exit, AddDiscFolder, Bios220, Bios490, Borderless, Decorated, Windowed }
 
-const SETTINGS_X: usize = 229;
+const SETTINGS_X: usize = 539;
 const SETTINGS_Y: usize = TOOLBAR_HEIGHT + 4;
 const SETTINGS_WIDTH: usize = 215;
 const SETTINGS_ROW: usize = 22;
-const SETTINGS_ITEMS: [(&str, ToolbarAction); 5] = [
+const SETTINGS_HEADER: usize = 0;
+const SETTINGS_ITEMS: [(&str, ToolbarAction); 6] = [
     ("Borderless Fullscreen", ToolbarAction::Borderless),
     ("Decorated Fullscreen", ToolbarAction::Decorated),
     ("Windowed", ToolbarAction::Windowed),
     ("Add Disc Folder…", ToolbarAction::AddDiscFolder),
-    ("Switch BIOS…", ToolbarAction::SwitchBios),
+    ("BIOS 220", ToolbarAction::Bios220),
+    ("BIOS 490", ToolbarAction::Bios490),
 ];
 
 #[derive(Clone, Copy)]
@@ -76,6 +78,68 @@ pub struct NativeCanvas<'a> {
 struct NativeLabel { x: usize, y: usize, value: String, color: u32, scale: usize, bounds: Option<(usize, usize)>, centered: bool }
 
 impl<'a> NativeCanvas<'a> {
+    pub(crate) fn surface(&mut self, x:usize,y:usize,w:usize,h:usize,r:usize,top:u32,bottom:u32,border:u32) {
+        let (left,upper,right,lower) = (self.x(x),self.y(y),self.x(x+w).min(self.width),self.y(y+h).min(self.height));
+        if right <= left || lower <= upper { return; }
+        let (hw,hh)=((right-left) as f32/2.0,(lower-upper) as f32/2.0);
+        let radius=(r as f32*self.view.2 as f32/W as f32).min(hw).min(hh);
+        for py in upper..lower {
+            let t=(py-upper) as f32/(lower-upper) as f32;
+            let mut color=0xFF000000;
+            for shift in [16,8,0] {
+                let a=((top>>shift)&255) as f32; let b=((bottom>>shift)&255) as f32;
+                let texture=if py%3==0 {1.0} else {0.0};
+                color|=((a+(b-a)*t+texture).clamp(0.0,255.0) as u32)<<shift;
+            }
+            for px in left..right {
+                let qx=((px-left) as f32+0.5-hw).abs()-(hw-radius);
+                let qy=((py-upper) as f32+0.5-hh).abs()-(hh-radius);
+                let outer=if qx>0.0 && qy>0.0 {qx.hypot(qy)}else{qx.max(qy).max(0.0)};
+                let distance=outer+qx.max(qy).min(0.0)-radius;
+                let alpha=((0.5-distance).clamp(0.0,1.0)*255.0) as u32;
+                if alpha==0 {continue;}
+                let paint=if distance > -1.0 {border}else{color};
+                let at=py*self.width+px;
+                self.dst[at]=if alpha==255 {paint}else{blend(paint,self.dst[at],alpha)};
+            }
+        }
+    }
+
+    pub(crate) fn icon(&mut self, kind:u8,x:usize,y:usize,size:usize,color:u32) {
+        let mut lines:Vec<(f32,f32,f32,f32)>=Vec::new();
+        let mut circles:Vec<(f32,f32,f32)>=Vec::new();
+        match kind {
+            0=>lines.extend([(2.,6.,2.,17.),(2.,17.,17.,17.),(17.,17.,19.,8.),(19.,8.,5.,8.),(5.,8.,2.,17.),(2.,6.,2.,4.),(2.,4.,8.,4.),(8.,4.,10.,6.),(10.,6.,17.,6.)]),
+            1=>{lines.extend([(5.,5.,15.,5.),(15.,5.,17.,7.),(17.,7.,19.,15.),(19.,15.,16.,16.),(16.,16.,13.,12.),(13.,12.,7.,12.),(7.,12.,4.,16.),(4.,16.,1.,15.),(1.,15.,3.,7.),(3.,7.,5.,5.),(5.,7.,5.,11.),(3.,9.,7.,9.)]);circles.extend([(13.,8.,0.7),(16.,10.,0.7)]);}
+            2=>{circles.extend([(10.,10.,6.),(10.,10.,2.3)]);for i in 0..8 {let a=i as f32*std::f32::consts::TAU/8.;let(s,c)=a.sin_cos();lines.push((10.+c*6.,10.+s*6.,10.+c*9.,10.+s*9.));}}
+            3=>{circles.extend([(10.,10.,8.),(10.,6.,0.6)]);lines.extend([(10.,9.,10.,14.)]);}
+            4=>{circles.extend([(10.,10.,8.),(10.,10.,1.7)]);lines.extend([(12.,4.,16.,8.),(4.,12.,8.,16.)]);}
+            5=>{circles.push((10.,11.,7.));lines.push((10.,2.,10.,10.));}
+            6=>{circles.push((8.,8.,5.));lines.push((12.,12.,18.,18.));}
+            7|8=>{for (a,b) in [(3.,3.),(12.,3.),(3.,12.),(12.,12.)]{lines.extend([(a,b,a+5.,b),(a+5.,b,a+5.,b+5.),(a+5.,b+5.,a,b+5.),(a,b+5.,a,b)]);}}
+            9=>{lines.extend([(3.,3.,17.,3.),(17.,3.,17.,17.),(17.,17.,3.,17.),(3.,17.,3.,3.),(4.,14.,8.,10.),(8.,10.,12.,14.),(12.,14.,15.,11.),(15.,11.,17.,13.)]);circles.push((12.,7.,1.4));}
+            10=>{lines.extend([(8.,15.,8.,4.),(8.,4.,17.,2.),(17.,2.,17.,13.),(8.,7.,17.,5.)]);circles.extend([(5.,15.,2.5),(14.,14.,2.5)]);}
+            11=>lines.extend([(2.,4.,18.,4.),(18.,4.,18.,17.),(18.,17.,2.,17.),(2.,17.,2.,4.),(2.,8.,18.,8.),(7.,4.,5.,8.),(13.,4.,11.,8.),(8.,10.,8.,15.),(8.,15.,13.,12.5),(13.,12.5,8.,10.)]),
+            12=>lines.extend([(6.,5.,1.,10.),(1.,10.,6.,15.),(14.,5.,19.,10.),(19.,10.,14.,15.),(12.,3.,8.,17.)]),
+            14=>lines.extend([(3.,2.,14.,2.),(14.,2.,18.,6.),(18.,6.,18.,18.),(18.,18.,3.,18.),(3.,18.,3.,2.),(6.,2.,6.,8.),(6.,8.,14.,8.),(14.,8.,14.,2.),(6.,18.,6.,12.),(6.,12.,15.,12.),(15.,12.,15.,18.)]),
+            15=>lines.extend([(3.,8.,3.,18.),(3.,18.,17.,18.),(17.,18.,17.,8.),(10.,14.,10.,2.),(10.,2.,5.,7.),(10.,2.,15.,7.)]),
+            16=>lines.extend([(10.,3.,3.,10.),(3.,10.,10.,17.),(3.,10.,18.,10.)]),
+            17=>lines.extend([(5.,3.,17.,10.),(17.,10.,5.,17.),(5.,17.,5.,3.)]),
+            18=>{circles.extend([(10.,10.,6.),(10.,10.,1.5)]);lines.extend([(10.,0.,10.,5.),(10.,15.,10.,20.),(0.,10.,5.,10.),(15.,10.,20.,10.)]);}
+            19=>lines.extend([(6.,2.,14.,2.),(14.,2.,17.,5.),(17.,5.,17.,15.),(17.,15.,14.,18.),(14.,18.,6.,18.),(6.,18.,3.,15.),(3.,15.,3.,5.),(3.,5.,6.,2.),(10.,4.,10.,8.),(3.,10.,17.,10.)]),
+            _=>{circles.push((10.,6.,3.));lines.extend([(3.,18.,10.,10.),(10.,10.,17.,18.),(17.,18.,3.,18.)]);}
+        }
+        let (left,upper,right,lower)=(self.x(x),self.y(y),self.x(x+size).min(self.width),self.y(y+size).min(self.height));
+        let scale=(right-left).max(1) as f32/20.;
+        for py in upper..lower {for px in left..right {
+            let u=(px-left) as f32/scale;let v=(py-upper) as f32/((lower-upper).max(1) as f32/20.);
+            let mut distance=f32::INFINITY;
+            for &(ax,ay,bx,by) in &lines {let dx=bx-ax;let dy=by-ay;let t=(((u-ax)*dx+(v-ay)*dy)/(dx*dx+dy*dy)).clamp(0.,1.);distance=distance.min((u-ax-t*dx).hypot(v-ay-t*dy));}
+            for &(cx,cy,r) in &circles {if kind==5 && v<6. {continue;}distance=distance.min(((u-cx).hypot(v-cy)-r).abs());}
+            let alpha=((0.8-distance)*scale+0.5).clamp(0.,1.);
+            if alpha>0. {let at=py*self.width+px;self.dst[at]=blend(color,self.dst[at],(alpha*255.) as u32);}
+        }}
+    }
     pub fn new(dst: &'a mut [u32], width: usize, height: usize, view: (usize, usize, usize, usize)) -> Self {
         let len=width.saturating_mul(height).min(dst.len());
         dst[..len].fill(0xFF080E17);
@@ -92,7 +156,7 @@ impl<'a> NativeCanvas<'a> {
     pub fn text(&mut self, x: usize, y: usize, value: &str, color: u32, scale: usize) {
         self.labels.push(NativeLabel { x, y, value: value.chars().take(96).collect(), color, scale, bounds: None, centered: false });
     }
-    fn centered_text(&mut self, x: usize, y: usize, value: &str, color: u32, scale: usize) {
+    pub(crate) fn centered_text(&mut self, x: usize, y: usize, value: &str, color: u32, scale: usize) {
         self.text(x, y, value, color, scale);
         if let Some(label) = self.labels.last_mut() { label.centered = true; }
     }
@@ -238,6 +302,7 @@ fn draw_labels_gdi(c:&mut NativeCanvas<'_>){
         let face:Vec<u16>="Segoe UI".encode_utf16().chain(std::iter::once(0)).collect();
         let mut fonts:Vec<(usize,*mut std::ffi::c_void)>=Vec::new();
         for label in &c.labels {
+            if label.value.is_empty() { continue; }
             let scale=label.scale.clamp(1,4);
             let font=if let Some((_,f))=fonts.iter().find(|(s,_)|*s==scale){*f}else{
                 let px=(9.0*scale as f32*c.view.3 as f32/H as f32).round().max(12.0) as i32;
@@ -301,12 +366,31 @@ pub fn load_items(paths: Vec<PathBuf>, covers_root: &Path, cd_root: &Path, artwo
     }).collect()
 }
 
+pub fn migrate_artwork_names(paths: &[PathBuf], root: &Path) {
+    for disc in paths {
+        let title = disc_title(disc);
+        let name = crate::launchbox::safe_name(&title);
+        let mut changes = vec![(crate::boxart::legacy_generated_path(root, &title), crate::boxart::generated_path(root, &title))];
+        for extension in ["png", "jpg", "jpeg"] {
+            changes.push((root.join("CD").join(format!("{name}-disc.{extension}")), root.join("CD").join(format!("{name}.{extension}"))));
+        }
+        for (old, new) in changes {
+            if !new.exists() && old.is_file() {
+                if let Err(error) = std::fs::rename(&old, &new) { log::debug!("Cannot rename artwork {old:?}: {error}"); }
+            }
+        }
+    }
+}
+
 pub fn managed_art_path(disc: &Path, root: &Path, kind: crate::launchbox::ArtworkKind) -> Option<PathBuf> {
     let folder = root.join(kind.folder());
     let title = disc_title(disc);
     if kind == crate::launchbox::ArtworkKind::Boxart {
         let path = crate::boxart::generated_path(root, &title);
-        return path.is_file().then_some(path);
+        return path.is_file().then_some(path).or_else(|| {
+            let old = crate::boxart::legacy_generated_path(root, &title);
+            old.is_file().then_some(old)
+        });
     }
     if let Some(path) = crate::screenscraper::preferred_gallery_image(&folder, kind, &title) { return Some(path); }
     let stem = disc.file_stem()?.to_string_lossy();
@@ -315,11 +399,54 @@ pub fn managed_art_path(disc: &Path, root: &Path, kind: crate::launchbox::Artwor
     }).find(|path| path.is_file())
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct DiscDetails {
     pub logo: Option<Artwork>,
     pub boxart: Option<Artwork>,
     pub back: Option<Artwork>,
+}
+
+#[derive(Default)]
+pub struct BootScene {
+    pixels: Vec<u32>,
+    size: (usize, usize),
+    view: (usize, usize, usize, usize),
+    title: String,
+    synopsis: Option<String>,
+    details: DiscDetails,
+    preview: bool,
+}
+
+impl BootScene {
+    pub fn render(&mut self, dst: &mut [u32], width: usize, height: usize,
+        view: (usize, usize, usize, usize), title: &str, details: &DiscDetails,
+        synopsis: Option<&str>, preview: bool, disc: Option<&Artwork>, frame: u64) {
+        let same = |a: &Option<Artwork>, b: &Option<Artwork>| match (a, b) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.w == b.w && a.h == b.h && Arc::ptr_eq(&a.pixels, &b.pixels),
+            _ => false,
+        };
+        if self.size != (width, height) || self.view != view || self.title != title
+            || self.synopsis.as_deref() != synopsis || self.preview != preview
+            || !same(&self.details.logo, &details.logo) || !same(&self.details.boxart, &details.boxart)
+            || !same(&self.details.back, &details.back) {
+            self.pixels.resize(width * height, 0);
+            self.pixels.fill(0xFF0B1523);
+            render_boot_details(&mut self.pixels, width, height, view, title, details, synopsis);
+            if preview { render_preview_actions(&mut self.pixels, width, height, view); }
+            self.size = (width, height);
+            self.view = view;
+            self.title = title.to_owned();
+            self.synopsis = synopsis.map(str::to_owned);
+            self.details = details.clone();
+            self.preview = preview;
+        }
+        dst.copy_from_slice(&self.pixels);
+        let cx = view.0 + 520 * view.2 / W;
+        let cy = view.1 + 398 * view.3 / H;
+        let size = (176 * view.2 / W).min(176 * view.3 / H).max(1);
+        blit_rotated_into(dst, width, height, disc.unwrap_or(&MISSING_DISC), cx as i32, cy as i32, size as i32, frame as f32 * 0.055);
+    }
 }
 
 impl DiscDetails {
@@ -475,7 +602,7 @@ pub fn render(dst: &mut [u32], items: &[Item], selected: usize, art_size: u8) {
     render_size_slider(dst, art_size);
     if items.is_empty() {
         text(dst, 205, 210, "NO DISC IMAGES FOUND", 0xFFFFD27A, 2);
-        text(dst, 135, 250, "ADD A DISC FOLDER FROM PATHS TO BEGIN", 0xFFE1E5ED, 1);
+        text(dst, 135, 250, "ADD A DISC FOLDER FROM SETTINGS TO BEGIN", 0xFFE1E5ED, 1);
         text(dst, 180, 330, "PRESS CTRL O TO BROWSE FOR A DISC", 0xFF90A4B8, 1);
     } else {
         let layout = layout(art_size);
@@ -501,13 +628,15 @@ pub fn render(dst: &mut [u32], items: &[Item], selected: usize, art_size: u8) {
         }
         let pages = (items.len() + per_page - 1) / per_page;
         text(dst, 23, 512, "ARROWS OR GAMEPAD D PAD / STICK: MOVE     ENTER / A: PLAY", 0xFFD5DCE7, 1);
-        text(dst, 23, 530, "MOUSE: SELECT / DOUBLE CLICK: DETAILS     WHEEL: SCROLL     ESC: QUIT", 0xFFD5DCE7, 1);
+        text(dst, 23, 530, "LEFT CLICK: DETAILS     WHEEL: SCROLL     ESC: QUIT", 0xFFD5DCE7, 1);
         text(dst, 717, 544, &format!("{}/{}", selected / per_page + 1, pages), 0xFFFFD98A, 1);
     }
 }
 
 #[derive(Default)]
 pub struct Search {
+    pub active_bios: Option<(String,String)>,
+    pub pointer: Option<(i32, i32)>,
     pub query: String,
     pub focused: bool,
     pub caret: usize,
@@ -651,11 +780,9 @@ pub fn render_native(dst: &mut [u32], width: usize, height: usize, view: (usize,
     let mut c=NativeCanvas::new(dst,width,height,view);
     for y in 0..H { let t=y as u32*10/H as u32; let color=0xFF000000|((10+t)<<16)|((20+t)<<8)|(34+t*2); c.rect(0,y,W,1,color); }
     c.round_rect(12,43,W-24,32,8,0xFF101D2C);
-    c.text(25,48,"CD-I LIBRARY",0xFFF1F5FA,2);
-    if search.focused { c.round_rect(454,44,257,30,8,0xFF59B2F5); }
-    c.round_rect(455,45,255,28,8,0xFF1A293B);
-    c.ring(472,58,5,0xFF91A9C2);
-    c.line(476,62,6,0xFF91A9C2);
+    c.text(25,48,"CD-i Library",0xFFF1F5FA,2);
+    c.surface(455,45,255,28,8,0xFF1D2D41,0xFF172537,if search.focused{0xFF62C1FF}else{0xFF344A62});
+    c.icon(6,465,51,14,0xFFAAC3DD);
     if search.query.is_empty() {
         c.text(486,53,"Search library...",0xFFA3B6CB,1);
     } else {
@@ -672,12 +799,14 @@ pub fn render_native(dst: &mut [u32], width: usize, height: usize, view: (usize,
     for (index, category) in Category::TABS.into_iter().enumerate() {
         let x = TAB_LEFT as usize + index * TAB_WIDTH as usize;
         let active = category == search.collection.category;
-        if active {
-            c.round_rect(x + 1, TAB_TOP as usize, TAB_WIDTH as usize - 2, TAB_HEIGHT as usize, 5, 0xFF223B56);
-            c.rect(x + 3, 101, TAB_WIDTH as usize - 6, 2, 0xFF62B7F8);
+        let hover=search.pointer.is_some_and(|(px,py)| category_hit(px,py)==Some(category));
+        if active || hover {
+            c.surface(x+1,TAB_TOP as usize,TAB_WIDTH as usize-2,TAB_HEIGHT as usize,7,
+                if active{0xFF2A4863}else{0xFF22394E},if active{0xFF203A53}else{0xFF192B3D},
+                if active{0xFF64BFF9}else{0xFF36526D});
         }
-        c.centered_text(x + TAB_WIDTH as usize / 2, 82, category.label(),
-            if active { 0xFFE6F4FF } else { 0xFFB9C9DB }, 1);
+        c.icon([7,1,8,9,10,11,12,13][index],x+8,82,12,if active{0xFFAEE0FF}else{0xFFA5BDD5});
+        c.centered_text(x+TAB_WIDTH as usize/2+7,84,category.label(),if active{0xFFE6F4FF}else{0xFFB9C9DB},1);
     }
     c.rect(0,H-100,W,100,0xFF0D1725);
     c.rect(0,H-100,W,1,0xFF26374A);
@@ -704,11 +833,11 @@ pub fn render_native(dst: &mut [u32], width: usize, height: usize, view: (usize,
     c.centered_text(615, H - 85, &collection_count, 0xFFE6F4FF, 1);
     c.text(18,H-48,"ARTWORK SIZE",0xFFB7C5D4,1);
     let track_x=125; let track_w=145; let track_y=H-35;
-    c.round_rect(track_x,track_y,track_w,4,2,0xFF33465A);
+    c.surface(track_x,track_y,track_w,4,2,0xFF24394D,0xFF182737,0xFF304357);
     let value=art_size.clamp(ART_SIZE_MIN,ART_SIZE_MAX);
     let filled=(value-ART_SIZE_MIN) as usize*track_w/(ART_SIZE_MAX-ART_SIZE_MIN) as usize;
-    c.round_rect(track_x,track_y,filled,4,2,0xFF57AEF5);
-    c.round_rect(track_x+filled.saturating_sub(5),track_y.saturating_sub(5),12,14,6,0xFFF4F7FB);
+    if filled>0 {c.surface(track_x,track_y,filled,4,2,0xFF8AD4FF,0xFF439BD4,0xFF62B9F0);}
+    c.surface(track_x+filled-5,track_y.saturating_sub(4),11,12,6,0xFFDDF2FF,0xFF79B9E3,0xFFA6DBFF);
     let l = layout(value);
     c.text(282,H-42,&format!("{} × {}", l.columns, l.rows),0xFFD5DFEA,1);
     let count = search.len(items);
@@ -725,7 +854,7 @@ pub fn render_native(dst: &mut [u32], width: usize, height: usize, view: (usize,
         c.centered_text(W / 2, 242, "No discs in this category", 0xFFF1F5FA, 2);
     } else if count == 0 {
         c.text(205,210,"NO DISC IMAGES FOUND",0xFFF1F5FA,2);
-        c.text(135,250,"ADD A DISC FOLDER FROM PATHS TO BEGIN",0xFF9AAFC4,1);
+        c.text(135,250,"ADD A DISC FOLDER FROM SETTINGS TO BEGIN",0xFF9AAFC4,1);
         c.text(180,290,"OR CHOOSE OPEN DISC",0xFF78BDF5,1);
     } else {
         let page_start=(selected/per_page)*per_page;
@@ -750,14 +879,14 @@ pub fn render_native(dst: &mut [u32], width: usize, height: usize, view: (usize,
             if active { c.round_rect(x+3,y+l.cell_h-4,l.cell_w.saturating_sub(6),2,1,0xFF56B1F7); }
         }
         let pages=count.div_ceil(per_page);
-        c.text(18,H-18,"MOUSE: SELECT  ·  DOUBLE CLICK: DETAILS    D-PAD / STICK: MOVE",0xFF778DA5,1);
+        c.text(18,H-18,"LEFT CLICK: DISC DETAILS    D-PAD / STICK: MOVE",0xFF778DA5,1);
         c.text(686,H-18,&format!("{}/{}",selected/per_page+1,pages),0xFFB7C5D4,1);
     }
     if let Some(offset) = search.collection.missing_offset {
         render_missing(&mut c, &search.collection, offset);
     }
     // Draw popovers over the grid so they remain legible when they extend below the toolbar.
-    if toolbar_visible { render_toolbar_native(&mut c,mode,popup,optical_disc); }
+    if toolbar_visible { render_toolbar_native(&mut c,mode,popup,optical_disc,search.pointer,search.active_bios.as_ref().map(|(model,file)| (model.as_str(),file.as_str()))); }
 }
 
 fn short_title(title: &str, width: usize) -> String {
@@ -773,37 +902,51 @@ fn wrap_title(title: &str, width: usize) -> (String, String) {
     (title[..split].to_owned(), short_title(title[split..].trim_start(), width))
 }
 
-fn render_toolbar_native(c:&mut NativeCanvas<'_>,mode:DisplayMode,popup:Option<ToolbarPopup>, optical_disc: Option<char>){
-    c.rect(0,0,W,TOOLBAR_HEIGHT,0xFF0C1726); c.rect(0,TOOLBAR_HEIGHT-1,W,1,0xFF26374A);
-    let buttons=[(0,12,100,"Open Disc"),(1,116,108,"Controller"),(3,229,109,"Settings"),(4,344,112,"About"),(5,676,80,"Exit")];
-    for &(i,x,w,label) in &buttons {
-        let active=matches!((i,popup),(3,Some(ToolbarPopup::Settings))|(4,Some(ToolbarPopup::About)));
-        if active { c.round_rect(x,5,w,31,7,0xFF1B2D42); }
-        let cx=x+13;let cy=15;let color=if i==5{0xFFFF7777}else{0xFFB6C7DA};
-        match i {
-            0=>{c.round_rect(cx-7,cy-5,14,11,3,0xFF334B65);c.rect(cx-5,cy-1,10,5,0xFF0C1726);c.rect(cx-4,cy-5,6,3,0xFF334B65);}
-            1=>{c.round_rect(cx-8,cy-5,16,11,4,0xFF344D67);c.rect(cx-5,cy-1,3,2,0xFF0C1726);c.rect(cx+3,cy-1,3,2,0xFF0C1726);c.rect(cx-1,cy+2,3,2,0xFF0C1726);}
-            3=>{c.ring(cx,cy,7,color);c.ring(cx,cy,3,color);for(dx,dy)in[(0,-10),(0,8),(-10,0),(8,0)]{c.rect((cx as isize+dx)as usize,(cy as isize+dy)as usize,2,2,color);}}
-            4=>{c.ring(cx,cy,8,color);c.rect(cx-1,cy-4,2,2,color);c.rect(cx-1,cy,2,5,color);}
-            _=>{c.rect(cx-1,cy-8,3,12,color);c.rect(cx+2,cy+2,6,3,color);c.rect(cx+7,cy+4,2,4,color);}
-        }
-        c.text(x+31,14,label,if i==5{0xFFFF808A}else{0xFFE0E8F1},1);
-        if i!=5 { c.rect(x+w,11,1,18,0xFF213247); }
-    }
-    if let Some(letter) = optical_disc {
-        c.round_rect(550, 5, 115, 31, 7, 0xFF1B2D42);
-        c.ring(563, 17, 7, 0xFFB6C7DA);
-        c.ring(563, 17, 2, 0xFFB6C7DA);
-        c.text(577, 14, &format!("Play Disc ({letter}:)"), 0xFFE0E8F1, 1);
+fn dock_buttons(optical: Option<char>) -> Vec<(ToolbarAction, usize, usize, &'static str, u8)> {
+    let mut buttons = Vec::new();
+    let mut x = 20;
+    if let Some(letter) = optical { buttons.push((ToolbarAction::PlayDisc(letter), x, 70, "Play Disc", 4)); x += 74; }
+    buttons.push((ToolbarAction::OpenDisc, x, 76, "Open Disc", 0));
+    buttons.push((ToolbarAction::Controller, x + 80, 80, "Controller", 1));
+    buttons.push((ToolbarAction::Start220, 286, 78, "Start 220", 5));
+    buttons.push((ToolbarAction::Start490, 370, 78, "Start 490", 5));
+    buttons.extend([(ToolbarAction::Settings, 564, 65, "Settings", 2),
+        (ToolbarAction::About, 633, 58, "About", 3), (ToolbarAction::Exit, 695, 59, "Exit", 5)]);
+    buttons
+}
+
+fn render_toolbar_native(c:&mut NativeCanvas<'_>,mode:DisplayMode,popup:Option<ToolbarPopup>, optical_disc: Option<char>, pointer: Option<(i32,i32)>, bios: Option<(&str,&str)>){
+    c.rect(0,0,W,TOOLBAR_HEIGHT,0xFF0C1726);
+    c.line(0,TOOLBAR_HEIGHT-1,W,0xFF26374A);
+    c.surface(14,3,if optical_disc.is_some(){250}else{176},36,10,0xFF1D2E42,0xFF142235,0xFF304459);
+    c.surface(558,3,202,36,10,0xFF1D2E42,0xFF142235,0xFF304459);
+    c.surface(280,3,174,36,10,0xFF1D2E42,0xFF142235,0xFF405D78);
+    let hovered=pointer.and_then(|(x,y)| if x>=0 && y>=0 { toolbar_hit(x as usize,y as usize,popup,optical_disc) } else {None});
+    for (action,x,w,label,icon) in dock_buttons(optical_disc) {
+        let active=matches!((action,popup),(ToolbarAction::Settings,Some(ToolbarPopup::Settings))|(ToolbarAction::About,Some(ToolbarPopup::About)));
+        let focus=active || hovered==Some(action);
+        let exit=action==ToolbarAction::Exit;
+        let (top,bottom,border)=if focus {
+            if exit {(0xFF50313F,0xFF382632,0xFFF19CAA)} else {(0xFF2D4A64,0xFF233C54,0xFF62C1FF)}
+        } else {(0xFF203247,0xFF18283B,0xFF2D435B)};
+        if !exit || focus { c.surface(x,5,w,32,7,top,bottom,border); }
+        c.icon(icon,x+w/2-7,8,14,if focus{0xFFA9DEFF}else{0xFFB0C4D9});
+        c.centered_text(x+w/2,25,label,if exit && focus{0xFFFFCAD4}else{0xFFE2ECF6},1);
     }
     let _=mode;
     match popup {
         Some(ToolbarPopup::Settings) => {
             // Paint any queued grid text before the opaque menu covers it.
             c.flush_labels();
-            c.round_rect(SETTINGS_X, SETTINGS_Y, SETTINGS_WIDTH, SETTINGS_ITEMS.len() * SETTINGS_ROW + 12, 9, 0xFF17263A);
-            for (row, (label, _)) in SETTINGS_ITEMS.iter().enumerate() {
-                c.text(SETTINGS_X + 13, SETTINGS_Y + 8 + row * SETTINGS_ROW, label, 0xFFE6EDF5, 1);
+            c.surface(SETTINGS_X, SETTINGS_Y, SETTINGS_WIDTH, SETTINGS_HEADER + SETTINGS_ITEMS.len() * SETTINGS_ROW + 12, 9, 0xFF1F3046, 0xFF17263A, 0xFF3D536C);
+            for (row, (label, action)) in SETTINGS_ITEMS.iter().enumerate() {
+                let checked = bios.is_some_and(|(model,_)| match action {
+                    ToolbarAction::Bios220 => model.contains("220"),
+                    ToolbarAction::Bios490 => model.contains("490"),
+                    _ => false,
+                });
+                let value=if checked { format!("✓  {label}") } else if row>=4 { format!("    {label}") } else { (*label).into() };
+                c.text(SETTINGS_X + 13, SETTINGS_Y + SETTINGS_HEADER + 8 + row * SETTINGS_ROW, &value, 0xFFE6EDF5, 1);
             }
         }
         Some(ToolbarPopup::About) => {
@@ -826,7 +969,8 @@ fn render_toolbar_native(c:&mut NativeCanvas<'_>,mode:DisplayMode,popup:Option<T
             ].iter().enumerate() {
                 c.text(157, 207 + row * 17, line, 0xFFE6EDF5, 1);
             }
-            for (row, line) in ["Emulator Core by sigsantilio and Arnold de Ruiter", "User Interface by sionisaac", "App Version 1"].iter().enumerate() {
+            let version=format!("Version {} · Build {}",env!("CARGO_PKG_VERSION"),env!("OPENCDI_BUILD_ID"));
+            for (row, line) in ["Emulator Core by sigsantilio and Arnold de Ruiter", "User Interface by sionisaac", version.as_str()].iter().enumerate() {
                 c.text(157, 295 + row * 19, line, 0xFFE6EDF5, 1);
             }
             c.round_rect(535, 365, 76, 30, 6, 0xFF243B55);
@@ -843,7 +987,7 @@ pub fn about_close_hit(x: usize, y: usize) -> bool {
 pub fn toolbar_popup_hit(x: usize, y: usize, popup: Option<ToolbarPopup>) -> bool {
     match popup {
         Some(ToolbarPopup::Settings) => (SETTINGS_X..SETTINGS_X + SETTINGS_WIDTH).contains(&x)
-            && (SETTINGS_Y..SETTINGS_Y + SETTINGS_ITEMS.len() * SETTINGS_ROW + 12).contains(&y),
+            && (SETTINGS_Y..SETTINGS_Y + SETTINGS_HEADER + SETTINGS_ITEMS.len() * SETTINGS_ROW + 12).contains(&y),
         _ => false,
     }
 }
@@ -975,43 +1119,39 @@ pub fn render_boot_details(
     title: &str, details: &DiscDetails, synopsis: Option<&str>,
 ) {
     let mut canvas = NativeCanvas::overlay(dst, width, height, view);
-    if let Some(logo) = &details.logo {
-        canvas.art_fit(logo, 270, 32, 228, 76);
-    } else {
-        canvas.centered_text(W / 2, 53, &short_title(title, 32), 0xFFF1F5FA, 2);
-    }
-    if let Some(boxart) = &details.boxart { canvas.art_fit(boxart, 25, 34, 211, 235); }
-    if let Some(back) = &details.back { canvas.art_fit(back, 25, 288, 211, 232); }
-    let Some(synopsis) = synopsis else { return; };
-    let x = 514;
-    let right = width.saturating_sub((view.2 * 24 / W).max(12)).min(canvas.x(x + 420));
-    let bottom = canvas.y(486).min(height);
-    if right.saturating_sub(canvas.x(x)) < 72 || bottom <= canvas.y(73) { return; }
-    canvas.labels.push(NativeLabel {
-        x,
-        y: 73,
-        value: format!("Synopsis\n\n{synopsis}"),
-        color: 0xFFD8E2EE,
-        scale: 1,
-        bounds: Some((right, bottom)),
-        centered: false,
-    });
+    canvas.rect(0,0,W,H,0xFF0B1523);
+    canvas.surface(18,42,248,448,12,0xFF182A3D,0xFF101D2C,0xFF2F465E);
+    canvas.surface(290,146,454,150,12,0xFF1C3045,0xFF142438,0xFF354C65);
+    canvas.text(24,15,"OpenCDi",0xFF99B3CC,1);
+    canvas.text(690,15,"Disc info",0xFF99B3CC,1);
+    canvas.line(18,34,W-36,0xFF293E53);
+    if let Some(boxart) = &details.boxart { canvas.art_fit(boxart, 34, 56, 216, 255); }
+    if let Some(back) = &details.back { canvas.art_fit(back, 57, 326, 170, 148); }
+    if let Some(logo) = &details.logo { canvas.art_fit(logo, 320, 54, 390, 76); }
+    else { canvas.centered_text(517,78,&short_title(title,30),0xFFF1F5FA,2); }
+    canvas.text(307,158,"Synopsis",0xFFA9D8FA,1);
+    let right=canvas.x(726).min(width);let bottom=canvas.y(284).min(height);
+    if right<=canvas.x(307)||bottom<=canvas.y(181){return;}
+    canvas.labels.push(NativeLabel{x:307,y:181,value:synopsis.unwrap_or("No synopsis available.").to_owned(),color:0xFFD8E5F1,scale:1,bounds:Some((right,bottom)),centered:false});
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreviewAction { Play, Back }
 
 const PLAY_BUTTON: (usize, usize, usize, usize) = (312, 510, 144, 40);
-const BACK_BUTTON: (usize, usize, usize, usize) = (22, 524, 128, 28);
+const BACK_BUTTON: (usize, usize, usize, usize) = (28, 512, 142, 36);
 
 pub fn render_preview_actions(dst: &mut [u32], width: usize, height: usize, view: (usize, usize, usize, usize)) {
     let mut canvas = NativeCanvas::overlay(dst, width, height, view);
+    canvas.surface(18,504,732,50,12,0xFF1C3045,0xFF142235,0xFF3A526A);
     let (x, y, w, h) = PLAY_BUTTON;
-    canvas.round_rect(x, y, w, h, 8, 0xFF2E6698);
-    canvas.centered_text(x + w / 2, y + 8, "Play", 0xFFF1F5FA, 2);
+    canvas.surface(x, y, w, h, 9, 0xFF355F80, 0xFF25445F, 0xFF6CBCF2);
+    canvas.icon(17,x+31,y+10,20,0xFFBDE5FF);
+    canvas.text(x+60,y+10,"Play",0xFFF1F5FA,2);
     let (x, y, w, h) = BACK_BUTTON;
-    canvas.round_rect(x, y, w, h, 6, 0xFF243B55);
-    canvas.centered_text(x + w / 2, y + 6, "Back to Library", 0xFFE6EDF5, 1);
+    canvas.surface(x, y, w, h, 8, 0xFF253B52, 0xFF182A3D, 0xFF425F7A);
+    canvas.icon(16,x+8,y+11,14,0xFFB0C4D9);
+    canvas.text(x+27,y+12,"Back to Library",0xFFE6EDF5,1);
 }
 
 pub fn preview_hit(x: i32, y: i32) -> Option<PreviewAction> {
@@ -1024,15 +1164,13 @@ pub fn preview_hit(x: i32, y: i32) -> Option<PreviewAction> {
 
 pub fn toolbar_hit(x: usize, y: usize, popup: Option<ToolbarPopup>, optical_disc: Option<char>) -> Option<ToolbarAction> {
     if popup == Some(ToolbarPopup::Settings) && toolbar_popup_hit(x, y, popup) {
-        let row = y.checked_sub(SETTINGS_Y + 6)? / SETTINGS_ROW;
+        let row = y.checked_sub(SETTINGS_Y + SETTINGS_HEADER + 6)? / SETTINGS_ROW;
         return SETTINGS_ITEMS.get(row).map(|&(_, action)| action);
     }
     if y >= TOOLBAR_HEIGHT { return None; }
-    match x {
-        12..=111 => Some(ToolbarAction::OpenDisc), 116..=224 => Some(ToolbarAction::Controller),
-        229..=337 => Some(ToolbarAction::Settings),
-        344..=455 => Some(ToolbarAction::About), 550..=664 => optical_disc.map(ToolbarAction::PlayDisc), 676..=760 => Some(ToolbarAction::Exit), _ => None,
-    }
+    dock_buttons(optical_disc).into_iter().find_map(|(action,left,width,_,_)| {
+        ((left..left+width).contains(&x) && (5..37).contains(&y)).then_some(action)
+    })
 }
 
 pub fn pause_menu_hit(x: usize, y: usize) -> Option<usize> {
@@ -1041,12 +1179,18 @@ pub fn pause_menu_hit(x: usize, y: usize) -> Option<usize> {
     None
 }
 
+pub const PAUSE_ACTIONS: [&str; 7] = ["Resume", "Disc Info", "Save State", "Load State", "Controller Settings", "Back to Library", "Exit OpenCDi"];
+const PAUSE_LEFT:usize=350;
+const PAUSE_WIDTH:usize=300;
+const PAUSE_TOP:usize=128;
+const PAUSE_STEP:usize=43;
+const PAUSE_HEIGHT:usize=36;
+
 pub fn pause_menu_hit_full(x: usize, y: usize, width: usize, height: usize) -> Option<usize> {
     if width==0||height==0{return None;}
     let bx=x.saturating_mul(W)/width;let by=y.saturating_mul(H)/height;
-    if !(140..620).contains(&bx){return None;}
-    let start=205usize;let step=48usize;let row_h=40usize;
-    (0..5).find(|row|{let top=start+row*step;(top..top+row_h).contains(&by)})
+    if !(PAUSE_LEFT..PAUSE_LEFT+PAUSE_WIDTH).contains(&bx){return None;}
+    (0..PAUSE_ACTIONS.len()).find(|row|{let top=PAUSE_TOP+row*PAUSE_STEP;(top..top+PAUSE_HEIGHT).contains(&by)})
 }
 
 pub fn render_pause_menu_full(dst: &mut [u32], width: usize, height: usize, title: &str, logo: Option<&Artwork>, selected: usize) {
@@ -1059,32 +1203,32 @@ pub fn render_pause_menu_full(dst: &mut [u32], width: usize, height: usize, titl
         rect_full(dst,width,height,bx,by,8,8,tinted);
     }}
     let mut c=NativeCanvas::overlay(dst,width,height,(0,0,width,height));
-    c.round_rect(145,89,478,390,17,0x99000000);
-    c.round_rect(140,84,478,390,17,0xFF111D2B);
-    c.round_rect(140,84,478,3,2,0xFF63B6F5);
-    c.centered_text(W / 2, 100, "Game Paused", 0xFFF1F5FA, 2);
+    c.surface(90,70,588,430,15,0xFF17283C,0xFF101D2D,0xFF3A526B);
+    c.text(112,88,"Game Paused",0xFFF1F5FA,2);
+    c.surface(112,128,102,25,7,0xFF24435B,0xFF1D354B,0xFF416C8B);
+    c.rect(122,135,2,10,0xFFB9E5FF);c.rect(127,135,2,10,0xFFB9E5FF);c.text(138,135,"Paused",0xFFB9E5FF,1);
     if let Some(logo) = logo {
-        c.art_fit(logo, 270, 124, 228, 39);
+        c.art_fit(logo,110,186,216,88);
     } else {
-        c.centered_text(W / 2, 132, &short_title(title, 40), 0xFFB6C9DD, 1);
+        let (first,second)=wrap_title(title,24);
+        c.text(112,190,&first,0xFFF1F5FA,2);
+        if !second.is_empty(){c.text(112,218,&second,0xFFF1F5FA,2);}
     }
-    c.centered_text(W / 2, 176, "Press the pause button again to resume", 0xFF91A6BC, 1);
-    let labels = ["Info", "Save State", "Load State", "Controller Settings", "Stop and Return to Library"];
-    let icons=[0usize,1,2,3,4];
-    for(row,label)in labels.iter().enumerate(){
-        let y=205+row*48;let active=row==selected;
-        if active{c.round_rect(154,y,450,40,8,0xFF2789CF);c.round_rect(154,y,4,40,2,0xFF82CEFF);}
-        else{c.round_rect(154,y,450,40,8,0xFF1B2A3C);}
-        let ic=if active{0xFFF4F9FE}else{0xFFB9CBE0};let ix=174;let iy=y+15;
-        match icons[row]{
-            0=>{c.ring(ix+4,iy,8,ic);c.rect(ix+3,iy-4,2,2,ic);c.rect(ix+3,iy,2,5,ic);},
-            1=>{c.round_rect(ix-5,iy-7,16,15,3,ic);c.rect(ix-2,iy-4,10,5,0xFF1B2A3C);c.rect(ix-2,iy+4,10,4,0xFF1B2A3C);},
-            2=>{c.round_rect(ix-5,iy-7,16,15,3,ic);c.rect(ix-2,iy-4,10,9,0xFF1B2A3C);c.rect(ix,iy-2,2,6,ic);c.rect(ix+4,iy-2,2,6,ic);},
-            3=>{c.round_rect(ix-6,iy-6,18,13,6,ic);c.rect(ix-3,iy-1,3,2,0xFF1B2A3C);c.rect(ix+5,iy-1,3,2,0xFF1B2A3C);},
-            _=>{c.rect(ix-2,iy-8,3,17,ic);c.rect(ix+4,iy-6,3,15,ic);c.rect(ix+10,iy-4,3,13,ic);}
-        }
-        c.text(201,y+12,label,if active{0xFFFFFFFF}else{0xFFE1E8F1},1);
+    c.text(112,291,"Philips CD-i",0xFFA7BED6,1);
+    c.text(112,362,"Press Home / Pause to resume",0xFFB5CDE2,1);
+    c.text(112,388,"Point to choose with the Wiimote",0xFF91A9C1,1);
+    c.text(PAUSE_LEFT,105,"ACTIONS",0xFF93ADC6,1);
+    for(row,label)in PAUSE_ACTIONS.iter().enumerate(){
+        let y=PAUSE_TOP+row*PAUSE_STEP;let active=row==selected;
+        c.surface(PAUSE_LEFT,y,PAUSE_WIDTH,PAUSE_HEIGHT,8,
+            if active{0xFF2E526E}else{0xFF23394F},if active{0xFF23435D}else{0xFF1A2C40},
+            if active{0xFF68C2FA}else{0xFF3B526A});
+        c.icon([17,4,14,15,1,7,5][row],PAUSE_LEFT+13,y+9,17,if active{0xFFBAE7FF}else{0xFFADC3DA});
+        c.text(PAUSE_LEFT+43,y+12,label,0xFFEAF2FA,1);
     }
+    c.line(112,454,538,0xFF2C425A);
+    c.text(112,469,"Button I: Choose     Button II: Back",0xFFA7BED6,1);
+    c.text(528,469,"Plus + Minus: Exit",0xFFA7BED6,1);
 }
 
 fn rect_full(dst: &mut [u32], width: usize, height: usize, x: usize, y: usize, w: usize, h: usize, color: u32) {
@@ -1129,15 +1273,19 @@ pub fn render_pause_menu(dst: &mut [u32], title: &str, selected: usize) {
 }
 
 fn blit_rotated(dst: &mut [u32], art: &Artwork, cx: i32, cy: i32, size: i32, angle: f32) {
+    blit_rotated_into(dst, W, H, art, cx, cy, size, angle);
+}
+
+fn blit_rotated_into(dst: &mut [u32], width: usize, height: usize, art: &Artwork, cx: i32, cy: i32, size: i32, angle: f32) {
     let (sin, cos) = angle.sin_cos(); let radius = size / 2;
     for oy in -radius..radius { for ox in -radius..radius {
         let u = ox as f32 * cos / size as f32 + oy as f32 * sin / size as f32 + 0.5;
         let v = -ox as f32 * sin / size as f32 + oy as f32 * cos / size as f32 + 0.5;
         if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) { continue; }
         let x = cx + ox; let y = cy + oy;
-        if x < 0 || y < 0 || x as usize >= W || y as usize >= H { continue; }
+        if x < 0 || y < 0 || x as usize >= width || y as usize >= height { continue; }
         let src = sample_bilinear(art, u * art.w as f32 - 0.5, v * art.h as f32 - 0.5); let a = src >> 24;
-        let idx = y as usize * W + x as usize; dst[idx] = blend(src, dst[idx], a);
+        let idx = y as usize * width + x as usize; dst[idx] = blend(src, dst[idx], a);
     }}
 }
 
@@ -1235,6 +1383,68 @@ mod library_tests {
     use super::*;
 
     #[test]
+    fn pause_actions_and_pointer_targets_match_at_different_window_sizes() {
+        assert_eq!(PAUSE_ACTIONS,["Resume","Disc Info","Save State","Load State","Controller Settings","Back to Library","Exit OpenCDi"]);
+        for (width,height) in [(768,560),(1920,1080),(1024,768)] {
+            for row in 0..PAUSE_ACTIONS.len() {
+                let x=(PAUSE_LEFT+PAUSE_WIDTH/2)*width/W;
+                let y=(PAUSE_TOP+row*PAUSE_STEP+PAUSE_HEIGHT/2)*height/H;
+                assert_eq!(pause_menu_hit_full(x,y,width,height),Some(row));
+                let gap=(PAUSE_TOP+row*PAUSE_STEP+PAUSE_HEIGHT+3)*height/H;
+                assert_eq!(pause_menu_hit_full(x,gap,width,height),None);
+            }
+            assert_eq!(pause_menu_hit_full(0,0,width,height),None);
+        }
+    }
+
+    #[test]
+    fn artwork_names_migrate_without_redownloads_or_overwriting_existing_files() {
+        let root=std::env::temp_dir().join(format!("opencdi-art-names-{}",std::process::id()));
+        std::fs::create_dir_all(root.join("Boxart")).unwrap();
+        std::fs::create_dir_all(root.join("CD")).unwrap();
+        let disc=PathBuf::from("Mad Dog McCree (USA, Europe).chd");
+        let old_box=root.join("Boxart/Mad Dog McCree (USA, Europe)--generated.png");
+        let new_box=root.join("Boxart/Mad Dog McCree (USA, Europe).png");
+        let old_cd=root.join("CD/Mad Dog McCree (USA, Europe)-disc.png");
+        let new_cd=root.join("CD/Mad Dog McCree (USA, Europe).png");
+        std::fs::write(&old_box,b"existing box art").unwrap();
+        std::fs::write(&old_cd,b"existing disc art").unwrap();
+        migrate_artwork_names(std::slice::from_ref(&disc),&root);
+        assert_eq!(std::fs::read(&new_box).unwrap(),b"existing box art");
+        assert_eq!(std::fs::read(&new_cd).unwrap(),b"existing disc art");
+        assert_eq!(managed_art_path(&disc,&root,crate::launchbox::ArtworkKind::Boxart),Some(new_box.clone()));
+        std::fs::write(&old_cd,b"older duplicate").unwrap();
+        migrate_artwork_names(&[disc],&root);
+        assert_eq!(std::fs::read(&new_cd).unwrap(),b"existing disc art");
+        assert_eq!(std::fs::read(&old_cd).unwrap(),b"older duplicate");
+        for path in [old_cd,new_cd,new_box] {std::fs::remove_file(path).unwrap();}
+        std::fs::remove_dir(root.join("Boxart")).unwrap();
+        std::fs::remove_dir(root.join("CD")).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn cached_boot_scene_refreshes_changed_artwork_controls_and_window_size() {
+        let mut scene = BootScene::default();
+        let art = |color| Artwork { w: 2, h: 2, pixels: vec![color; 4].into() };
+        let mut details = DiscDetails { boxart: Some(art(0xFF00FF00)), ..DiscDetails::default() };
+        let mut output = vec![0; W * H];
+        scene.render(&mut output, W, H, (0,0,W,H), "Test", &details, None, true, None, 0);
+        assert_eq!(output[100 * W + 100], 0xFF00FF00);
+        assert_ne!(output[530 * W + 330], 0xFF000000);
+        scene.render(&mut output, W, H, (0,0,W,H), "Test", &details, None, false, None, 20);
+        assert_eq!(output[100 * W + 100], 0xFF00FF00);
+        assert_eq!(output[530 * W + 330], 0xFF0B1523);
+        details.boxart = Some(art(0xFFFF0000));
+        scene.render(&mut output, W, H, (0,0,W,H), "Test", &details, None, false, None, 40);
+        assert_eq!(output[100 * W + 100], 0xFFFF0000);
+        output.resize(1280 * 720, 0);
+        scene.render(&mut output, 1280, 720, (0,0,1280,720), "Changed", &details, Some("Synopsis"), false, None, 60);
+        assert_eq!(scene.pixels.len(), output.len());
+        assert_eq!(scene.title, "Changed");
+    }
+
+    #[test]
     fn category_search_and_collection_controls_leave_the_grid_and_slider_available() {
         let items = ["Flashback (Europe)", "Space Safari (UK)", "Uncatalogued disc"].map(|title| {
             Item { path: format!("{title}.chd").into(), title: title.into(), cover: None, disc: None, logo: None }
@@ -1292,7 +1502,7 @@ mod library_tests {
             {
                 let mut canvas = NativeCanvas::new(&mut pixels, W, H, (0, 0, W, H));
                 canvas.text(SETTINGS_X + 25, SETTINGS_Y + 35, underlying_label, 0xFFFFFFFF, 1);
-                render_toolbar_native(&mut canvas, DisplayMode::Windowed, Some(ToolbarPopup::Settings), None);
+                render_toolbar_native(&mut canvas, DisplayMode::Windowed, Some(ToolbarPopup::Settings), None, None, Some(("Philips CD-i 490","cdi490a.rom")));
             }
             pixels
         };
@@ -1328,17 +1538,21 @@ mod library_tests {
 
     #[test]
     fn play_disc_toolbar_action_requires_detected_media() {
-        assert!(toolbar_hit(575, 16, None, None).is_none());
-        assert!(toolbar_hit(575, 16, None, Some('F')) == Some(ToolbarAction::PlayDisc('F')));
+        assert_eq!(toolbar_hit(45, 16, None, None), Some(ToolbarAction::OpenDisc));
+        assert_eq!(toolbar_hit(45, 16, None, Some('F')), Some(ToolbarAction::PlayDisc('F')));
+        assert_eq!(toolbar_hit(120, 16, None, Some('F')), Some(ToolbarAction::OpenDisc));
+        assert_eq!(toolbar_hit(325,16,None,None),Some(ToolbarAction::Start220));
+        assert_eq!(toolbar_hit(410,16,None,Some('F')),Some(ToolbarAction::Start490));
     }
 
     #[test]
     fn toolbar_uses_new_positions_and_paths_has_four_actions() {
-        assert!(toolbar_hit(275, 16, None, None) == Some(ToolbarAction::Settings));
-        assert!(toolbar_hit(400, 16, None, None) == Some(ToolbarAction::About));
+        assert!(toolbar_hit(590, 16, None, None) == Some(ToolbarAction::Settings));
+        assert!(toolbar_hit(660, 16, None, None) == Some(ToolbarAction::About));
         for (row, (_, action)) in SETTINGS_ITEMS.into_iter().enumerate() {
-            assert!(toolbar_hit(250, SETTINGS_Y + 9 + row * SETTINGS_ROW, Some(ToolbarPopup::Settings), None) == Some(action));
+            assert!(toolbar_hit(SETTINGS_X+25, SETTINGS_Y + SETTINGS_HEADER + 9 + row * SETTINGS_ROW, Some(ToolbarPopup::Settings), None) == Some(action));
         }
+        assert_eq!(toolbar_hit(SETTINGS_X+25,SETTINGS_Y+2,Some(ToolbarPopup::Settings),None),None);
         assert_eq!(preview_hit(384, 530), Some(PreviewAction::Play));
         assert_eq!(preview_hit(64, 540), Some(PreviewAction::Back));
         assert_eq!(preview_hit(384, 500), None);
@@ -1378,10 +1592,14 @@ mod library_tests {
         for (width, height, view) in [(W, H, (0, 0, W, H)), (1920, 1080, (219, 0, 1481, 1080))] {
             let mut pixels = vec![0; width * height];
             render_boot_details(&mut pixels, width, height, view, "", &DiscDetails::default(), Some(&summary));
-            let disc_right = view.0 + 490 * view.2 / W;
-            let text_middle = view.1 + 279 * view.3 / H;
-            assert!(pixels.chunks_exact(width).all(|row| row[..disc_right].iter().all(|&pixel| pixel == 0)));
-            assert!(pixels.chunks_exact(width).skip(text_middle.saturating_sub(35)).take(70).any(|row| row.iter().any(|&pixel| pixel != 0)));
+            let mut without=vec![0;width*height];
+            render_boot_details(&mut without,width,height,view,"",&DiscDetails::default(),Some(""));
+            let left=view.0+307*view.2/W;let right=view.0+726*view.2/W;
+            let top=view.1+181*view.3/H;let bottom=view.1+284*view.3/H;
+            let changed:Vec<_>=pixels.iter().zip(&without).enumerate().filter(|(_, (a,b))|a!=b).map(|(i,_)|(i%width,i/width)).collect();
+            assert!(!changed.is_empty());
+            assert!(changed.iter().all(|&(x,y)|x>=left&&x<right&&y>=top&&y<bottom));
+
         }
     }
 

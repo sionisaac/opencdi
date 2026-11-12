@@ -1303,7 +1303,8 @@ impl Dvc {
                     self.audio_armed = true;
                     self.audio_enabled = true;
                     self.or_fma_word(0x02, 0x0010);
-                    self.or_fma_word(FMA_ISR, 0x0010);
+                    // DEC is a transition notification, raised by decode_due when
+                    // decoding actually starts. DMA rearming must not repeat it.
                 }
                 if value & 0x8000 != 0 { // DMA request Audio
                     self.dma_requested = true;
@@ -1327,6 +1328,10 @@ impl Dvc {
 
     pub fn handle_fmv_write(&mut self, offset: usize) {
         let value = self.get_fmv_word(offset);
+        if matches!(offset, FMV_SYSCMD | FMV_VIDCMD | FMV_IER)
+            && std::env::var_os("CDI_DVC_COMMAND_TRACE").is_some() {
+            eprintln!("DVC-COMMAND impeg={} register={offset:02x} value={value:04x}",self.impeg);
+        }
         match offset {
             FMV_SYSCMD => {
                 if value & 0x0008 != 0 { // PLAY
@@ -1591,6 +1596,10 @@ impl Dvc {
                 let mut audio = std::mem::take(&mut d.audio);
                 if self.mp2.decode_available(&mut audio) != 0 {
                     self.audio_sample_rate = self.mp2.last_sample_rate;
+                    if !self.fma_started {
+                        self.fma_started = true;
+                        self.fma_pending |= FMA_IRQ_PLAY;
+                    }
                     self.fma_pending |= FMA_IRQ_DEC;
                     self.audio_out.extend(self.mp2.pcm.drain(..));
                 }
@@ -1908,6 +1917,7 @@ impl opencdi::savestate::State for Mp2Decoder {
 mod window_tests {
     use super::*;
 
+
     #[test]
     fn window_places_and_clips_the_picture() {
         let mut d = Dvc::new();
@@ -2125,6 +2135,81 @@ mod timing_tests {
         assert_eq!(d.get_fma_word(FMA_ISR) & 0x14, 0);
         tick(&mut d);
         assert_eq!(d.get_fma_word(FMA_ISR) & 0x14, 0x14);
+    }
+
+    #[test]
+    fn audio_dma_rearming_does_not_repeat_the_started_notification() {
+        let mut d = dvc();
+        d.set_fma_word(FMA_CMD, 2);
+        d.handle_fma_write(FMA_CMD);
+        assert_eq!(d.get_fma_word(FMA_ISR) & FMA_IRQ_PLAY, 0);
+        feed(&mut d, &stream(90_000, Some(99_000), 1));
+        feed(&mut d, &pack(99_800, 3528));
+        tick(&mut d);
+        assert_ne!(d.get_fma_word(FMA_ISR) & FMA_IRQ_PLAY, 0);
+        d.acknowledge_fma_isr();
+        for _ in 0..3 {
+            d.set_fma_word(FMA_CMD, 0x8002);
+            d.handle_fma_write(FMA_CMD);
+            tick(&mut d);
+            assert_eq!(d.get_fma_word(FMA_ISR) & FMA_IRQ_PLAY, 0);
+        }
+        d.set_fma_word(FMA_CMD, 1);
+        d.handle_fma_write(FMA_CMD);
+        d.set_fma_word(FMA_CMD, 2);
+        d.handle_fma_write(FMA_CMD);
+        assert_eq!(d.get_fma_word(FMA_ISR) & FMA_IRQ_PLAY, 0);
+        feed(&mut d, &stream(90_000, Some(99_000), 1));
+        feed(&mut d, &pack(99_800, 3528));
+        tick(&mut d);
+        assert_ne!(d.get_fma_word(FMA_ISR) & FMA_IRQ_PLAY, 0, "a new play must announce its start");
+    }
+
+    #[test]
+    fn untimed_audio_announces_started_once_when_it_decodes() {
+        let mut d = dvc();
+        feed(&mut d, &audio_packet(None, &loud_frame()));
+        tick(&mut d);
+        assert_ne!(d.get_fma_word(FMA_ISR) & FMA_IRQ_PLAY, 0);
+        d.acknowledge_fma_isr();
+        feed(&mut d, &audio_packet(None, &loud_frame()));
+        tick(&mut d);
+        assert_eq!(d.get_fma_word(FMA_ISR) & FMA_IRQ_PLAY, 0);
+    }
+
+    #[test]
+    fn separate_audio_continues_after_video_end_until_its_own_end() {
+        let mut d = dvc();
+        for b in audio_packet(None, &loud_frame()) { d.push_fma_stream_byte(b); }
+        d.process_stream();
+        let first_audio = d.audio_out.len();
+        assert!(first_audio > 0);
+        d.dvc_stream_fifo.extend_from_slice(&[0, 0, 1, 0xB9]);
+        d.process_stream();
+        assert_ne!(d.get_fmv_word(FMV_ISR) & FMV_IRQ_EII, 0);
+        assert_eq!(d.get_fma_word(FMA_ISR) & FMA_IRQ_EOI, 0);
+        for b in audio_packet(None, &loud_frame()) { d.push_fma_stream_byte(b); }
+        d.process_stream();
+        assert!(d.audio_out.len() > first_audio, "audio tail must still decode");
+        for _ in 0..30 { tick(&mut d); }
+        assert_eq!(d.get_fma_word(FMA_ISR) & FMA_IRQ_EOI, 0, "underflow is not end-of-item");
+        for b in [0, 0, 1, 0xB9] { d.push_fma_stream_byte(b); }
+        d.process_stream();
+        assert_ne!(d.get_fma_word(FMA_ISR) & FMA_IRQ_EOI, 0);
+        d.acknowledge_fma_isr();
+        d.process_stream();
+        assert_eq!(d.get_fma_word(FMA_ISR) & FMA_IRQ_EOI, 0);
+    }
+
+    #[test]
+    fn multiplexed_audio_finishes_with_its_shared_program_end() {
+        let mut d = dvc();
+        d.dvc_stream_fifo.extend(audio_packet(None, &loud_frame()));
+        d.dvc_stream_fifo.extend_from_slice(&[0, 0, 1, 0xB9]);
+        d.process_stream();
+        assert!(!d.audio_out.is_empty());
+        assert_ne!(d.get_fma_word(FMA_ISR) & FMA_IRQ_EOI, 0);
+        assert_ne!(d.get_fmv_word(FMV_ISR) & FMV_IRQ_EII, 0);
     }
 
     #[test]

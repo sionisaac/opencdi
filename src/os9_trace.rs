@@ -11,11 +11,19 @@ const NAME_CALLS: &[u16] = &[0x00, 0x01, 0x03, 0x05, 0x21, 0x25, 0x80, 0x83, 0x8
 const NO_RETURN: &[u16] = &[0x06, 0x1E];
 const MAX_PENDING: usize = 256;
 
+fn read_hash(bus: &CdiBus, address: u32, requested: u32, count: u32) -> Option<String> {
+    if count > requested || count > 1024 * 1024 { return None; }
+    let bytes: Option<Vec<u8>> = (0..count)
+        .map(|i| address.checked_add(i).and_then(|a| bus.peek_byte(a))).collect();
+    bytes.map(|d| crate::bios::sha1_hex(&d))
+}
+
 struct Pending {
     seq: u64,
     ret_pc: u32,
     sp: u32,
     sup: bool,
+    read: Option<(u32, u32)>,
 }
 
 pub struct Os9Trace {
@@ -27,6 +35,7 @@ pub struct Os9Trace {
     line: usize,
     dc: bool,
     dc_prev: Vec<(u16, u8, u32)>,
+    read_hashes: bool,
 }
 
 impl Os9Trace {
@@ -37,7 +46,8 @@ impl Os9Trace {
         let mut out = BufWriter::new(file);
         let _ = writeln!(out, "# os9 trace: C=call R=return; regs before/after; str=a0 text for name calls; mem=32 bytes at a0 for status calls");
         let dc = std::env::var_os("CDI_DC_TRACE").is_some();
-        Some(Box::new(Self { out, seq: 0, frame: 0, pending: Vec::new(), modules: Vec::new(), line: 0, dc, dc_prev: Vec::new() }))
+        let read_hashes = std::env::var_os("CDI_IO_HASHES").is_some();
+        Some(Box::new(Self { out, seq: 0, frame: 0, pending: Vec::new(), modules: Vec::new(), line: 0, dc, dc_prev: Vec::new(), read_hashes }))
     }
 
     /// Start of a field; with `CDI_DC_TRACE` set also logs (V lines) the display instructions that changed against the field before.
@@ -123,12 +133,13 @@ impl Os9Trace {
             if self.pending.len() >= MAX_PENDING {
                 self.pending.remove(0);
             }
-            self.pending.push(Pending { seq: self.seq, ret_pc: cpu.pc.wrapping_add(2), sp: cpu.dar[15], sup });
+            let read = (self.read_hashes && trap == 0 && code == 0x89).then_some((cpu.a(0),cpu.d(1)));
+            self.pending.push(Pending { seq: self.seq, ret_pc: cpu.pc.wrapping_add(2), sp: cpu.dar[15], sup, read });
         }
     }
 
     /// Per-instruction check while calls are pending; logs registers when a caller resumes after its call word.
-    pub fn check_return(&mut self, cpu: &CpuCore) {
+    pub fn check_return(&mut self, cpu: &CpuCore, bus: &CdiBus) {
         let pc = cpu.pc;
         let Some(i) = self.pending.iter().rposition(|p| p.ret_pc == pc && p.sp == cpu.dar[15] && p.sup == (cpu.s_flag != 0))
         else {
@@ -138,6 +149,15 @@ impl Os9Trace {
         let cc = cpu.get_ccr() & 1;
         let mut line = format!("R {} f={} l={} cc={} err={:04X} ", p.seq, self.frame, self.line, cc, cpu.d(1) & 0xFFFF);
         push_regs(&mut line, cpu, false);
+        if let Some((address,requested)) = p.read {
+            let count = cpu.d(1);
+            let _ = write!(line," read_requested={requested}");
+            if cc == 0 {
+                if let Some(hash) = read_hash(bus,address,requested,count) {
+                    let _ = write!(line," read_count={count} read_sha1={hash}");
+                } else { line.push_str(" read_unavailable=unmapped_or_limit"); }
+            } else { line.push_str(" read_unavailable=error_or_limit"); }
+        }
         let _ = writeln!(self.out, "{line}");
     }
 
@@ -212,4 +232,22 @@ fn read_text(bus: &CdiBus, addr: u32, max: usize) -> String {
         }
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn io_hash_is_bounded_read_only_and_refuses_unmapped_buffers() {
+        let mut bus=CdiBus::new();
+        bus.mcd212.plane_a[0x100..0x103].copy_from_slice(b"abc");
+        assert_eq!(read_hash(&bus,0x100,3,3).as_deref(),Some("a9993e364706816aba3e25717850c26c9cd0d89d"));
+        assert_eq!(&bus.mcd212.plane_a[0x100..0x103],b"abc");
+        assert!(read_hash(&bus,0x100,2,3).is_none());
+        assert!(read_hash(&bus,0x100,u32::MAX,1024*1024+1).is_none());
+        assert!(read_hash(&bus,0x00303c00,16,16).is_none());
+        assert!(read_hash(&bus,u32::MAX,2,2).is_none());
+        assert_eq!(read_hash(&bus,0,0,0).as_deref(),Some("da39a3ee5e6b4b0d3255bfef95601890afd80709"));
+    }
 }

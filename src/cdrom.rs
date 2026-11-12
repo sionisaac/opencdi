@@ -8,6 +8,22 @@ pub const CD_SECTOR_RAW_SIZE: usize = 2352;
 pub const CD_SUBCHANNEL_SIZE: usize = 96;
 pub const CD_FRAME_SIZE: usize = CD_SECTOR_RAW_SIZE + CD_SUBCHANNEL_SIZE; // 2448
 
+fn volume_descriptor(d: &[u8; 2048]) -> bool {
+    d[0] == 1 && d[6] == 1 && matches!(&d[1..6], b"CD-I " | b"CD001")
+}
+
+fn label_text(d: &[u8]) -> String {
+    String::from_utf8_lossy(d).trim_matches(|c| c == ' ' || c == '\0').to_string()
+}
+
+fn data_header_valid(s: &[u8; CD_SECTOR_RAW_SIZE], lba: u32) -> bool {
+    if s[0] != 0 || s[11] != 0 || s[1..11].iter().any(|&b| b != 0xff) { return false; }
+    let at = lba as u64 + 150;
+    let bcd = |n: u64| (((n / 10) << 4) | (n % 10)) as u8;
+    s[12..15] == [bcd(at / 4500), bcd(at / 75 % 60), bcd(at % 75)]
+        && (s[15] == 1 || (s[15] == 2 && s[16..20] == s[20..24]))
+}
+
 #[derive(Clone, Debug)]
 pub struct CdTrack {
     pub number: u8,
@@ -582,12 +598,17 @@ impl CdRom {
     }
 
     fn detect_disc_type(&mut self) {
-        let mut s16 = [0u8; CD_SECTOR_RAW_SIZE];
-        if self.read_sector(16, &mut s16) {
-            let sys_id = &s16[24 + 8..24 + 40];
-            self.volume_id = String::from_utf8_lossy(&s16[24 + 40..24 + 72]).trim().to_string();
-            self.volume_set = String::from_utf8_lossy(&s16[24 + 318..24 + 446]).trim().to_string();
-            self.publisher = String::from_utf8_lossy(&s16[24 + 446..24 + 574]).trim().to_string();
+        let only_audio = !self.tracks.is_empty() && self.tracks.iter().all(|t| t.control & 0x40 == 0);
+        if only_audio {
+            self.disc_type = 0;
+            return;
+        }
+        let mut label = [0u8; 2048];
+        if self.read_data_sector(16, &mut label) && volume_descriptor(&label) {
+            let sys_id = &label[8..40];
+            self.volume_id = label_text(&label[40..72]);
+            self.volume_set = label_text(&label[190..318]);
+            self.publisher = label_text(&label[318..446]);
             if sys_id.starts_with(b"CD-RTOS CD-BRIDGE") {
                 info!("CD-ROM: Riconosciuto disco CD-RTOS CD-BRIDGE (Video CD / White Book), disc_type = 0x20");
                 self.disc_type = 0x20;
@@ -598,13 +619,39 @@ impl CdRom {
                 info!("CD-ROM: Disc system ID: {:?}, disc_type = 0x10, volume = {:?}", String::from_utf8_lossy(sys_id).trim(), self.volume_id);
                 self.disc_type = 0x10;
             }
-        } else {
-            let only_audio = self.tracks.iter().all(|t| (t.control & 0x40) == 0);
-            if only_audio && !self.tracks.is_empty() {
-                info!("CD-ROM: Riconosciuto disco CD-DA Audio Red Book, disc_type = 0x00");
-                self.disc_type = 0x00;
-            }
         }
+    }
+
+    /// Read a 2048-byte data payload in CPU-independent byte order. Raw reads
+    /// remain unchanged for the emulated controllers. Rejects audio and Form 2.
+    /// Sector structure is checked; this does not verify the sector EDC/ECC.
+    pub fn read_data_sector(&mut self, lba: u32, out: &mut [u8; 2048]) -> bool {
+        let track = self.tracks.iter().find(|t| lba >= t.start_lba && lba < t.start_lba + t.length_sectors);
+        if track.is_some_and(|t| t.control & 0x40 == 0) { return false; }
+        let cooked = track.is_some_and(|t| t.sector_size == 2048);
+        let mut sector = [0u8; CD_SECTOR_RAW_SIZE];
+        if !self.read_sector(lba, &mut sector) { return false; }
+        if cooked {
+            // RawFiles' cooked-sector adapter places its payload at byte 24.
+            out.copy_from_slice(&sector[24..2072]);
+            return true;
+        }
+        if sector[0..2] == [0xff, 0] {
+            for pair in sector.chunks_exact_mut(2) { pair.swap(0, 1); }
+        }
+        if !data_header_valid(&sector, lba) {
+            static SCRAMBLE: std::sync::OnceLock<[u8; 2448]> = std::sync::OnceLock::new();
+            let mask = SCRAMBLE.get_or_init(crate::cdic::generate_sector_scramble);
+            for i in 12..CD_SECTOR_RAW_SIZE { sector[i] ^= mask[i]; }
+            if !data_header_valid(&sector, lba) { return false; }
+        }
+        let start = match sector[15] {
+            1 => 16,
+            2 if sector[18] & 0x20 == 0 => 24,
+            _ => return false,
+        };
+        out.copy_from_slice(&sector[start..start + 2048]);
+        true
     }
 
     /// Evaluates whether this disc should run in NTSC (60 Hz) mode based on filename and Sector 16 metadata.
@@ -775,6 +822,113 @@ impl CdRom {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Fixture { path: PathBuf, dir: PathBuf }
+    impl Fixture {
+        fn new(bytes: &[u8], ext: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("opencdi-sector-test-{}-{n}",std::process::id()));
+            std::fs::create_dir(&dir).unwrap();
+            let path = dir.join(format!("synthetic.{ext}"));
+            std::fs::write(&path, bytes).unwrap();
+            Self { path, dir }
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_dir(&self.dir);
+        }
+    }
+
+    fn label() -> [u8; 2048] {
+        let mut d=[0;2048];
+        d[0]=1;
+        d[1..6].copy_from_slice(b"CD-I ");
+        d[6]=1;
+        d[8..40].fill(b' ');
+        d[8..15].copy_from_slice(b"CD-RTOS");
+        d[40..46].copy_from_slice(b"Volume");
+        d[190..195].copy_from_slice(b"Album");
+        d[318..327].copy_from_slice(b"Publisher");
+        d[446..454].copy_from_slice(b"Preparer");
+        d
+    }
+
+    fn raw(label: &[u8;2048], mode: u8) -> [u8;CD_SECTOR_RAW_SIZE] {
+        let mut d=[0;CD_SECTOR_RAW_SIZE];
+        d[1..11].fill(0xff);
+        d[12..16].copy_from_slice(&[0,2,0x16,mode]);
+        let start=if mode==1 {16} else {24};
+        d[start..start+2048].copy_from_slice(label);
+        d
+    }
+
+    #[test]
+    fn metadata_uses_normalized_payload_and_correct_album_publisher_fields() {
+        let payload=label();
+        for mode in [1,2] {
+            for scrambled in [false,true] {
+                for swapped in [false,true] {
+                    let mut sector=raw(&payload,mode);
+                    if scrambled {
+                        let mask=crate::cdic::generate_sector_scramble();
+                        for i in 12..CD_SECTOR_RAW_SIZE {sector[i]^=mask[i];}
+                    }
+                    if swapped {for pair in sector.chunks_exact_mut(2) {pair.swap(0,1);}}
+                    let mut image=vec![0;17*CD_SECTOR_RAW_SIZE];
+                    image[16*CD_SECTOR_RAW_SIZE..].copy_from_slice(&sector);
+                    let fixture=Fixture::new(&image,"bin");
+                    let mut cd=CdRom::open(&fixture.path).unwrap();
+                    assert_eq!((&*cd.volume_id,&*cd.volume_set,&*cd.publisher),("Volume","Album","Publisher"),
+                        "mode={mode} scrambled={scrambled} swapped={swapped}");
+                    let mut actual=[0;2048];
+                    assert!(cd.read_data_sector(16,&mut actual));
+                    assert_eq!(actual,payload);
+                    let mut untouched=[0;CD_SECTOR_RAW_SIZE];
+                    assert!(cd.read_sector(16,&mut untouched));
+                    assert_eq!(untouched,sector,"controller raw bytes changed");
+                    drop(cd);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cooked_iso_bridge_and_invalid_descriptors_are_distinguished() {
+        for standard in [b"CD-I ",b"CD001",b"XXXXX"] {
+            let mut image=vec![0;17*2048];
+            let mut payload=label();
+            payload[1..6].copy_from_slice(standard);
+            payload[8..40].fill(b' ');
+            payload[8..26].copy_from_slice(b"CD-RTOS CD-BRIDGE ");
+            image[16*2048..].copy_from_slice(&payload);
+            let fixture=Fixture::new(&image,"iso");
+            let cd=CdRom::open(&fixture.path).unwrap();
+            if standard==b"XXXXX" {assert!(cd.volume_id.is_empty());}
+            else { assert_eq!(cd.disc_type,0x20); assert_eq!(cd.volume_id,"Volume"); }
+            drop(cd);
+        }
+    }
+
+    #[test]
+    fn rejects_form2_wrong_sector_headers_and_audio_as_data() {
+        for variant in 0..3 {
+            let mut sector=raw(&label(),2);
+            if variant==0 {sector[18]=0x20;sector[22]=0x20;}
+            if variant==1 {sector[14]=0x17;}
+            let mut image=vec![0;17*CD_SECTOR_RAW_SIZE];
+            image[16*CD_SECTOR_RAW_SIZE..].copy_from_slice(&sector);
+            let fixture=Fixture::new(&image,"bin");
+            let mut cd=CdRom::open(&fixture.path).unwrap();
+            if variant==2 {cd.tracks[0].control=1;cd.detect_disc_type();assert_eq!(cd.disc_type,0);}
+            let mut out=[0x55;2048];
+            assert!(!cd.read_data_sector(16,&mut out));
+            assert_eq!(out,[0x55;2048]);
+            drop(cd);
+        }
+    }
 
     #[test]
     fn test_parse_drive_letter() {

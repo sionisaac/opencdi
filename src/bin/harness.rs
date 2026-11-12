@@ -44,7 +44,7 @@ fn dump_ppm(fb: &[u32], path: &str) {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: harness <bios.rom> <disc|none> <frames> [--dvc <rom>] [--video-levels full|studio] [--ppm <out.ppm>] [--ntsc] [--autoplay [--print-autoplay-script]] [--input <script|@file>] [--sample <n> [--sample-audio]] [--dump-every <n> <prefix>] [--roundtrip <frame>] [--counters] [--idle-pc <hex>] [--board mono1|mono4] [--audio-out <file.s16>] [--nvram-out <file>]");
+    eprintln!("usage: harness <bios.rom> <disc|none> <frames> [--dvc <rom>] [--video-levels full|studio] [--ppm <out.ppm>] [--ntsc] [--autoplay [--require-launch] [--print-autoplay-script]] [--input <script|@file> | --post-input <script|@file>] [--absolute-input | --absolute-game-input] [--sample <n> [--sample-audio]] [--dump-every <n> <prefix>] [--roundtrip <frame>] [--counters] [--idle-pc <hex>] [--board mono1|mono4] [--audio-out <file.s16>] [--nvram-in <file>] [--nvram-out <file>] [--state-in <file>] [--state-out <file>] [--peek <hex-address> <bytes>]");
     std::process::exit(2);
 }
 
@@ -59,8 +59,12 @@ fn main() {
     let mut ppm: Option<&String> = None;
     let mut ntsc = false;
     let mut autoplay = false;
+    let mut require_launch = false;
     let mut print_script = false;
     let mut input: Option<String> = None;
+    let mut post_input = false;
+    let mut absolute_input = false;
+    let mut absolute_game_input = false;
     let mut sample = 0u64;
     let mut sample_audio = false;
     let mut dump: Option<(u64, String)> = None;
@@ -70,9 +74,15 @@ fn main() {
     let mut idle_pc: Option<u32> = None;
     let mut audio_out: Option<(String, Vec<u8>)> = None;
     let mut nvram_out: Option<&String> = None;
+    let mut nvram_in: Option<&String> = None;
+    let mut state_in: Option<&String> = None;
+    let mut state_out: Option<&String> = None;
+    let mut peeks: Vec<(u32,usize)> = Vec::new();
     let mut i = 4;
     while i < a.len() {
         match a[i].as_str() {
+            "--absolute-input" => absolute_input = true,
+            "--absolute-game-input" => absolute_game_input = true,
             "--dvc" => { i += 1; dvc = a.get(i); }
             "--video-levels" => {
                 i += 1;
@@ -85,6 +95,14 @@ fn main() {
             "--ppm" => { i += 1; ppm = a.get(i); }
             "--audio-out" => { i += 1; audio_out = Some((a.get(i).cloned().unwrap_or_else(|| usage()), Vec::new())); }
             "--nvram-out" => { i += 1; nvram_out = Some(a.get(i).unwrap_or_else(|| usage())); }
+            "--nvram-in" => { i += 1; nvram_in = Some(a.get(i).unwrap_or_else(|| usage())); }
+            "--state-in" => { i += 1; state_in = Some(a.get(i).unwrap_or_else(|| usage())); }
+            "--state-out" => { i += 1; state_out = Some(a.get(i).unwrap_or_else(|| usage())); }
+            "--peek" => {
+                let at = a.get(i+1).and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"),16).ok()).unwrap_or_else(|| usage());
+                let n = a.get(i+2).and_then(|s| s.parse::<usize>().ok()).filter(|n| *n <= 256).unwrap_or_else(|| usage());
+                peeks.push((at,n)); i += 2;
+            }
             "--ntsc" => ntsc = true,
             "--counters" => counters = true,
             "--board" => {
@@ -93,8 +111,14 @@ fn main() {
             }
             "--idle-pc" => { i += 1; idle_pc = Some(a.get(i).and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok()).unwrap_or_else(|| usage())); }
             "--autoplay" => autoplay = true,
+            "--require-launch" => { autoplay = true; require_launch = true; }
             "--print-autoplay-script" => print_script = true,
-            "--input" => { i += 1; input = Some(a.get(i).cloned().unwrap_or_else(|| usage())); }
+            "--input" | "--post-input" => {
+                if input.is_some() { usage(); }
+                post_input = a[i] == "--post-input";
+                if post_input { autoplay = true; require_launch = true; }
+                i += 1; input = Some(a.get(i).cloned().unwrap_or_else(|| usage()));
+            }
             "--sample" => { i += 1; sample = a.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| usage()); }
             "--sample-audio" => sample_audio = true,
             "--roundtrip" => { i += 1; roundtrip = Some(a.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| usage())); }
@@ -107,7 +131,9 @@ fn main() {
         }
         i += 1;
     }
-    if (print_script && !autoplay) || (autoplay && input.is_some()) || (sample_audio && sample == 0) || roundtrip.is_some_and(|n| n >= frames) {
+    if (print_script && !autoplay) || (autoplay && input.is_some() && !post_input) || (sample_audio && sample == 0) || roundtrip.is_some_and(|n| n >= frames)
+        || (require_launch && disc == "none") || (state_in.is_some() && autoplay)
+        || (state_out.is_some() && roundtrip.is_some()) {
         usage();
     }
     let mut player = input.map(|s| {
@@ -120,10 +146,25 @@ fn main() {
     let mut recorded: Vec<Event> = Vec::new();
 
     let mut m = Machine::new();
+    // Tests must never flush guest writes into a user's persistent save.
+    m.bus.nvram.persist = false;
     let report = m.load_bios(bios).unwrap_or_else(|e| panic!("load bios {}: {}", bios, e));
     eprintln!("bios {}: {}", report.status, report.message);
     if let Some(b) = board {
         m.bus.set_board(b);
+    }
+    if let Some(p) = nvram_in {
+        let bytes = std::fs::read(p).expect("read nvram input");
+        match m.bus.mono4.as_deref_mut() {
+            Some(board) => {
+                assert!(matches!(bytes.len(),8192 | 32768), "Mono-IV NVRAM input must be 8192 or 32768 bytes");
+                board.nvram.load_bytes(&bytes);
+            }
+            None => {
+                assert_eq!(bytes.len(), m.bus.nvram.ram.len(), "Mono-I NVRAM input must be exactly 8192 bytes");
+                m.bus.nvram.ram.copy_from_slice(&bytes);
+            }
+        }
     }
     eprintln!("board {:?}", m.bus.board);
     if let Some(p) = dvc {
@@ -135,27 +176,34 @@ fn main() {
     }
     m.set_video_mode(if ntsc { VideoMode::Ntsc } else { VideoMode::Pal });
     m.reset();
+    if let Some(path) = state_in {
+        let bytes = std::fs::read(path).expect("read input state");
+        m.load_state(&bytes).expect("load input state");
+        m.bus.nvram.persist = false;
+    }
 
     let mut video_all = FNV_OFFSET;
     let mut audio_all = FNV_OFFSET;
     let mut audio_samples = 0u64;
     let mut audio_nonzero = 0u64;
     let mut disc_launched = false;
+    let mut boot_frame: Option<u64> = None;
     let mut shell_ready_count = 0u32;
     let mut audio_buf: Vec<(f32, f32)> = Vec::new();
     let (mut win_samples, mut win_nonzero) = (0u64, 0u64);
     let mut idle_first: Option<u64> = None;
 
     // Round trip: save at `at`, run to the end (A), load, rerun the same frames with the same input (B).
-    let mut saved: Option<(Vec<u8>, bool, u32, Option<Player>)> = None;
+    let mut saved: Option<(Vec<u8>, bool, u32, Option<Player>, Option<u64>)> = None;
     let mut pass_a: Option<(u64, u64, u64, u64)> = None;
+    let mut resave_same = true;
     let mut start = 0;
     'passes: loop {
         for frame in start..frames {
             if roundtrip == Some(frame) && saved.is_none() {
                 let mut buf = Vec::new();
                 m.save_state(&[], &mut buf);
-                saved = Some((buf, disc_launched, shell_ready_count, player.clone()));
+                saved = Some((buf, disc_launched, shell_ready_count, player.clone(), boot_frame));
                 (video_all, audio_all, audio_samples) = (FNV_OFFSET, FNV_OFFSET, 0);
             }
             if autoplay && m.bus.cdrom.is_some() && !disc_launched {
@@ -166,35 +214,30 @@ fn main() {
                 } else {
                     bus.peek_long(0x0000C000u32.wrapping_add(0xFFFF9172)).unwrap_or(0)
                 };
-                if shell_state >= 2 {
-                    shell_ready_count += 1;
-                    let btn = match shell_ready_count {
-                        1 | 50 | 150 | 200 => Some(0),
-                        30 | 180 => Some(1),
-                        _ => None,
-                    };
-                    if let Some(b) = btn {
-                        bus.slave.update_mouse(575, 335, b);
-                        recorded.push(Event::Pointer { frame, x: 575, y: 335, buttons: b });
-                    }
+                if let Some((x,y,b)) = opencdi::boot::shell_play_click(bus, shell_state, &mut shell_ready_count) {
+                    if absolute_input { opencdi::boot::send_game_pointer(bus,x,y,b); }
+                    else { opencdi::boot::send_shell_pointer(bus,x,y,b); }
+                    recorded.push(Event::Pointer { frame, x, y, buttons: b });
                 }
-                if ((cpu.pc >= 0x0001_0000 && cpu.pc < 0x0030_0000) || (cpu.pc >= 0x00D0_0000 && cpu.pc < 0x00E0_0000)) && frame > 250 {
+                let started = opencdi::boot::disc_program_started(cpu.pc, frame,
+                    if bus.mono4.is_some() { 0 } else { shell_state }, shell_ready_count);
+                if started {
                     disc_launched = true;
-                    bus.slave.update_mouse(384, 280, 0);
+                    boot_frame = Some(frame);
+                    opencdi::boot::send_shell_pointer(bus,384,280,0);
                     recorded.push(Event::Pointer { frame, x: 384, y: 280, buttons: 0 });
+                    eprintln!("AUTOPLAY handover_frame={frame} pc={:08x} shell_state={shell_state}", cpu.pc);
                 }
             }
-            if let Some(p) = player.as_mut() {
-                let slave = &mut m.bus.slave;
-                if slave.device_mouse_updated {
-                    slave.device_mouse_updated = false;
-                    p.warp(slave.device_mouse_x, slave.device_mouse_y);
+            let input_frame = if post_input { boot_frame.map(|at| frame - at) } else { Some(frame) };
+            if let (Some(p),Some(input_frame)) = (player.as_mut(),input_frame) {
+                if m.bus.slave.device_mouse_updated {
+                    m.bus.slave.device_mouse_updated = false;
+                    p.warp(m.bus.slave.device_mouse_x, m.bus.slave.device_mouse_y);
                 }
-                if let Some((x, y, b)) = p.step(frame) {
-                    match m.bus.mono4.as_deref_mut() {
-                        Some(m4) => m4.ikat.update_pointer(x, y, b),
-                        None => slave.update_mouse(x, y, b),
-                    }
+                if let Some((x, y, b)) = p.step(input_frame) {
+                    if absolute_input || absolute_game_input { opencdi::boot::send_game_pointer(&mut m.bus,x,y,b); }
+                    else { opencdi::boot::send_shell_pointer(&mut m.bus,x,y,b); }
                 }
             }
 
@@ -214,7 +257,29 @@ fn main() {
             }
             if sample > 0 && (frame + 1) % sample == 0 {
                 let nb = nonblack_count(m.framebuffer());
-                eprintln!("SAMPLE frame={} nonblack={}", frame + 1, nb);
+                eprintln!("SAMPLE frame={} nonblack={} pc={:08x} shell_ram={:08x} shell_dvc={:08x}", frame + 1, nb, m.cpu.pc,
+                    m.bus.peek_long(0x5172).unwrap_or(0), m.bus.peek_long(0xD01202).unwrap_or(0));
+                if let Some(board) = m.bus.mono4.as_deref() {
+                    eprintln!("BOARD frame={} sectors={} lba={} drive_active={} selecting={} imr={:02x}", frame + 1,
+                        board.ciap.sectors, board.ciap.lba, board.ciap.drive_active, board.ciap.selecting, board.ikat.imr);
+                }
+                if m.bus.dvc.is_fitted() {
+                    let d = &m.bus.dvc;
+                    eprintln!("MPEG frame={} video={} audio={} pictures={} visr={:04x} vier={:04x} aisr={:04x} aier={:04x}",frame+1,
+                        d.video_playing,d.audio_enabled,d.frames_presented_count,
+                        d.get_fmv_word(opencdi::dvc::FMV_ISR),d.get_fmv_word(opencdi::dvc::FMV_IER),
+                        d.get_fma_word(opencdi::dvc::FMA_ISR),d.get_fma_word(opencdi::dvc::FMA_IER));
+                }
+                if std::env::var_os("CDI_PROBE_PC").is_some() {
+                    let at = m.cpu.pc.saturating_sub(64);
+                    let words: Vec<_> = (0..48).map(|n| m.bus.peek_word(at+n*2).unwrap_or(0)).collect();
+                    eprintln!("PROBE pc={:08x} from={at:08x} words={:04x?} regs={:08x?}",m.cpu.pc,words,m.cpu.dar);
+                }
+                if std::env::var_os("CDI_PROBE_DISPLAY").is_some() {
+                    let d = &m.bus.mcd212;
+                    eprintln!("DISPLAY icm={:08x} tcr={:08x} order={} dcr={:04x?} ddr={:04x?} vsr={:08x?} dcp={:08x?} dca={:08x?} key={:08x?} mask={:08x?} matte={:08x?} weight={:?}",
+                        d.image_coding_method,d.transparency_control,d.plane_order,d.dcr,d.ddr,d.vsr,d.dcp,d.dca,d.transparent_color,d.mask_color,d.matte_control,[d.weight_factor[0][384],d.weight_factor[1][384]]);
+                }
                 if sample_audio {
                     eprintln!("AUDIO frame={} samples={} nonzero={}", frame + 1, win_samples, win_nonzero);
                     (win_samples, win_nonzero) = (0, 0);
@@ -226,7 +291,7 @@ fn main() {
                 }
             }
         }
-        if let (Some(at), Some((buf, dl, src, pl))) = (roundtrip, saved.as_ref()) {
+        if let (Some(at), Some((buf, dl, src, pl, bf))) = (roundtrip, saved.as_ref()) {
             let now = (video_all, video_hash(FNV_OFFSET, m.framebuffer()), audio_all, audio_samples);
             match pass_a {
                 None => {
@@ -234,8 +299,10 @@ fn main() {
                     m.load_state(buf).expect("load_state");
                     let mut again = Vec::new();
                     m.save_state(&[], &mut again);
-                    eprintln!("ROUNDTRIP-RESAVE {} size={}", if &again == buf { "same" } else { "DIFF" }, buf.len());
+                    resave_same = &again == buf;
+                    eprintln!("ROUNDTRIP-RESAVE {} size={}", if resave_same { "same" } else { "DIFF" }, buf.len());
                     (disc_launched, shell_ready_count, player) = (*dl, *src, pl.clone());
+                    boot_frame = *bf;
                     (video_all, audio_all, audio_samples) = (FNV_OFFSET, FNV_OFFSET, 0);
                     start = at;
                     continue 'passes;
@@ -248,6 +315,10 @@ fn main() {
                         if (a.0, a.1) == (now.0, now.1) { "match" } else { "DIFFER" },
                         if (a.2, a.3) == (now.2, now.3) { "match" } else { "DIFFER" }
                     );
+                    if a != now || !resave_same || (require_launch && !disc_launched) {
+                        eprintln!("validation failed: replay mismatch, changed saved state, or required handover absent");
+                        std::process::exit(1);
+                    }
                     return;
                 }
             }
@@ -256,6 +327,15 @@ fn main() {
     }
 
     let video_last = video_hash(FNV_OFFSET, m.framebuffer());
+    for (at,n) in peeks {
+        let bytes: Vec<_> = (0..n).map(|i| m.bus.peek_byte(at.wrapping_add(i as u32))).collect();
+        eprintln!("PEEK at={at:08x} bytes={bytes:02x?}");
+    }
+    if let Some(path) = state_out {
+        let mut bytes = Vec::new();
+        m.save_state(&[], &mut bytes);
+        std::fs::write(path,bytes).expect("write output state");
+    }
     let nonblack = nonblack_count(m.framebuffer());
     if let Some(p) = ppm {
         dump_ppm(m.framebuffer(), p);
@@ -286,6 +366,10 @@ fn main() {
     }
     if print_script {
         println!("AUTOPLAY_SCRIPT {}", input_script::format(&recorded));
+    }
+    if require_launch && !disc_launched {
+        eprintln!("validation failed: no disc-program handover within {frames} frames");
+        std::process::exit(1);
     }
 }
 

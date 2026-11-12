@@ -62,6 +62,8 @@ pub struct CdiBus {
 
     pub scc_timer: SccTimer,
     pub scc_uart_cmd: u8,
+    pub scc_uart_mode: u8,
+    pub scc_uart_clock: u8,
     pub scc_uart_tx_irq: bool,
     pub uart_capture: Option<Vec<u8>>, // Some: UART bytes are collected for the host instead of printed
     pub current_pc: u32,
@@ -101,6 +103,8 @@ impl CdiBus {
 
             scc_timer: SccTimer::new(),
             scc_uart_cmd: 0,
+            scc_uart_mode: 0,
+            scc_uart_clock: 0,
             scc_uart_tx_irq: false,
             uart_capture: None,
             current_pc: 0,
@@ -149,6 +153,8 @@ impl CdiBus {
         self.scc_timer = SccTimer::new();
         self.dma = SccDma::new();
         self.scc_uart_cmd = 0;
+        self.scc_uart_mode = 0;
+        self.scc_uart_clock = 0;
         self.scc_uart_tx_irq = false;
         self.shared_in4_owner = SharedIn4Owner::Idle;
         self.current_pc = 0;
@@ -614,10 +620,12 @@ impl CdiBus {
         if (address & 0xFFFF_0000) == 0x8000_0000 || (address & 0x00FF_0000) == 0x0080_0000 {
             let reg = address & 0xFFFF;
             return match reg {
-                // UART Status Register: Bit 2 = Tx Ready / Empty (0x04)
-                0x2011 | 0x2013 => 0x04,
-                0x2015 => self.scc_uart_cmd,
-                0x2017 | 0x2019 => 0x00,
+                0x2011 => self.scc_uart_mode,
+                // The headless serial sink consumes bytes immediately: TX ready and empty.
+                0x2013 => 0x0C,
+                0x2015 => self.scc_uart_clock | 0x08,
+                0x2017 => self.scc_uart_cmd,
+                0x2019 | 0x201B => 0x00,
 
                 // LIR: Line Interrupt Register (INT1/INT2)
                 0x1001 => self.scc_timer.read_byte(reg),
@@ -894,7 +902,7 @@ impl CdiBus {
             let reg = address & 0xFFFF;
             match reg {
                 // UART Transmit Data
-                0x2017 | 0x2019 => {
+                0x2019 => {
                     if let Some(buf) = self.uart_capture.as_mut() {
                         buf.push(value);
                     } else {
@@ -910,7 +918,9 @@ impl CdiBus {
                         self.scc_uart_tx_irq = true;
                     }
                 }
-                0x2015 => {
+                0x2011 => self.scc_uart_mode = value & 0xDF,
+                0x2015 => self.scc_uart_clock = value,
+                0x2017 => {
                     self.scc_uart_cmd = value;
                     let tx_cmd = (value >> 2) & 3;
                     if tx_cmd == 1 {
@@ -1231,6 +1241,9 @@ impl CdiBus {
             None => Ok(()),
             Some(a) => {
                 self.counters.bus_errors += 1;
+                if std::env::var_os("CDI_BUS_FAULT_TRACE").is_some() {
+                    eprintln!("BUS-FAULT frame={} kind={} address={:08X} pc~{:08X}", self.current_frame, kind, a, self.current_pc);
+                }
                 if !mono1 {
                     self.mono4_unmapped(kind, a & 0x00FF_FFFF, 0xFF);
                 }
@@ -1571,6 +1584,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn uart_registers_keep_command_clock_and_data_separate() {
+        let mut bus = CdiBus::new();
+        bus.uart_capture = Some(Vec::new());
+        bus.write_byte(0x8000_2015, 0x77); // clock select, not transmitter enable
+        assert!(!bus.scc_uart_tx_irq);
+        assert_eq!(bus.read_byte(0x8000_2015), 0x7F);
+        bus.write_byte(0x8000_2011, 0xFF);
+        assert_eq!(bus.read_byte(0x8000_2011), 0xDF);
+        bus.write_byte(0x8000_2017, 0x05); // enable receiver and transmitter
+        assert!(bus.uart_capture.as_ref().unwrap().is_empty());
+        assert!(bus.scc_uart_tx_irq);
+        assert_eq!(bus.read_byte(0x8000_2017), 0x05);
+        assert_eq!(bus.read_byte(0x8000_2013) & 0x0D, 0x0C); // ready, empty, no RX data
+        bus.write_byte(0x8000_2019, b'X');
+        assert_eq!(bus.uart_capture.as_ref().unwrap(), b"X");
+        bus.write_byte(0x8000_2017, 0x09); // disable TX
+        assert!(!bus.scc_uart_tx_irq);
+    }
+
+    #[test]
     fn peek_matches_read_without_side_effects() {
         let mut bus = CdiBus::new();
         bus.mcd212.plane_a[0x5172..0x5176].copy_from_slice(&[0x00, 0x00, 0x00, 0x02]);
@@ -1666,7 +1699,7 @@ mod tests {
 opencdi::impl_state_enum!(SharedIn4Owner { Idle = 0, Cdic = 1, Vmpeg = 2 });
 
 opencdi::impl_state!(CdiBus {
-    mono4, sys_ram, dvc, cdic, dma, mcd212, nvram, slave, shared_in4_owner, scc_timer, scc_uart_cmd, scc_uart_tx_irq,
+    mono4, sys_ram, dvc, cdic, dma, mcd212, nvram, slave, shared_in4_owner, scc_timer, scc_uart_cmd, scc_uart_mode, scc_uart_clock, scc_uart_tx_irq,
     current_pc, wait_cycles, current_line_cycle, emulate_wait_states, current_frame,
 } skip {
     board, onchip_loud, mono4_bus_errors, rom, cdrom, uart_capture, trace_setup, watch_addr1, watch_addr2, watch_enabled, trace_fmv, taps, counters,

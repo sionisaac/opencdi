@@ -50,6 +50,7 @@ pub const ID_NVRAM_GLOBAL: usize = 1006;
 pub const ID_NVRAM_PER_DISC: usize = 1007;
 pub const ID_PATH_ADD_DISCS: usize = 1220;
 pub const ID_SWITCH_BIOS: usize = 1225;
+pub const ID_BIOS_490: usize = 1226;
 
 pub const ID_STATE_QUICK_SAVE: usize = 1070;
 pub const ID_STATE_QUICK_LOAD: usize = 1071;
@@ -351,6 +352,17 @@ pub fn modal<R>(hwnd: *mut std::ffi::c_void, f: impl FnOnce() -> R) -> R {
     r
 }
 
+pub fn update_bios_menu(model: &str) {
+    unsafe {
+        if !MENU_HANDLE.is_null() {
+            for (id,name) in [(ID_SWITCH_BIOS,"220"),(ID_BIOS_490,"490")] {
+                CheckMenuItem(MENU_HANDLE,id as u32,MF_BYCOMMAND | if model.contains(name) { MF_CHECKED } else { MF_UNCHECKED });
+            }
+            if !OWNER_HWND.is_null() { DrawMenuBar(OWNER_HWND); }
+        }
+    }
+}
+
 pub fn update_input_device_menu(mode: InputDeviceMode) {
     unsafe {
         if !MENU_HANDLE.is_null() {
@@ -647,7 +659,11 @@ unsafe extern "system" fn custom_wndproc(
                 return 0;
             }
             ID_SWITCH_BIOS => {
-                if let Some(path) = modal(hwnd, || open_bios_dialog(hwnd)) { push_action(GuiAction::SwitchBios(path)); }
+                push_action(GuiAction::SelectBios(220));
+                return 0;
+            }
+            ID_BIOS_490 => {
+                push_action(GuiAction::SelectBios(490));
                 return 0;
             }
             ID_HELP_FEEDBACK => {
@@ -780,17 +796,13 @@ pub fn attach_gui_menu(
 
         let settings_menu = CreatePopupMenu();
         AppendMenuW(settings_menu, MF_STRING, ID_PATH_ADD_DISCS, to_wide("Add Disc Folder...").as_ptr());
-        AppendMenuW(settings_menu, MF_STRING, ID_SWITCH_BIOS, to_wide("Switch BIOS...").as_ptr());
+        AppendMenuW(settings_menu, MF_STRING, ID_SWITCH_BIOS, to_wide("BIOS 220").as_ptr());
+        AppendMenuW(settings_menu, MF_STRING, ID_BIOS_490, to_wide("BIOS 490").as_ptr());
         AppendMenuW(main_menu, MF_POPUP, settings_menu as usize, to_wide("Settings").as_ptr());
 
         // 2. Controls Menu
         let controls_menu = CreatePopupMenu();
 
-        let device_menu = CreatePopupMenu();
-        AppendMenuW(device_menu, MF_STRING, ID_INPUT_DEVICE_GAMEPAD, to_wide("CD-i Gamepad (USB Controller / Keyboard)\tF9").as_ptr());
-        AppendMenuW(device_menu, MF_STRING, ID_INPUT_DEVICE_MOUSE, to_wide("Philips CD-i Mouse (Host Cursor)\tF9").as_ptr());
-        AppendMenuW(controls_menu, MF_POPUP, device_menu as usize, to_wide("Input Device (Exclusive)").as_ptr());
-        AppendMenuW(controls_menu, MF_SEPARATOR, 0, std::ptr::null());
 
         AppendMenuW(controls_menu, MF_STRING, ID_PROFILE_STANDARD, to_wide("Key Profile: Standard (Arrow Keys + Z / X)").as_ptr());
         AppendMenuW(controls_menu, MF_STRING, ID_PROFILE_WASD, to_wide("Key Profile: WASD + J / K (PC Style)").as_ptr());
@@ -983,7 +995,7 @@ pub fn show_controls_dialog(owner: *mut std::ffi::c_void) {
            • F11 or Alt+Enter: Cycle display modes (borderless, decorated, windowed)\n\
            • F5 or H: Restart console (Reset)\n\
            • F6: Quick Save State (Slot 1)  |  F7: Quick Load State (Slot 1)\n\
-           • F9: Switch Active Input Device (Gamepad <-> Mouse)\n\
+           • Mouse, gamepad and Wiimote are available together\n\
            • P: Pause  |  Space (hold): Fast-forward\n\
            • F8: Screenshot (PPM)  |  F12: Screenshot (BMP)\n\
            • Ctrl+I: Insert disc  |  Ctrl+O: Open disc image and restart\n\
@@ -1006,9 +1018,9 @@ pub fn show_disc_error(owner: *mut std::ffi::c_void, text: &str) {
 }
 
 pub fn show_about_dialog(owner: *mut std::ffi::c_void) {
-    let text = to_wide(
+    let text = to_wide(&format!(
         "OpenCDi - Philips CD-i Emulator\n\
-        Version: 0.2.0 (High Performance Edition)\n\
+        Version: {}\nBuild: {}\n\
         Emulator Core by sigsantilio and Arnold de Ruiter\n\
         Built with Rust, winit & softbuffer\n\n\
         Key Emulation Features:\n\
@@ -1023,7 +1035,7 @@ pub fn show_about_dialog(owner: *mut std::ffi::c_void) {
         • The MAME Team (BSD-3-Clause CD-i drivers: cdi, mcd212, cdicdic, scc68070)\n\
         • The CDi_MiSTer project (ash2020) for FPGA hardware research\n\
         • The CD-i preservation community"
-    );
+    , env!("CARGO_PKG_VERSION"), env!("OPENCDI_BUILD_ID")));
     let title = to_wide("About OpenCDi");
     unsafe {
         MessageBoxW(owner, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONINFORMATION);

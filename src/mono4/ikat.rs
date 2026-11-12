@@ -128,7 +128,11 @@ impl Ikat {
             }
         }
         self.reported = Some((x, y));
-        let (x, y) = ((x * 0x3FF / 0x2FF) as u16, (y * 0x3FF / 0x22F) as u16);
+        // The driver truncates 10-bit positions to screen pixels. Choose the
+        // first wire coordinate in the requested pixel, rather than rounding
+        // down into the preceding pixel. Host Y always spans 560 input lines.
+        let (x, y) = (((x * 1023 + 766) / 767) as u16,
+                      ((y * 1023 + 558) / 559) as u16);
         let r = [
             0x40 | btn | ((x >> 6) & 0x0F) as u8,
             0x10 | ((y >> 6) & 0x0F) as u8,
@@ -371,11 +375,29 @@ impl Ikat {
 }
 
 opencdi::impl_state!(Port { cmd, reply, len } skip {});
-opencdi::impl_state!(Ikat { mode, imr, ports, keyboard_enabled, pal, disc_present, pointer, toc_reply, reset_request } skip { drive_busy, drive_event, loud, trace, reported });
+opencdi::impl_state!(Ikat { mode, imr, ports, keyboard_enabled, pal, disc_present, pointer, toc_reply, reset_request, reported } skip { drive_busy, drive_event, loud, trace });
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_state_replays_relative_pointer_movement() {
+        use crate::savestate::{State, Reader};
+        let mut k = Ikat::default();
+        k.write(0x1B, 8, 0);
+        k.ports[1].reply.clear();
+        k.update_pointer(400,300,0);
+        k.ports[1].reply.clear();
+        let mut saved = Vec::new(); k.save(&mut saved);
+        k.update_pointer(401,301,0);
+        let expected: Vec<_> = k.ports[1].reply.drain(..).collect();
+        k.update_pointer(410,310,0);
+        k.load(&mut Reader::new(&saved)).unwrap();
+        k.update_pointer(401,301,0);
+        let replay: Vec<_> = k.ports[1].reply.drain(..).collect();
+        assert_eq!(replay,expected);
+    }
 
     #[test]
     fn identification_reply_and_level2_line() {
@@ -439,7 +461,7 @@ mod tests {
         let mut k = Ikat { pointer: (384, 280, 0), ..Ikat::default() };
         k.write(0x1B, 0x08, 0);
         let r: Vec<u8> = (0..4).map(|_| k.read(0x0B, 0)).collect();
-        assert_eq!(r, [0x48, 0x18, 0x00, 0x80]);
+        assert_eq!(r, [0x48, 0x18, 0x01, 0x81]);
         k.write(0x1B, 0x88, 0);
         assert_eq!(k.pending(), 0x08);
         k.update_pointer(0, 0, 1);
@@ -478,10 +500,10 @@ mod tests {
         let report: Vec<u8> = (0..4).map(|_| k.read(0x0B, 0)).collect();
         assert_eq!(report[1] & 0x10, 0x10);
         assert_ne!(report[3] & 0x80, 0);
-        let x = (385 * 1023 / 767) as u16;
-        let y = (281 * 1023 / 559) as u16;
-        assert_eq!(report, [0x60 | ((x >> 6) & 15) as u8,
-            0x10 | ((y >> 6) & 15) as u8, (x & 63) as u8, 0x80 | (y & 63) as u8]);
+        let x = (((report[0] & 15) as u16) << 6) | report[2] as u16;
+        let y = (((report[1] & 15) as u16) << 6) | (report[3] & 63) as u16;
+        assert_eq!(report[0] & 0x30, 0x20);
+        assert_eq!((x as u32 * 767 / 1023, y as u32 * 559 / 1023), (385, 281));
     }
 
     #[test]

@@ -16,19 +16,45 @@ OpenCDi requires a Philips CD-i system BIOS, which must be supplied by the user.
 By default, place the files here:
 
 ```text
-%APPDATA%\OpenCDI\bios\cdi220b.rom
-%APPDATA%\OpenCDI\bios\vmpega.rom
+%APPDATA%\OpenCDI\BIOS\cdi220b.rom
+%APPDATA%\OpenCDI\BIOS\vmpega.rom
 ```
 
-Create a `Portable` folder beside `opencdi.exe` before first launch to store settings, BIOS, artwork, save states, NVRAM, and per-disc configurations alongside the app. In portable mode, place firmware in `Portable\bios`.
+Create a `Portable` folder beside `opencdi.exe` before first launch to store settings, BIOS, artwork, save states, NVRAM, and per-disc configurations alongside the app. In portable mode, place firmware in `Portable\BIOS`.
 
 ## 3. Add discs and artwork
 
-Use **Open Disc** to select a CHD, ISO, or CUE image. When Windows detects a readable CD-i disc, the toolbar also offers **Play Disc** with the drive letter. Both open the disc details screen. Choose **Play** with the mouse, press Enter, or press the configured gamepad Button I to start emulation. Use **Back to Library**, Escape, or Button II to leave the preview.
+Use **Open Disc** to select a CHD, ISO, or CUE image. When Windows detects a readable CD-i disc, the floating toolbar also offers **Play Disc** immediately to the left of Open Disc. Both open the disc details screen. Choose **Play** with the mouse, press Enter, or press the configured gamepad Button I to start emulation. Use **Back to Library**, Escape, or Button II to leave the preview.
 
-Use **Settings → Add Disc Folder** to scan a folder and its subfolders. Artwork uses the default app-data folders. **Settings → Switch BIOS** lets you choose another system ROM, which OpenCDi remembers for later launches.
+The floating toolbar uses smooth outline icons, textured rounded buttons and blue
+hover feedback. Settings, About and Exit sit in the right-hand dock. The matching
+search field and artwork-size slider keep their existing positions and behavior.
 
-The smallest artwork setting shows 10 columns and 4 rows. Disc names appear below the artwork. Covers appear as they download. The library displays the Cover Missing image when no cover is available, and the startup screen uses a generic CD-i disc when it has no disc art. Use the artwork slider to choose a larger size. Move through the library with the keyboard, mouse wheel, gamepad D-pad, or left analog stick. Press Enter or gamepad A, or double-click a cover, to view the selected disc.
+Category tabs, Controller Settings and the pause menu share the same outline
+icons, textured surfaces and blue selection treatment. The library grid keeps
+its existing space, and Controller Settings retains the Gamepad, Mouse and
+Peacekeeper photographs. The pause menu has Resume, Disc Info, Save State,
+Load State, Controller Settings, Back to Library and Exit OpenCDi. Mouse and
+Wiimote pointing highlight the pause action beneath the pointer; keyboard and
+gamepad navigation remain available. Home or the configured pause key also resumes.
+
+Primary box art and CD artwork use the original disc title as the filename, such
+as `Boxart/Mad Dog McCree (USA, Europe).png` and `CD/Mad Dog McCree (USA, Europe).png`.
+Existing `--generated` and `-disc` files are renamed during the background library
+scan when the clean destination does not already exist. Conflicting files are
+preserved. Legacy filenames remain readable.
+
+Per-disc NVRAM keeps the disc filename with a `.bin` extension in `NVRAM/220/` or `NVRAM/490/`. Save states use `Savestates/220/` or `Savestates/490/`. These folders are inside the active app-data folder, including Portable when enabled. Old NVRAM files are copied only into the BIOS folder matching their RAM size; existing files are preserved. Legacy save states are imported only after passing the BIOS/disc/DVC identity and checksum checks.
+
+Use **Start 220** or **Start 490** on the central toolbar dock to boot a system without a disc. The configured pause key/button, Wiimote Home, or a mouse-wheel press returns to the library from this screen. Escape also returns. During a running game, these pause controls open the pause menu; right click or Resume returns to gameplay.
+
+Physical mouse, dedicated gamepad and Wiimote remain enabled together. F9 switching is no longer needed. A single left click in the library opens disc details; Play starts emulation separately. Wiimote A/B mappings are unchanged. The Windows pointer is hidden during Wiimote gameplay and visible in app menus.
+
+The desktop clock is initialized from the PC local date/time and advances independently of emulation speed. Headless validation retains its fixed clock. About shows the release version and build identifier automatically.
+
+Use **Settings > Add Disc Folder** to scan your disc folders. Choose **BIOS 220** or **BIOS 490** in Settings; a tick marks the selected system. Firmware is found automatically in the BIOS folder. For the 490, supply `cdi490a.rom` and `impega.rom`.
+
+The smallest artwork setting shows 10 columns and 4 rows. Disc names appear below the artwork. Covers appear as they download. The library displays the Cover Missing image when no cover is available, and the startup screen uses a generic CD-i disc when it has no disc art. Use the artwork slider to choose a larger size. Move through the library with the keyboard, mouse wheel, gamepad D-pad, or left analog stick. Press Enter or gamepad A, or single-click a cover, to view the selected disc.
 
 ### Synopses and ScreenScraper
 
@@ -209,6 +235,19 @@ unverified. One Wiimote is supported at a time. Close other programs using the
 remote before connecting.
 
 Press Plus and Minus together on the Wiimote to exit OpenCDi.
+
+The library opens before loading collection artwork. Disc titles appear first;
+artwork fills in a page at a time in the background. With automatic disc start
+enabled on the CD-i 220 BIOS, Play runs the BIOS boot sequence without the normal
+frame limit, then restores normal speed when control passes to the disc program.
+Boot frames run in short batches between window updates so monitor refresh does
+not limit boot to one emulated frame per screen update.
+Boot acceleration stops after 30 seconds if startup stalls. Boot audio is muted
+during acceleration. The spinning disc uses real elapsed time rather than the
+emulated frame count. A game's own subsequent loading and introductions run at
+normal speed.
+The disc stays stationary on the library preview until Play is pressed. It spins
+during startup and continues spinning on the in-game Info screen while paused.
 
 Peacekeeper is selected automatically for Crime Patrol, Drug Wars / Crime Patrol II,
 The Last Bounty Hunter, Mad Dog McCree, Mad Dog II: The Lost Gold,

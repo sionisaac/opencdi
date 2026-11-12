@@ -50,8 +50,7 @@ impl ArtworkKind {
     }
 
     pub fn filename(self, title: &str, extension: &str) -> String {
-        let suffix = if self == Self::Disc { "-disc" } else { "" };
-        format!("{}{suffix}.{extension}", safe_name(title))
+        format!("{}.{extension}", safe_name(title))
     }
 }
 

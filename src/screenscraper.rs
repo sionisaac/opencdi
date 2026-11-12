@@ -198,7 +198,11 @@ fn preferred_filename(kind: ArtworkKind, title: &str, extension: &str) -> String
 
 pub fn preferred_gallery_image(folder: &Path, kind: ArtworkKind, title: &str) -> Option<PathBuf> {
     ["png", "jpg", "jpeg"].into_iter()
-        .map(|extension| folder.join(preferred_filename(kind, title, extension)))
+        .flat_map(|extension| {
+            let preferred = folder.join(preferred_filename(kind, title, extension));
+            let old = folder.join(format!("{}--screenscraper-disc.{extension}", crate::launchbox::safe_name(title)));
+            [Some(preferred), (kind == ArtworkKind::Disc).then_some(old)].into_iter().flatten()
+        })
         .find(|path| path.is_file())
 }
 
@@ -402,7 +406,7 @@ mod tests {
         let url = public_gallery_url(&game, ArtworkKind::Disc, "eu", Some(2)).unwrap();
         assert!(url.contains("gameid=104714&media=support-2D"));
         assert!(url.contains("&region=eu&num=2&"));
-        assert_eq!(preferred_filename(ArtworkKind::Disc, "Flashback (Europe)", "png"), "Flashback (Europe)--screenscraper-disc.png");
+        assert_eq!(preferred_filename(ArtworkKind::Disc, "Flashback (Europe)", "png"), "Flashback (Europe)--screenscraper.png");
     }
 
     #[test]

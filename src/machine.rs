@@ -122,6 +122,7 @@ impl Machine {
     }
 
     pub fn run_frame(&mut self) {
+        let fault_trace = std::env::var_os("CDI_BUS_FAULT_TRACE").is_some();
         let bus = &mut self.bus;
         let cpu = &mut self.cpu;
         let mut trace = self.os9_trace.as_deref_mut();
@@ -152,12 +153,24 @@ impl Machine {
                 bus.current_pc = cpu.pc;
                 bus.current_line_cycle = line_cycles.max(0) as u32;
 
-                let batch = match trace.as_deref_mut() {
-                    Some(t) if t.has_pending() => cpu.run_for_cycles_with_hook(bus, budget, |c, _, _| {
-                        t.check_return(c);
+                let batch = if fault_trace {
+                    cpu.run_for_cycles_with_hook(bus, budget, |c, b, _| {
+                        if let Some(vector) = c.last_exception_vector.take() {
+                            if vector < 24 {
+                                eprintln!("CPU-EXCEPTION frame={} vector={} ppc={:08X} pc={:08X} regs={:08X?}", b.current_frame, vector, c.ppc, c.pc, c.dar);
+                            }
+                        }
+                        if let Some(t) = trace.as_deref_mut() { t.check_return(c, b); }
                         m68k::CycleBatchControl::Continue
-                    }),
-                    _ => cpu.run_for_cycles(bus, budget),
+                    })
+                } else {
+                    match trace.as_deref_mut() {
+                        Some(t) if t.has_pending() => cpu.run_for_cycles_with_hook(bus, budget, |c, b, _| {
+                            t.check_return(c, b);
+                            m68k::CycleBatchControl::Continue
+                        }),
+                        _ => cpu.run_for_cycles(bus, budget),
+                    }
                 };
                 self.instructions += batch.instructions as u64;
                 let mut batch_cycles = batch.cycles + bus.consume_wait_cycles();
@@ -293,12 +306,23 @@ impl Default for Machine {
 pub fn highest_ipl(bus: &mut CdiBus) -> u8 {
     let int1_lvl = bus.scc_timer.int1_level();
     let timer_lvl = if bus.scc_timer.timer_irq { bus.scc_timer.picr1 & 7 } else { 0 };
-    int1_lvl.max(timer_lvl).max(bus.board_ipl())
+    let uart_lvl = if bus.scc_uart_tx_irq { bus.scc_timer.picr2 & 7 } else { 0 };
+    int1_lvl.max(timer_lvl).max(uart_lvl).max(bus.board_ipl())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uart_transmitter_interrupt_reaches_cpu_at_programmed_priority() {
+        let mut bus = CdiBus::new();
+        bus.scc_timer.picr2 = 0x34; // RX priority 3, TX priority 4
+        bus.scc_uart_tx_irq = true;
+        assert_eq!(highest_ipl(&mut bus), 4);
+        bus.scc_uart_tx_irq = false;
+        assert_eq!(highest_ipl(&mut bus), 0);
+    }
 
     #[test]
     fn cartridge_check_depends_on_the_board() {

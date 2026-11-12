@@ -167,17 +167,20 @@ pub fn render_native(dst:&mut [u32],width:usize,height:usize,view:(usize,usize,u
         return;
     }
     c.rect(0,0,library::W,42,0xFF0C1726);c.rect(0,41,library::W,1,0xFF26374A);
-    c.round_rect(12,8,112,26,7,0xFF1D2D40);c.text(21,15,"<  Back",0xFFD9E4EF,1);
+    c.surface(12,8,112,26,7,0xFF263C53,0xFF1B2D42,0xFF3B526B);c.icon(16,22,14,13,0xFFBADAF1);c.text(43,15,"Back",0xFFD9E4EF,1);
     c.text(20,54,"Controller Settings",0xFFF1F5FA,2);
-    c.round_rect(14,92,338,300,12,0xFF131F2E);c.round_rect(364,92,390,300,12,0xFF131F2E);
+    c.text(382,60,"All controls enabled together",0xFF91B8D8,1);
+    c.surface(14,92,338,300,12,0xFF182A3E,0xFF122033,0xFF30455E);c.surface(364,92,390,300,12,0xFF182A3E,0xFF122033,0xFF30455E);
     c.text(28,106,match mode { InputDeviceMode::Mouse => "CD-i Mouse", InputDeviceMode::Gamepad => "CD-i Gamepad", InputDeviceMode::Peacekeeper => "CD-i Peacekeeper" },0xFFEAF0F6,1);
     for (x,device,label) in [
-        (27,InputDeviceMode::Gamepad,"1 Gamepad"),
-        (132,InputDeviceMode::Mouse,"2 Mouse"),
-        (237,InputDeviceMode::Peacekeeper,"3 Peacekeeper"),
+        (27,InputDeviceMode::Gamepad,"Gamepad"),
+        (132,InputDeviceMode::Mouse,"Mouse"),
+        (237,InputDeviceMode::Peacekeeper,"Peacekeeper"),
     ] {
-        c.round_rect(x,124,100,27,7,if mode==device{0xFF3B9DE5}else{0xFF202D3E});
-        c.text(x+9,132,label,0xFFF1F6FA,1);
+        let selected=mode==device;
+        c.surface(x,124,100,27,7,if selected{0xFF2D506C}else{0xFF24394F},if selected{0xFF23415B}else{0xFF1B2D41},if selected{0xFF67C2FD}else{0xFF3A516A});
+        c.icon(match device{InputDeviceMode::Gamepad=>1,InputDeviceMode::Mouse=>19,InputDeviceMode::Peacekeeper=>18},x+7,130,13,if selected{0xFFB5E4FF}else{0xFFA7BED6});
+        c.text(x+25,132,label,0xFFF1F6FA,1);
     }
     let art=match mode { InputDeviceMode::Mouse=>mouse_art, InputDeviceMode::Gamepad=>gamepad_art, InputDeviceMode::Peacekeeper=>peacekeeper_art };
     let art_box=(20,158,326,190);
@@ -191,7 +194,7 @@ pub fn render_native(dst:&mut [u32],width:usize,height:usize,view:(usize,usize,u
             c.ring_art(art,art_box,(661.0,136.0),41.0,0xFFB49CF4);
         }
     }
-    c.round_rect(27,354,312,27,7,0xFF202D3E);c.text(41,362,if wiimote.is_some() {
+    c.surface(27,354,312,27,7,0xFF21394F,0xFF1A2D41,0xFF354F69);c.icon(match mode{InputDeviceMode::Gamepad=>1,InputDeviceMode::Mouse=>19,InputDeviceMode::Peacekeeper=>18},37,361,13,0xFF86CAFA);c.text(57,362,if wiimote.is_some() {
         match automatic {
             crate::wiimote::ControlMode::Pointer => "Wiimote - pointing mouse",
             crate::wiimote::ControlMode::Sideways => "Wiimote - sideways controller",
@@ -215,13 +218,14 @@ pub fn render_native(dst:&mut [u32],width:usize,height:usize,view:(usize,usize,u
             ("Library confirm / back","1 / 2 or A / B"),
         ].into_iter().enumerate() {
             let y=172+row*23;
+            c.surface(374,y-5,370,21,5,0xFF20364D,0xFF192D42,0xFF2D455E);
             c.text(382,y,label,0xFFB7C6D5,1);
             c.text(535,y,value,0xFFF1F6FA,1);
         }
-        c.round_rect(390,320,340,30,7,0xFF243B53);
-        c.text(463,330,"Calibrate aim (C)",0xFFEAF0F6,1);
+        c.surface(390,320,340,30,8,0xFF305774,0xFF24455F,0xFF64BFF9);
+        c.icon(18,441,328,14,0xFFB9E6FF);c.text(463,330,"Calibrate aim (C)",0xFFEAF0F6,1);
         c.text(382,365,notice,0xFF80C4FF,1);
-        c.round_rect(14,404,740,128,12,0xFF131F2E);
+        c.surface(14,404,740,128,12,0xFF182A3F,0xFF122034,0xFF30465F);
         c.text(28,418,"Peacekeeper controls",0xFFEAF0F6,1);
         c.text(28,445,"Point for mouse control. Hold sideways with the D-pad on the left.",0xFFB7C6D5,1);
         c.text(28,466,"Calibrate from your playing position. A clicks in menus; B returns.",0xFFB7C6D5,1);
@@ -231,31 +235,30 @@ pub fn render_native(dst:&mut [u32],width:usize,height:usize,view:(usize,usize,u
     }
 
     c.text(382,106,"Button Mapping",0xFFEAF0F6,1);c.text(481,128,"Keyboard",0xFF91A9C1,1);c.text(631,128,"Controller",0xFF91A9C1,1);
-    let names=["UP","DOWN","LEFT","RIGHT","BUTTON I","BUTTON II","BUTTON I/II","PAUSE MENU"];
+    let names=["Up","Down","Left","Right","Button I","Button II","Button I/II","Pause menu"];
     let keys=[bindings.up,bindings.down,bindings.left,bindings.right,bindings.btn1,bindings.btn2,bindings.btn3];
     let pads=[bindings.pad_up,bindings.pad_down,bindings.pad_left,bindings.pad_right,bindings.pad_btn1,bindings.pad_btn2,bindings.pad_btn3];
     for row in 0..ROWS{
         let y=145+row*29;let active=state.row==row;
-        c.round_rect(374,y,370,26,6,if active{0xFF243B53}else{0xFF1B2939});
+        c.surface(374,y,370,26,6,if active{0xFF27445E}else{0xFF1E3248},if active{0xFF203B54}else{0xFF172A3F},if active{0xFF426A8D}else{0xFF2C435C});
         c.text(384,y+7,names[row],if active{0xFF80C4FF}else{0xFFE4EBF2},1);
         let kv=if row==7{shortcuts.pause_key.map(key_to_string).unwrap_or("--")}else{key_to_string(keys[row])};
         let pv=if row==7{shortcuts.pause_pad.first().copied().map(pad_button_to_string).unwrap_or("--")}else{pad_button_to_string(pads[row])};
         native_field(&mut c,472,y+2,120,22,kv,active&&state.target==Target::Keyboard,state.listening&&active&&state.target==Target::Keyboard);
         native_field(&mut c,602,y+2,142,22,pv,active&&state.target==Target::Gamepad,state.listening&&active&&state.target==Target::Gamepad);
     }
-    c.round_rect(14,404,338,128,12,0xFF131F2E);c.text(28,418,"Hotkeys",0xFFEAF0F6,1);
+    c.surface(14,404,338,128,12,0xFF182A3F,0xFF122034,0xFF30465F);c.text(28,418,"Hotkeys",0xFFEAF0F6,1);
     c.text(28,447,"Pause",0xFFB1C0CF,1);native_field(&mut c,102,440,104,27,shortcuts.pause_key.map(key_to_string).unwrap_or("--"),state.listening&&state.target==Target::PauseKey,state.listening&&state.target==Target::PauseKey);
     c.text(222,447,"Exit",0xFFB1C0CF,1);native_field(&mut c,270,440,68,27,shortcuts.exit_key.map(key_to_string).unwrap_or("--"),state.listening&&state.target==Target::ExitKey,state.listening&&state.target==Target::ExitKey);
     c.text(28,486,"Active profile",0xFF839BB2,1);c.text(28,506,profile_name(bindings.profile),0xFFEAF0F6,1);
-    c.round_rect(364,404,390,128,12,0xFF131F2E);c.text(380,418,"Button I/II",0xFFDAE9F8,1);
+    c.surface(364,404,390,128,12,0xFF182A3F,0xFF122034,0xFF30465F);c.text(380,418,"Button I/II",0xFFDAE9F8,1);
     c.text(380,447,"One press sends Buttons I and II together.",0xFFB7C6D5,1);c.text(380,469,"Assign a key or controller button to trigger both.",0xFF8198AF,1);
     let exit_pad=if state.listening&&state.target==Target::ExitPad{"PRESS COMBO".to_string()}else if shortcuts.exit_pad.is_empty(){"--".into()}else{shortcuts.exit_pad.iter().map(|b|pad_button_to_string(*b)).collect::<Vec<_>>().join("+")};
     c.text(380,497,"Exit controller combo",0xFFB1C0CF,1);native_field(&mut c,530,490,210,27,&exit_pad,state.listening&&state.target==Target::ExitPad,state.listening&&state.target==Target::ExitPad);
 }
 
 fn native_field(c:&mut library::NativeCanvas<'_>,x:usize,y:usize,w:usize,h:usize,value:&str,selected:bool,listening:bool){
-    c.round_rect(x,y,w,h,5,if listening{0xFF294B68}else if selected{0xFF2B4158}else{0xFF202E3E});
-    c.rect(x+6,y,w.saturating_sub(12),1,if listening{0xFF64B8FA}else if selected{0xFF59B2F5}else{0xFF32475D});
+    c.surface(x,y,w,h,6,if listening || selected{0xFF30506C}else{0xFF24394F},if listening || selected{0xFF25415C}else{0xFF1B2E43},if listening || selected{0xFF68C4FF}else{0xFF3B526B});
     let label=if listening{"PRESS..."}else{value};c.text(x+5,y+11,&label.chars().take(w/6-1).collect::<String>(),0xFFE8EDF3,1);
 }
 

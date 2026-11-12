@@ -248,7 +248,18 @@ impl Ciap {
                 self.set(REG_APCR, value);
                 let queued = self.reg(REG_BMAN) & 0x03 != 0;
                 match value {
-                    0x0140 if !self.audio_playing => (self.audio_playing, self.audio_wait) = (true, 1),
+                    0x0140 if !self.audio_playing => {
+                        let first = self.audio_next & 1;
+                        let next = [first, first ^ 1].into_iter()
+                            .find(|&i| self.reg(REG_BMAN) & (1 << i) != 0);
+                        self.audio_playing = true;
+                        // DONE is a completion notification, including for the
+                        // first buffer. A one-sector initial delay reports it
+                        // early for ADPCM codings lasting 2..16 sector periods.
+                        // ReadySoft uses these notifications to pace fades.
+                        self.audio_wait = next.map_or(1, |i|
+                            crate::cdic::get_sector_count_for_coding(self.audio_coding[i]));
+                    }
                     // Audio event: 0xA0 at once (queued buffers still play out), 0x20 at once only when nothing is queued.
                     0x0020 | 0x00A0 if value == 0x00A0 || !queued => {
                         self.set(REG_ISR, self.reg(REG_ISR) | ISR_AUDIO_EVENT);
@@ -541,7 +552,10 @@ impl Ciap {
         audio.decode_sector(&self.ram[at..at + AUDIO_LEN], coding & 0x03 == 0x01, coding & 0x30 == 0x10, if coding & 0x0C == 0x04 { 18900 } else { 37800 });
         self.set(REG_BMAN, bman & !(1 << i));
         self.set(REG_ISR, self.reg(REG_ISR) | ISR_AUDIO_DONE);
-        self.set(REG_APTR, (at as u16 + 0x800) / 2);
+        // Completion frees this buffer and switches the playing pointer to the
+        // other one. The BIOS refills the buffer opposite APTR; leaving APTR
+        // inside the completed buffer makes it toggle off the queued successor.
+        self.set(REG_APTR, (AUDIO_BUFS[i ^ 1] / 2) as u16);
         (self.audio_wait, self.audio_next) = (crate::cdic::get_sector_count_for_coding(coding), i ^ 1);
         self.audio_buffers += 1;
         if self.trace {
@@ -583,6 +597,46 @@ opencdi::impl_state!(Ciap { ram, regs, running, q_mode, lba, drive_active, audio
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn first_audio_buffer_completes_only_after_its_coding_duration() {
+        use super::*;
+        for (shadow, duration) in [(0x0000,8),(0x0800,4),(0x1000,16),(0x1800,8),
+                                   (0x2000,4),(0x2800,2),(0x3000,8),(0x3800,4)] {
+            let mut c = Ciap::default();
+            let mut audio = CdiAudio::new();
+            let period = crate::mcd212::VideoMode::Pal.cycles_per_sector();
+            c.write_reg(REG_ASHDW,shadow,0);
+            c.write_reg(REG_BMAN,1,0);
+            c.write_reg(REG_APCR,0x140,0);
+            c.tick(period*(duration-1),period,&mut None,&mut audio);
+            assert_eq!(c.peek_reg(REG_BMAN) & 3,1,"buffer returned before playback finished: ASHDW={shadow:04x}");
+            assert_eq!(c.read_reg(REG_ISR,0) & ISR_AUDIO_DONE,0);
+            c.tick(period,period,&mut None,&mut audio);
+            assert_eq!(c.peek_reg(REG_BMAN) & 3,0);
+            assert_ne!(c.read_reg(REG_ISR,0) & ISR_AUDIO_DONE,0);
+        }
+    }
+
+    #[test]
+    fn completed_audio_buffer_is_the_one_the_bios_can_refill() {
+        use super::*;
+        let period = crate::mcd212::VideoMode::Pal.cycles_per_sector();
+        let mut c = Ciap::default();
+        let mut audio = CdiAudio::new();
+        c.write_reg(REG_BMAN,3,0);
+        c.write_reg(REG_APCR,0x140,0);
+        c.tick(period*8,period,&mut None,&mut audio);
+        for _ in 0..4 {
+            assert_ne!(c.read_reg(REG_ISR,0) & ISR_AUDIO_DONE,0);
+            // The identified 490 driver tests the byte pointer against 0x900
+            // and refills the other buffer. That buffer must be free.
+            let refill = if c.read_reg(REG_APTR,0) as usize * 2 < 0x900 { 2 } else { 1 };
+            assert_eq!(c.peek_reg(REG_BMAN) & refill,0,"completion points BIOS at a still-queued buffer");
+            c.write_reg(REG_BMAN,refill,0);
+            assert_eq!(c.peek_reg(REG_BMAN) & 3,3);
+            c.tick(period*8,period,&mut None,&mut audio);
+        }
+    }
     use super::*;
 
     #[test]
@@ -693,7 +747,7 @@ mod tests {
         assert_eq!(c.peek_reg(REG_ISR) & ISR_AUDIO_EVENT, 0);
         c.write_reg(REG_APCR, 0x140, 0);
         c.write_reg(REG_IER, ISR_AUDIO_DONE, 0);
-        c.tick(period, period, &mut None, &mut audio);
+        c.tick(period * 4, period, &mut None, &mut audio);
         assert_eq!((c.peek_reg(REG_BMAN) & 3, c.read_reg(REG_ISR, 0) & ISR_AUDIO_DONE), (2, ISR_AUDIO_DONE));
         c.tick(period * 3, period, &mut None, &mut audio);
         assert_eq!(c.peek_reg(REG_BMAN) & 3, 2);
@@ -735,7 +789,7 @@ mod tests {
         let mut c = Ciap::default();
         c.write_reg(REG_BMAN, 0x03, 0);
         c.write_reg(REG_APCR, 0x140, 0);
-        c.tick(period, period, &mut None, &mut audio);
+        c.tick(period * 8, period, &mut None, &mut audio);
         assert_eq!(c.peek_reg(REG_BMAN) & 3, 2);
         // 0xA0 raises the event at once; the queued buffer still plays and playback then ends.
         c.write_reg(REG_APCR, 0xA0, 0);

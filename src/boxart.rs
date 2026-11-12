@@ -21,9 +21,13 @@ static TEMPLATE: LazyLock<Artwork> = LazyLock::new(|| {
 
 pub fn generated_path(root: &Path, title: &str) -> PathBuf {
     root.join("Boxart").join(format!(
-        "{}--generated.png",
+        "{}.png",
         crate::launchbox::safe_name(title)
     ))
+}
+
+pub fn legacy_generated_path(root: &Path, title: &str) -> PathBuf {
+    root.join("Boxart").join(format!("{}--generated.png", crate::launchbox::safe_name(title)))
 }
 
 fn encode(image: &Artwork, signature: Option<&str>) -> io::Result<Vec<u8>> {
@@ -150,6 +154,8 @@ pub fn ensure(
     }
     let signature = format!("case-v1-{:x}-{}x{}", hash, image.w, image.h);
     let destination = generated_path(root, title);
+    let legacy = legacy_generated_path(root, title);
+    if !destination.exists() && legacy.is_file() { let _ = fs::rename(&legacy, &destination); }
     if let Ok(file) = fs::File::open(&destination) {
         let decoder = png::Decoder::new(std::io::BufReader::new(file));
         if let Ok(reader) = decoder.read_info() {

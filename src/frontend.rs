@@ -67,6 +67,39 @@ pub fn app_data_file(name: &str) -> PathBuf {
 
 pub fn settings_file_path() -> PathBuf { app_data_file("opencdi_controls.ini") }
 
+/// A case-only directory rename on Windows needs an intermediate name.
+/// Keep all ROMs intact and roll back if the second rename cannot complete.
+pub fn prepare_data_folders_at(root:&Path)->std::io::Result<()> {
+    for (old,new) in [("bios","BIOS"),("savestates","Savestates"),("nvram","NVRAM")] {ensure_folder_case_at(root,old,new)?;}
+    for folder in ["NVRAM","Savestates"] {for bios in ["220","490"] {std::fs::create_dir_all(root.join(folder).join(bios))?;}}
+    Ok(())
+}
+fn ensure_folder_case_at(root:&Path,old_name:&str,new_name:&str)->std::io::Result<()> {
+    std::fs::create_dir_all(root)?;
+    let entries=std::fs::read_dir(root)?.collect::<Result<Vec<_>,_>>()?;
+    if entries.iter().any(|e|e.file_name()==new_name){return Ok(());}
+    if let Some(old)=entries.iter().find(|e|e.file_name()==old_name&&e.path().is_dir()) {
+        let temporary=root.join(format!(".{old_name}-case-{}",std::process::id()));
+        if temporary.exists(){return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists,"Folder rename staging path exists"));}
+        std::fs::rename(old.path(),&temporary)?;
+        if let Err(error)=std::fs::rename(&temporary,root.join(new_name)) {let _=std::fs::rename(&temporary,old.path());return Err(error);}
+        Ok(())
+    }else{std::fs::create_dir_all(root.join(new_name))}
+}
+
+#[cfg(test)] mod folder_tests {
+    #[test] fn uppercase_bios_keeps_existing_roms_and_is_repeatable(){
+        let root=std::env::temp_dir().join(format!("opencdi-bios-case-{}",std::process::id()));
+        std::fs::create_dir_all(root.join("bios")).unwrap();std::fs::write(root.join("bios/cdi220b.rom"),b"test ROM").unwrap();
+        std::fs::create_dir_all(root.join("savestates")).unwrap();std::fs::write(root.join("savestates/test.st"),b"state").unwrap();
+        super::prepare_data_folders_at(&root).unwrap();super::prepare_data_folders_at(&root).unwrap();
+        assert_eq!(std::fs::read(root.join("Savestates/test.st")).unwrap(),b"state");
+        assert_eq!(std::fs::read(root.join("BIOS/cdi220b.rom")).unwrap(),b"test ROM");
+        assert!(std::fs::read_dir(&root).unwrap().any(|e|e.unwrap().file_name()=="BIOS"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 pub fn migrate_app_data_dir(name: &str) -> PathBuf {
     let data_dir = app_data_dir();
     let target = data_dir.join(name);
@@ -680,6 +713,7 @@ pub enum GuiAction {
     SetNvramMode(NvramMode),
     AddDiscPath(PathBuf),
     SwitchBios(PathBuf),
+    SelectBios(u16),
     StopToLibrary,
     TakeScreenshot,
     SetVideoMode(crate::mcd212::VideoMode),
