@@ -11,11 +11,14 @@ pub struct Machine {
     pub cpu: CpuCore,
     pub instructions: u64,
     pub os9_trace: Option<Box<Os9Trace>>,
+    /// Host-only boot evidence; never part of guest memory or a saved state.
+    pub disc_application_entered: bool,
+    disc_launch_checks: u8,
 }
 
 impl Machine {
     pub fn new() -> Self {
-        Self { bus: CdiBus::new(), cpu: CpuCore::new(), instructions: 0, os9_trace: Os9Trace::from_env() }
+        Self { bus: CdiBus::new(), cpu: CpuCore::new(), instructions: 0, os9_trace: Os9Trace::from_env(), disc_application_entered:false, disc_launch_checks:0 }
     }
 
     /// Reads and checks a system ROM file or zip; the name is the zip entry used, if any.
@@ -98,7 +101,9 @@ impl Machine {
     }
 
     pub fn load_disc<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Box<dyn std::error::Error>> {
-        self.bus.load_cdrom(path)
+        self.bus.load_cdrom(path)?;
+        self.disc_application_entered=false;self.disc_launch_checks=0;
+        Ok(())
     }
 
     pub fn set_video_mode(&mut self, mode: VideoMode) {
@@ -106,6 +111,7 @@ impl Machine {
     }
 
     pub fn reset(&mut self) {
+        self.disc_application_entered=false;self.disc_launch_checks=0;
         self.cpu.set_cpu_type(CpuType::SCC68070);
         self.cpu.reset(&mut self.bus);
         self.bus.emulate_wait_states = true;
@@ -177,6 +183,14 @@ impl Machine {
 
                 match batch.exit {
                     m68k::CycleBatchExit::TrapInstruction { trap_num } => {
+                        // Short bootloaders can run and exit between frame-end
+                        // samples. Observe a bounded number of user RAM traps;
+                        // this does not alter registers, memory or CPU timing.
+                        if !self.disc_application_entered && self.disc_launch_checks<64
+                            && cpu.s_flag==0 && (0x10000..0x300000).contains(&cpu.ppc) {
+                            self.disc_launch_checks+=1;
+                            self.disc_application_entered=crate::boot::disc_application_executing(bus,cpu.ppc,true);
+                        }
                         if let Some(t) = trace.as_deref_mut() {
                             t.on_trap(cpu, bus, trap_num);
                         }
@@ -291,11 +305,12 @@ impl Machine {
             let _ = self.load(&mut Reader::new(&backup));
             return Err(e);
         }
+        self.disc_application_entered=false;self.disc_launch_checks=0;
         Ok(frontend)
     }
 }
 
-crate::impl_state!(Machine { cpu, bus, instructions } skip { os9_trace });
+crate::impl_state!(Machine { cpu, bus, instructions } skip { os9_trace, disc_application_entered, disc_launch_checks });
 
 impl Default for Machine {
     fn default() -> Self {
@@ -313,6 +328,17 @@ pub fn highest_ipl(bus: &mut CdiBus) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boot_evidence_is_not_saved_and_does_not_survive_state_restore() {
+        let mut m=Machine::new();let mut before=Vec::new();m.save_state(&[],&mut before);
+        m.disc_application_entered=true;m.disc_launch_checks=64;
+        let mut after=Vec::new();m.save_state(&[],&mut after);
+        assert_eq!(before,after,"host boot observations must not alter the saved machine");
+        m.load_state(&before).unwrap();
+        assert!(!m.disc_application_entered);
+        assert_eq!(m.disc_launch_checks,0);
+    }
 
     #[test]
     fn uart_transmitter_interrupt_reaches_cpu_at_programmed_priority() {

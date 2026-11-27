@@ -24,6 +24,8 @@ use opencdi::machine::Machine;
 use opencdi::mcd212::{SCREEN_WIDTH, SCREEN_HEIGHT, VideoMode};
 mod library;
 mod library_catalogue;
+mod title_aliases;
+mod multidisc;
 mod launchbox;
 mod screenscraper;
 mod synopsis;
@@ -237,15 +239,25 @@ fn default_nvram_save_path() -> PathBuf {
 }
 
 fn per_disc_nvram_save_path(global_path: &Path, disc_path: &Path, bios: &str) -> PathBuf {
-    let legacy = legacy_per_disc_nvram_save_path(global_path, disc_path);
-    let mut name = disc_path.file_stem().unwrap_or_else(|| std::ffi::OsStr::new("disc")).to_os_string();
+    let first=multidisc::first_disc(disc_path);
+    let source=first.as_deref().unwrap_or(disc_path);
+    let legacy = legacy_per_disc_nvram_save_path(global_path, source);
+    let shared=multidisc::identify(disc_path);
+    let mut name = shared.as_ref().map(|d|std::ffi::OsString::from(&d.title))
+        .unwrap_or_else(||disc_path.file_stem().unwrap_or_else(|| std::ffi::OsStr::new("disc")).to_os_string());
     name.push(".bin");
     let base=global_path.parent().filter(|p|!p.as_os_str().is_empty()).unwrap_or_else(||Path::new("."));
     let target=base.join("NVRAM").join(bios).join(&name);
     if target.is_file(){return target;}
     // The old shared file belongs only to the board whose RAM size matches.
     let size=if bios=="490"{32768}else{8192};
-    for old in [legacy.with_file_name(&name),legacy] {
+    let source_name=source.file_stem().unwrap_or_default().to_string_lossy();
+    let source_file=std::ffi::OsString::from(format!("{source_name}.bin"));
+    let mut old_paths=Vec::new();
+    // Disc 1 is authoritative for a set. Never silently choose Disc 2's save.
+    if shared.is_some() && first.is_some(){old_paths.push(base.join("NVRAM").join(bios).join(&source_file));}
+    if shared.is_none() || first.is_some(){old_paths.extend([legacy.with_file_name(&source_file),legacy]);}
+    for old in old_paths {
         if let Ok(bytes)=std::fs::read(&old) {
             if bytes.len()==size {
                 if let Err(e)=copy_save_without_overwrite(&target,&bytes){log::warn!("Cannot migrate save {old:?}: {e}");return old;}
@@ -706,6 +718,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         wiimote: None,
         wiimote_auto: wiimote::AutoControl::default(),
         wiimote_cursor: None,
+        gun_crosshair_visible: true,
         wiimote_mouse_buttons: 0,
         wiimote_sample: None,
         wiimote_buttons: 0,
@@ -818,6 +831,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         library_scan_at: Instant::now(),
         library_reload_art: library_mode,
         library_selected: 0,
+        info_discs: Vec::new(),
+        last_discs: std::fs::read_to_string(app_data_file("DiscSelections.json")).ok().and_then(|s|serde_json::from_str(&s).ok()).unwrap_or_default(),
         library_search,
         disc_paths,
         managed_artwork_root,
@@ -1027,6 +1042,7 @@ struct App {
     wiimote: Option<wiimote::Wiimote>,
     wiimote_auto: wiimote::AutoControl,
     wiimote_cursor: Option<PhysicalPosition<f64>>,
+    gun_crosshair_visible: bool,
     wiimote_mouse_buttons: u8,
     wiimote_sample: Option<wiimote::Sample>,
     wiimote_buttons: u16,
@@ -1127,6 +1143,8 @@ struct App {
     measured_cd_rate: f64,
     library_mode: bool,
     library_items: Vec<library::Item>,
+    info_discs: Vec<PathBuf>,
+    last_discs: std::collections::HashMap<String,PathBuf>,
     artwork_fetch_rx: Option<std::sync::mpsc::Receiver<DownloadedArtwork>>,
     artwork_progress_rx: Option<std::sync::mpsc::Receiver<launchbox::LookupProgress>>,
     artwork_progress: Option<launchbox::LookupProgress>,
@@ -1270,6 +1288,7 @@ impl App {
             3 => { push_action(GuiAction::QuickLoadState); self.paused = false; },
             4 => {
                 self.controller_config_was_captured = self.mouse_captured;
+                if let Some(remote)=self.wiimote.as_ref(){remote.reconnect();}
                 self.controller_config = Some(controller_config::State::default());
                 self.mouse_captured = false;
                 send_pointer(&mut self.m.bus, self.pad_x, self.pad_y, 0);
@@ -1360,6 +1379,15 @@ impl App {
 
     fn on_cursor_moved(&mut self, position: PhysicalPosition<f64>) {
                 self.cursor = Some(position);
+                if self.mouse_left && self.controller_config.is_some() {
+                    let (x,y)=cursor_to_cdi(position,self.image_rect);
+                    if let Some(ControllerConfigHit::Sensitivity(value))=controller_config::hit_test(x.max(0) as usize,y.max(0) as usize) {
+                        if self.bindings.controllers.mouse_sensitivity!=value {
+                            self.bindings.controllers.mouse_sensitivity=value;self.save_input_settings();
+                            if let Some(window)=&self.window{window.request_redraw();}
+                        }
+                    }
+                }
                 self.library_search.pointer = Some(cursor_to_cdi(position, self.image_rect));
                 if self.paused && !self.pause_info && self.controller_config.is_none()
                     && let Some(window) = &self.window {
@@ -1420,6 +1448,13 @@ impl App {
                     if self.pause_info { self.pause_info = false; }
                     self.toggle_pause_menu();
                     return;
+                }
+                if (self.pause_info || self.preview_started.is_some()) && down && button==MouseButton::Left
+                    && let Some(pos)=self.cursor {
+                    let (x,y)=cursor_to_cdi(pos,self.image_rect);
+                    if let Some(index)=library::disc_picker_hit(x,y,self.info_discs.len(),self.info_disc_index()) {
+                        self.choose_info_disc(index);return;
+                    }
                 }
                 if self.pause_info { return; }
                 if self.preview_started.is_some() && self.controller_config.is_none() {
@@ -1512,6 +1547,14 @@ impl App {
                                 if self.input_device_mode == InputDeviceMode::Peacekeeper
                                     && matches!(hit, ControllerConfigHit::Binding(_, _) | ControllerConfigHit::Hotkey(_)) { return; }
                                 match hit {
+                                    ControllerConfigHit::ToggleDevice(mode) => {
+                                        let controls=&mut self.bindings.controllers;
+                                        match mode {InputDeviceMode::Gamepad=>controls.gamepad=!controls.gamepad,InputDeviceMode::Mouse=>controls.mouse=!controls.mouse,InputDeviceMode::Peacekeeper=>controls.peacekeeper=!controls.peacekeeper}
+                                        self.save_input_settings();
+                                    }
+                                    ControllerConfigHit::Sensitivity(value) => {
+                                        self.bindings.controllers.mouse_sensitivity=value;self.save_input_settings();
+                                    }
                                     ControllerConfigHit::Binding(_, _) | ControllerConfigHit::Hotkey(_) => {
                                         if let Some(config) = self.controller_config.as_mut() { config.click(hit); }
                                     }
@@ -1601,6 +1644,15 @@ impl App {
             self.wiimote_pressed = 0;
             return;
         }
+        if self.disc_launched && !self.library_mode && !self.paused
+            && self.preview_started.is_none() && self.controller_config.is_none()
+            && self.input_device_mode == InputDeviceMode::Peacekeeper
+            && self.bindings.controllers.peacekeeper
+            && opencdi::frontend::peacekeeper_disc(Path::new(&self.current_game_name))
+            && self.wiimote_pressed & wiimote::PLUS != 0 {
+            self.gun_crosshair_visible = !self.gun_crosshair_visible;
+            if let Some(window) = &self.window { window.request_redraw(); }
+        }
         let aim = self.wiimote_sample.and_then(|s| s.aim);
         let inside_picture = self.wiimote_position().is_some_and(|pos| {
             let (x,y,w,h) = self.image_rect;
@@ -1652,17 +1704,19 @@ impl App {
     }
 
     fn update_wiimote_mouse(&mut self) {
+        let ui = self.library_mode || self.preview_started.is_some() || self.controller_config.is_some() || self.paused;
+        let pointing_enabled=ui || self.bindings.controllers.pointing_enabled(self.input_device_mode==InputDeviceMode::Peacekeeper);
         self.input_arbiter.remote_mode(self.wiimote_auto.mode == wiimote::ControlMode::Pointer);
-        let remote = (self.wiimote_auto.mode == wiimote::ControlMode::Pointer)
+        let remote = (pointing_enabled && self.wiimote_auto.mode == wiimote::ControlMode::Pointer)
             .then(|| self.wiimote_position()).flatten()
             .map(|p| cursor_to_cdi(p,self.image_rect));
-        self.input_arbiter.pointers(std::mem::take(&mut self.mouse_activity),remote,
+        let mouse_activity=std::mem::take(&mut self.mouse_activity) && (ui || self.bindings.controllers.mouse);
+        self.input_arbiter.pointers(mouse_activity,remote,
             self.wiimote_pressed & (wiimote::A | wiimote::B) != 0);
-        let ui = self.library_mode || self.preview_started.is_some() || self.controller_config.is_some() || self.paused;
         let previous_cursor = self.wiimote_cursor;
         self.wiimote_cursor = None;
         let mut buttons = 0;
-        if self.focused && self.wiimote_auto.mode == wiimote::ControlMode::Pointer
+        if self.focused && pointing_enabled && self.wiimote_auto.mode == wiimote::ControlMode::Pointer
             && self.input_arbiter.source() == opencdi::host_input::PointerSource::Wiimote
             && let Some(position) = self.wiimote_position() {
             self.wiimote_cursor = Some(position);
@@ -1696,9 +1750,11 @@ impl App {
         let mut guide = self.bindings.ui_shortcuts.pause_pad.contains(&gilrs::Button::Mode) && xbox_guide_pressed();
         let mut exit = false;
         let mut up = false; let mut down = false; let mut confirm = false;
+        let mut left=false;let mut right=false;
         let mut back = false;
         guide |= self.wiimote_buttons & wiimote::HOME != 0;
-        let (_,remote_y) = self.wiimote_auto.directions(self.wiimote_buttons);
+        let (remote_x,remote_y) = self.wiimote_auto.directions(self.wiimote_buttons);
+        left|=remote_x<0;right|=remote_x>0;
         up |= remote_y < 0;
         down |= remote_y > 0;
         confirm |= self.wiimote_buttons & wiimote::ONE != 0
@@ -1714,6 +1770,8 @@ impl App {
                 exit |= !exit_chord.is_empty() && exit_chord.iter().all(|button| pad.is_pressed(*button));
                 up |= pad.is_pressed(gilrs::Button::DPadUp) || pad.value(gilrs::Axis::LeftStickY) > 0.35;
                 down |= pad.is_pressed(gilrs::Button::DPadDown) || pad.value(gilrs::Axis::LeftStickY) < -0.35;
+                left |= pad.is_pressed(gilrs::Button::DPadLeft)||pad.value(gilrs::Axis::LeftStickX)< -0.35;
+                right |= pad.is_pressed(gilrs::Button::DPadRight)||pad.value(gilrs::Axis::LeftStickX)>0.35;
                 confirm |= pad.is_pressed(gilrs::Button::South);
                 back |= pad.is_pressed(self.bindings.pad_btn2);
             }
@@ -1726,6 +1784,11 @@ impl App {
         if pause_pressed && !self.pause_info { self.toggle_pause_menu(); }
         if exit { self.exit_requested = true; }
         if !self.paused { return; }
+        if self.pause_info {
+            if left && !self.library_prev_left {self.step_info_disc(-1);}
+            if right && !self.library_prev_right {self.step_info_disc(1);}
+            self.library_prev_left=left;self.library_prev_right=right;
+        }
         if !self.pause_info {
             if up && !self.prev_pause_up { self.move_pause_selection(-1); }
             if down && !self.prev_pause_down { self.move_pause_selection(1); }
@@ -1789,7 +1852,11 @@ impl App {
     fn launch_library_selection(&mut self) {
         if self.library_search.collection.missing_offset.is_some() { return; }
         if let Some(item) = self.library_search.get(&self.library_items, self.library_selected) {
-            push_action(GuiAction::OpenDisc(item.path.clone()));
+            let paths:Vec<_>=self.library_items.iter().map(|item|item.path.clone()).collect();
+            let members=multidisc::members(&item.path,&paths);
+            let remembered=multidisc::identify(&item.path).and_then(|d|self.last_discs.get(&d.key));
+            let path=remembered.filter(|p|members.contains(p)).unwrap_or(&item.path);
+            push_action(GuiAction::OpenDisc(path.clone()));
         }
     }
 
@@ -1808,15 +1875,42 @@ impl App {
         self.mouse_middle = false;
         self.mouse_captured = false;
         self.apply_grab();
-        self.disc_details = library::DiscDetails::load(&path, &self.managed_artwork_root);
-        self.boot_synopsis = synopsis::load(&self.synopsis_root, &path);
+        self.info_discs=multidisc::members(&path,&self.library_items.iter().map(|item|item.path.clone()).collect::<Vec<_>>());
+        if self.info_discs.len()<2 {self.info_discs=multidisc::discover(&path);}
+        let shared=self.info_discs.first().unwrap_or(&path);
+        self.disc_details = library::DiscDetails::load(shared, &self.managed_artwork_root);
+        self.boot_synopsis = synopsis::load(&self.synopsis_root, &path).or_else(||synopsis::load(&self.synopsis_root,shared));
         self.boot_disc_art = library::load_disc_artwork(&path, &self.managed_cd_path);
         self.current_game_name = opencdi::frontend::disc_display_name(&path);
+        self.gun_crosshair_visible = true;
         self.current_disc_path = Some(path);
         self.next_synopsis_check = Instant::now();
         self.artwork_retry_at = self.next_synopsis_check;
         self.refresh_title();
         if let Some(window) = &self.window { window.request_redraw(); }
+    }
+
+    fn info_disc_index(&self)->usize {
+        self.info_discs.iter().position(|p|Some(p)==self.current_disc_path.as_ref()).unwrap_or(0)
+    }
+
+    fn choose_info_disc(&mut self,index:usize){
+        let Some(path)=self.info_discs.get(index).cloned() else{return;};
+        if self.current_disc_path.as_ref()==Some(&path){return;}
+        if self.preview_started.is_some(){self.preview_disc(path.clone());}
+        else if self.pause_info {push_action(GuiAction::InsertDisc(path.clone()));}
+        if let Some(disc)=multidisc::identify(&path){
+            self.last_discs.insert(disc.key,path);
+            if let Ok(json)=serde_json::to_vec(&self.last_discs){
+                let target=app_data_file("DiscSelections.json");let temp=target.with_extension("tmp");
+                if std::fs::write(&temp,json).is_ok(){let _=std::fs::rename(temp,target);}
+            }
+        }
+        if let Some(window)=&self.window{window.request_redraw();}
+    }
+
+    fn step_info_disc(&mut self,delta:isize){
+        if self.info_discs.len()>1 {self.choose_info_disc((self.info_disc_index() as isize+delta).rem_euclid(self.info_discs.len() as isize) as usize);}
     }
 
     fn switch_bios(&mut self, path: PathBuf) {
@@ -1999,10 +2093,16 @@ impl App {
             let synopsis_root = self.synopsis_root.clone();
             let report_path = std::env::current_exe().ok().map(|exe| exe.with_file_name("Missing Media.txt"));
             let lookup_running = self.artwork_fetch_rx.is_some();
+            let nvram_base=self.global_nvram_path.clone();
             let (tx, rx) = std::sync::mpsc::channel();
             if std::thread::Builder::new().name("disc-library-scan".into()).spawn(move || {
                 let paths = library::scan_paths(&roots);
                 library::migrate_artwork_names(&paths, &managed_artwork);
+                if force_reload {
+                    for path in paths.iter().filter(|p|multidisc::identify(p).is_some_and(|d|d.number==1)) {
+                        for bios in ["220","490"] {let _=per_disc_nvram_save_path(&nvram_base,path,bios);}
+                    }
+                }
                 let logo_added = missing_logos.iter().any(|path| {
                     library::managed_art_path(path, &managed_artwork, launchbox::ArtworkKind::Logo).is_some()
                 });
@@ -2016,6 +2116,14 @@ impl App {
                     if tx.send(LibraryScan { items: Some(items.clone()), optical_disc: previous_optical, complete: false }).is_err() { return; }
                     for start in (0..paths.len()).step_by(24) {
                         let end = (start + 24).min(paths.len());
+                        // Versioned, local generation runs independently of the
+                        // network lookup's completed/download markers.
+                        for path in &paths[start..end] {
+                            if let Some(cover)=library::cover_artwork_path(path,&covers)
+                                && let Err(error)=boxart::ensure(&cover,&library::disc_title(path),&managed_artwork) {
+                                log::warn!("Cannot refresh case for {path:?}: {error}");
+                            }
+                        }
                         let loaded = library::load_items(paths[start..end].to_vec(), &covers, &discs, &managed_artwork);
                         items[start..end].clone_from_slice(&loaded);
                         if tx.send(LibraryScan { items: Some(items.clone()), optical_disc: previous_optical, complete: false }).is_err() { return; }
@@ -2490,6 +2598,16 @@ impl App {
                 return;
             }
             if !self.controller_config.as_ref().is_some_and(|s| s.listening) {
+                let controls=&mut self.bindings.controllers;
+                let changed=match code {
+                    Key::KeyG=>{controls.gamepad=!controls.gamepad;true},
+                    Key::KeyM=>{controls.mouse=!controls.mouse;true},
+                    Key::KeyP=>{controls.peacekeeper=!controls.peacekeeper;true},
+                    Key::Minus=>{controls.mouse_sensitivity=controls.mouse_sensitivity.saturating_sub(5).max(25);true},
+                    Key::Equal=>{controls.mouse_sensitivity=(controls.mouse_sensitivity+5).min(150);true},
+                    _=>false
+                };
+                if changed {self.save_input_settings();if let Some(window)=&self.window{window.request_redraw();}return;}
                 let mode = match code {
                     Key::Digit1 => Some(InputDeviceMode::Gamepad),
                     Key::Digit2 => Some(InputDeviceMode::Mouse),
@@ -2509,6 +2627,10 @@ impl App {
             }
         }
         if code == self.bindings.btn2 && self.go_back() { return; }
+        if (self.preview_started.is_some()||self.pause_info) && self.controller_config.is_none() {
+            if code==Key::ArrowLeft {self.step_info_disc(-1);return;}
+            if code==Key::ArrowRight {self.step_info_disc(1);return;}
+        }
         if self.preview_started.is_some() && self.controller_config.is_none() {
             if code == Key::Escape {
                 self.stop_to_library();
@@ -2629,8 +2751,9 @@ impl App {
                             self.save_active_disc_settings();
                             self.activate_disc_settings(&path);
                             self.current_disc_path = Some(path.clone());
-                            self.disc_details = library::DiscDetails::load(&path, &self.managed_artwork_root);
-                            self.boot_synopsis = synopsis::load(&self.synopsis_root, &path);
+                            let shared=self.info_discs.first().filter(|_|self.info_discs.contains(&path)).unwrap_or(&path);
+                            self.disc_details = library::DiscDetails::load(shared, &self.managed_artwork_root);
+                            self.boot_synopsis = synopsis::load(&self.synopsis_root, &path).or_else(||synopsis::load(&self.synopsis_root,shared));
                             self.next_synopsis_check = Instant::now();
                             self.artwork_retry_at = self.next_synopsis_check;
                             self.activate_nvram_for_selection();
@@ -2760,10 +2883,12 @@ impl App {
                     info!("Controls reloaded from INI file. Profile: {:?}", self.bindings.profile);
                 }
                 GuiAction::OpenControllerConfig => {
+                    if let Some(remote)=self.wiimote.as_ref(){remote.reconnect();}
                     self.set_search_focus(false);
                     self.toolbar_popup = None;
                     self.controller_config_was_captured = self.mouse_captured;
                     self.controller_config = Some(ControllerConfigState::default());
+                    if let Some(state)=self.controller_config.as_mut(){state.per_disc=self.active_disc_config_path.is_some();}
                     self.mouse_captured = false;
                     send_pointer(&mut self.m.bus, self.pad_x, self.pad_y, 0);
                     self.prev_key_btn = 0;
@@ -2916,7 +3041,9 @@ impl App {
                     send_pointer(&mut m.bus,x,y,b);
                 }
                 let started = disc_program_started(m.cpu.pc, self.frame_count,
-                    if m.bus.mono4.is_some() { 0 } else { shell_state }, self.shell_ready_count);
+                    if m.bus.mono4.is_some() { 0 } else { shell_state }, self.shell_ready_count)
+                    || (self.frame_count>250 && self.shell_ready_count>=35
+                        && (m.disc_application_entered || opencdi::boot::disc_application_executing(&m.bus,m.cpu.pc,m.cpu.s_flag==0)));
                 if started {
                     info!("Disc program started (PC=0x{:06X}); automatic boot complete.", m.cpu.pc);
                     self.disc_launched = true;
@@ -3060,6 +3187,7 @@ impl App {
                 }
             }
         }
+        if !self.bindings.controllers.gamepad {dir_x=0;dir_y=0;key_btn=0;}
         {
             let buttons = self.wiimote_buttons;
             let (remote_x,remote_y) = self.wiimote_auto.directions(buttons);
@@ -3069,7 +3197,7 @@ impl App {
             let confirm = buttons & wiimote::ONE != 0 || sideways && buttons & wiimote::A != 0;
             lib_confirm |= confirm;
             play_pad_down |= confirm;
-            if is_active && sideways {
+            if is_active && sideways && self.bindings.controllers.gamepad {
                 dir_x += remote_x; dir_y += remote_y;
                 if buttons & (wiimote::ONE | wiimote::A) != 0 { key_btn |= 1; }
                 if buttons & (wiimote::TWO | wiimote::B) != 0 { key_btn |= 2; }
@@ -3133,6 +3261,9 @@ impl App {
         if !capturing_mapping && back_pressed && self.go_back() { return; }
         if self.preview_started.is_some() && self.controller_config.is_none() {
             if play_pressed { push_action(GuiAction::PlaySelectedDisc); }
+            if lib_left && !self.library_prev_left {self.step_info_disc(-1);}
+            if lib_right && !self.library_prev_right {self.step_info_disc(1);}
+            self.library_prev_left=lib_left;self.library_prev_right=lib_right;
             if exit_pad_down { self.exit_requested = true; }
             return;
         }
@@ -3158,7 +3289,7 @@ impl App {
         let mut mouse_x = self.pad_x;
         let mut mouse_y = self.pad_y;
 
-        if is_active && self.mouse_captured {
+        if is_active && self.mouse_captured && self.bindings.controllers.mouse {
             if let Some((x, y)) = self.rel_pointer {
                 (mouse_x, mouse_y) = (x.round() as i32, y.round() as i32);
             } else if let Some(pos) = self.cursor {
@@ -3170,7 +3301,8 @@ impl App {
             }
         }
 
-        let wiimote_raw_aim = self.wiimote_position().filter(|_| self.wiimote_auto.mode == wiimote::ControlMode::Pointer).filter(|pos| {
+        let wiimote_raw_aim = self.wiimote_position().filter(|_| self.wiimote_auto.mode == wiimote::ControlMode::Pointer
+            && if self.input_device_mode==InputDeviceMode::Peacekeeper{self.bindings.controllers.peacekeeper}else{self.bindings.controllers.mouse}).filter(|pos| {
             let (x,y,w,h) = self.image_rect;
             pos.x >= x as f64 && pos.y >= y as f64 && pos.x < (x+w) as f64 && pos.y < (y+h) as f64
         }).map(|pos| cursor_to_cdi(pos,self.image_rect));
@@ -3194,20 +3326,23 @@ impl App {
         {
             // Keep host input from interfering with the automatic Play CD-i selection.
         } else {
+            let mut edge_push=(0,0);
             // All devices feed one CD-i pointer. Motion comes from the last
             // deliberately used device; held buttons are combined independently.
             if is_active && (dir_x != 0 || dir_y != 0) {
                 self.input_arbiter.gamepad_motion(wiimote_raw_aim);
                 const PAD_SPEED: f32 = 2.5;
+                let before=(self.pad_x,self.pad_y);
                 self.pad_x_f = (self.pad_x_f + dir_x.clamp(-1,1) as f32 * PAD_SPEED).clamp(0.0,767.0);
                 self.pad_y_f = (self.pad_y_f + dir_y.clamp(-1,1) as f32 * PAD_SPEED).clamp(0.0,559.0);
                 self.pad_x = self.pad_x_f.round() as i32;
                 self.pad_y = self.pad_y_f.round() as i32;
+                if (self.pad_x==0&&dir_x<0)||(self.pad_x==767&&dir_x>0){edge_push.0=dir_x.clamp(-1,1)*3-(self.pad_x-before.0);}
+                if (self.pad_y==0&&dir_y<0)||(self.pad_y==559&&dir_y>0){edge_push.1=dir_y.clamp(-1,1)*3-(self.pad_y-before.1);}
             } else if is_active {
                 match self.input_arbiter.source() {
                     opencdi::host_input::PointerSource::Mouse => {
-                        self.pad_x = mouse_x;
-                        self.pad_y = mouse_y;
+                        if self.bindings.controllers.mouse {self.pad_x = mouse_x;self.pad_y = mouse_y;}
                     }
                     opencdi::host_input::PointerSource::Wiimote => {
                         if let Some((x,y)) = wiimote_aim { self.pad_x = x; self.pad_y = y; }
@@ -3219,11 +3354,14 @@ impl App {
             }
             let mut remote_buttons = 0;
             if wiimote_aim.is_some() && self.wiimote_trigger_ready {
-                if self.wiimote_buttons & wiimote::A != 0 { remote_buttons |= 1; }
-                if self.wiimote_buttons & wiimote::B != 0 { remote_buttons |= 2; }
+                remote_buttons = wiimote::pointing_buttons(&self.current_game_name,
+                    self.input_device_mode == InputDeviceMode::Peacekeeper,
+                    self.wiimote_buttons & wiimote::A != 0, self.wiimote_buttons & wiimote::B != 0);
             }
-            let buttons = opencdi::host_input::combined_buttons(is_active,mouse_btn,key_btn,remote_buttons);
+            let buttons = self.bindings.controllers.buttons(is_active,mouse_btn,key_btn,remote_buttons,self.input_device_mode==InputDeviceMode::Peacekeeper);
+            let source_enabled=match self.input_arbiter.source(){opencdi::host_input::PointerSource::Mouse=>self.bindings.controllers.mouse,opencdi::host_input::PointerSource::Gamepad=>self.bindings.controllers.gamepad,opencdi::host_input::PointerSource::Wiimote=>self.bindings.controllers.pointing_enabled(self.input_device_mode==InputDeviceMode::Peacekeeper)};
             if m.bus.cdrom.is_none(){opencdi::boot::send_shell_pointer(&mut m.bus,self.pad_x,self.pad_y,buttons);}
+            else if !source_enabled || opencdi::host_input::relative_motion(&launchbox::normalize_title(&self.current_game_name),self.input_arbiter.source(),self.input_device_mode==InputDeviceMode::Peacekeeper && self.bindings.controllers.peacekeeper){opencdi::boot::send_game_controller(&mut m.bus,self.pad_x,self.pad_y,buttons,edge_push);}
             else{opencdi::boot::send_game_pointer(&mut m.bus,self.pad_x,self.pad_y,buttons);}
             self.prev_key_btn = key_btn;
         }
@@ -3482,9 +3620,15 @@ impl App {
                     // use real time even in the in-game pause/Info screen.
                     let animation_frame = if self.preview_started.is_some() { 0 }
                         else { (self.animation_clock.elapsed().as_millis() / 20) as u64 };
+                    let picker=(self.preview_started.is_some()||self.pause_info)&&self.info_discs.len()>1;
+                    self.boot_scene.compact_disc=picker;
                     self.boot_scene.render(&mut buffer, dw, dh, self.image_rect,
                         &self.current_game_name, &self.disc_details, self.boot_synopsis.as_deref(),
                         self.preview_started.is_some(), self.boot_disc_art.as_ref(), animation_frame);
+                    if picker {
+                        let selected=self.info_discs.iter().position(|p|Some(p)==self.current_disc_path.as_ref()).unwrap_or(0);
+                        library::render_disc_picker(&mut buffer,dw,dh,self.image_rect,&self.info_discs,selected);
+                    }
                 } else {
                     blit_aspect(&mut buffer, dw, dh, &self.m.bus.mcd212.framebuffer[..], self.image_rect);
                     draw_bezel(&mut buffer, dw, dh, self.image_rect);
@@ -3493,6 +3637,14 @@ impl App {
             if render_pause_menu && self.controller_config.is_none() && !self.pause_info {
                 library::render_pause_menu_full(&mut buffer, dw, dh, &self.current_game_name,
                     self.disc_details.logo.as_ref(), self.pause_menu_selected);
+            }
+            if self.disc_launched && !self.library_mode && !show_details && !self.paused
+                && self.controller_config.is_none() && self.focused && self.host_input
+                && self.gun_crosshair_visible && self.bindings.controllers.peacekeeper
+                && self.input_device_mode == InputDeviceMode::Peacekeeper
+                && opencdi::frontend::peacekeeper_disc(Path::new(&self.current_game_name))
+                && let Some(position) = self.wiimote_cursor {
+                wiimote::draw_crosshair(&mut buffer, dw, dh, self.image_rect, position.x, position.y);
             }
             // Wayland: ties the next redraw to a frame callback, so a hidden window is never presented to
             window.pre_present_notify();
@@ -3640,8 +3792,9 @@ impl ApplicationHandler for App {
         if let (DeviceEvent::MouseMotion { delta: (dx, dy) }, Some((x, y))) = (event, self.rel_pointer) {
             let (_, _, w, h) = self.image_rect;
             if w > 0 && h > 0 {
-                let x = (x + dx * SCREEN_WIDTH as f64 / w as f64).clamp(0.0, (SCREEN_WIDTH - 1) as f64);
-                let y = (y + dy * SCREEN_HEIGHT as f64 / h as f64).clamp(0.0, (SCREEN_HEIGHT - 1) as f64);
+                let sensitivity=self.bindings.controllers.mouse_sensitivity.clamp(25,150) as f64/100.0;
+                let x = (x + dx * sensitivity * SCREEN_WIDTH as f64 / w as f64).clamp(0.0, (SCREEN_WIDTH - 1) as f64);
+                let y = (y + dy * sensitivity * SCREEN_HEIGHT as f64 / h as f64).clamp(0.0, (SCREEN_HEIGHT - 1) as f64);
                 self.rel_pointer = Some((x, y));
             }
         }
@@ -3717,6 +3870,15 @@ impl ApplicationHandler for App {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn motion_profiles_apply_to_regional_disc_names_but_preserve_burn_cycle(){
+        for title in ["Tetris (USA, Europe).chd","Battleship (World).chd"]{
+            assert!(opencdi::host_input::relative_controls(&crate::launchbox::normalize_title(title)),"{title}");
+        }
+        for title in ["Burn-Cycle (USA, Europe) (Disc 1) (The Game).chd","Mad Dog McCree (USA)","Tetris 2","3rd Degree (USA)"]{
+            assert!(!opencdi::host_input::relative_controls(&crate::launchbox::normalize_title(title)),"{title}");
+        }
+    }
+    #[test]
     #[ignore = "Writes the matching screen previews; requires OPENCDI_THEME_PREVIEWS"]
     fn render_matching_theme_previews() {
         let folder=PathBuf::from(std::env::var("OPENCDI_THEME_PREVIEWS").unwrap());
@@ -3727,6 +3889,9 @@ mod tests {
             encoder.set_color(png::ColorType::Rgb);encoder.set_depth(png::BitDepth::Eight);
             encoder.write_header().unwrap().write_image_data(&bytes).unwrap();
         };
+        let mut aim_preview=vec![0xFF243B53;1920*1080];
+        wiimote::draw_crosshair(&mut aim_preview,1920,1080,(0,0,1920,1080),960.0,540.0);
+        save("peacekeeper-crosshair.png",&aim_preview);
         let gamepad=controller_config::load_controller_art().unwrap();
         let mouse=controller_config::load_mouse_art().unwrap();
         let gun=controller_config::load_peacekeeper_art().unwrap();
@@ -3752,7 +3917,7 @@ mod tests {
         save("disc-actions.png",&pixels);
         if let (Ok(path),Ok(root))=(std::env::var("OPENCDI_PREVIEW_DISC"),std::env::var("OPENCDI_PREVIEW_ART")) {
             let path=PathBuf::from(path);let root=PathBuf::from(root);
-            let details=library::DiscDetails::load(&path,&root);
+            let mut details=library::DiscDetails::load(&path,&root);
             let disc=library::load_disc_artwork(&path,&root.join("CD"));
             let synopsis=synopsis::load(&root.parent().unwrap_or(&root).join("Synopses"),&path);
             let mut scene=library::BootScene::default();
@@ -3760,6 +3925,19 @@ mod tests {
             save("disc-info.png",&pixels);
             scene.render(&mut pixels,1920,1080,(0,0,1920,1080),"The 7th Guest",&details,synopsis.as_deref(),false,disc.as_ref(),30);
             save("disc-info-loading.png",&pixels);
+            if std::env::var_os("OPENCDI_NEW_CASE_PREVIEW").is_some(){
+                let cover=library::cover_artwork_path(&path,&root.join("Covers")).unwrap();
+                let art_root=folder.join("artwork");
+                let case=boxart::ensure(&cover,&library::disc_title(&path),&art_root).unwrap().unwrap_or_else(||boxart::generated_path(&art_root,&library::disc_title(&path)));
+                details.boxart=library::load_artwork(&case);
+                let paths=vec![path.clone(),path.with_file_name("7th Guest, The (Europe) (Disc 2) (The Making Of).chd")];
+                scene.compact_disc=true;
+                for selected in 0..2{
+                    scene.render(&mut pixels,1920,1080,(0,0,1920,1080),"The 7th Guest",&details,synopsis.as_deref(),true,if selected==0{disc.as_ref()}else{None},0);
+                    library::render_disc_picker(&mut pixels,1920,1080,(0,0,1920,1080),&paths,selected);
+                    save(&format!("multidisc-info-disc-{}.png",selected+1),&pixels);
+                }
+            }
         }
 
     }
@@ -3782,6 +3960,31 @@ mod tests {
     fn save_state_folders_do_not_collide_between_bioses(){
         let a=savestate_path_for("Test Game",1,"220");let b=savestate_path_for("Test Game",1,"490");
         assert_ne!(a,b);assert_eq!(a.file_name(),b.file_name());assert!(a.parent().unwrap().ends_with("Savestates/220"));assert!(b.parent().unwrap().ends_with("Savestates/490"));
+    }
+    #[test]
+    fn multidisc_nvram_uses_disc_one_without_overwriting_any_existing_save(){
+        let root=std::env::temp_dir().join(format!("opencdi-disc-set-nvram-{}",std::process::id()));
+        std::fs::create_dir_all(root.join("NVRAM/220")).unwrap();
+        std::fs::create_dir_all(root.join("NVRAM/490")).unwrap();
+        let first=root.join("Example (Europe) (Disc 1) (The Game).chd");
+        let second=root.join("Example (Europe) (Disc 2) (The Making Of).chd");
+        std::fs::write(&first,b"").unwrap();std::fs::write(&second,b"").unwrap();
+        let old=root.join("NVRAM/220/Example (Europe) (Disc 1) (The Game).bin");
+        let other=root.join("NVRAM/220/Example (Europe) (Disc 2) (The Making Of).bin");
+        std::fs::write(&old,vec![0x11;8192]).unwrap();std::fs::write(&other,vec![0x22;8192]).unwrap();
+        let global=root.join("global.bin");
+        let shared=per_disc_nvram_save_path(&global,&second,"220");
+        assert_eq!(shared,root.join("NVRAM/220/Example (Europe).bin"));
+        assert_eq!(std::fs::read(&shared).unwrap(),vec![0x11;8192]);
+        assert_eq!(per_disc_nvram_save_path(&global,&first,"220"),shared);
+        assert_eq!(std::fs::read(&old).unwrap(),vec![0x11;8192]);assert_eq!(std::fs::read(&other).unwrap(),vec![0x22;8192]);
+        std::fs::write(&shared,vec![0x33;8192]).unwrap();
+        per_disc_nvram_save_path(&global,&first,"220");assert_eq!(std::fs::read(&shared).unwrap(),vec![0x33;8192]);
+        let other_bios=per_disc_nvram_save_path(&global,&second,"490");assert!(!other_bios.exists());
+        std::fs::write(root.join("NVRAM/490/Example (Europe) (Disc 1) (The Game).bin"),vec![0x44;32768]).unwrap();
+        assert_eq!(std::fs::read(per_disc_nvram_save_path(&global,&second,"490")).unwrap(),vec![0x44;32768]);
+        assert_ne!(per_disc_nvram_save_path(&global,&root.join("Example (USA) (Disc 1).chd"),"220"),shared);
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     #[ignore = "Measures local library decoding; requires OPENCDI_BENCH_DISCS and OPENCDI_BENCH_ART"]

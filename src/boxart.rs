@@ -12,10 +12,10 @@ use std::sync::{
 
 const SCALE: usize = 2;
 const WIDTH: usize = 400 * SCALE;
-const HEIGHT: usize = 459 * SCALE;
+const HEIGHT: usize = 470 * SCALE;
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static TEMPLATE: LazyLock<Artwork> = LazyLock::new(|| {
-    library::load_png_bytes(include_bytes!("../assets/boxart_case.png"))
+    library::load_png_bytes(include_bytes!("../assets/boxart_case_v2.png"))
         .expect("embedded case template")
 });
 
@@ -152,7 +152,7 @@ pub fn ensure(
             hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
         }
     }
-    let signature = format!("case-v1-{:x}-{}x{}", hash, image.w, image.h);
+    let signature = format!("case-v2-{:x}-{}x{}", hash, image.w, image.h);
     let destination = generated_path(root, title);
     let legacy = legacy_generated_path(root, title);
     if !destination.exists() && legacy.is_file() { let _ = fs::rename(&legacy, &destination); }
@@ -186,49 +186,28 @@ pub fn ensure(
 
 fn render(template: &Artwork, cover: &Artwork) -> Vec<u32> {
     let mut pixels = vec![0; WIDTH * HEIGHT];
+    // Exact cover pixels are projected onto the new case's front plane.
+    // The generated reference supplies only the plastic frame and CD-i spine.
+    let (left,right,top_left,top_right,bottom_left,bottom_right)=(286.0f32,972.0f32,78.0f32,241.0f32,1257.0f32,1130.0f32);
+    let e=bottom_left-top_left;
+    let g=e/(bottom_right-top_right)-1.0;
+    let a=right*(g+1.0)-left;
+    let d=top_right*(g+1.0)-top_left;
     for y in 0..HEIGHT {
         for x in 0..WIDTH {
-            let px = x as f32 / SCALE as f32;
-            let py = y as f32 / SCALE as f32;
-            let top = if px < 48.0 {
-                6.0 - px / 8.0
-            } else {
-                (px - 48.0) * 23.0 / 351.0
-            };
-            let bottom = if px < 48.0 {
-                445.0 + px * 14.0 / 48.0
-            } else {
-                459.0 - (px - 48.0) * 15.0 / 351.0
-            };
-            if py < top || py > bottom {
-                continue;
-            }
+            let px = x as f32 * template.w as f32 / WIDTH as f32;
+            let py = y as f32 * template.h as f32 / HEIGHT as f32;
             let mut color = crate::library::sample_bilinear(template, px, py);
-            if (50.0..396.0).contains(&px) {
-                let u = (px - 50.0) / 346.0;
-                let front_top = 13.0 + 15.0 * u;
-                let front_bottom = 445.0 - 10.0 * u;
-                if py >= front_top && py <= front_bottom {
-                    let v = (py - front_top) / (front_bottom - front_top);
+            let u=(left-px)/(px*g-a);
+            let v=(py*(g*u+1.0)-d*u-top_left)/e;
+            if (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v) {
                     color = crate::library::sample_bilinear(
                         cover,
                         u * (cover.w - 1) as f32,
                         v * (cover.h - 1) as f32,
                     ) | 0xff000000;
-                }
             }
-            if px >= 48.0 {
-                let u = ((px - 50.0) / 346.0).clamp(0.0, 1.0);
-                if py < 13.0 + 15.0 * u || py > 445.0 - 10.0 * u {
-                    let light =
-                        (((color >> 16) & 255) * 3 + ((color >> 8) & 255) * 6 + (color & 255)) / 10;
-                    let silver = light.max(130);
-                    color = 0xff000000 | silver << 16 | silver << 8 | silver;
-                }
-            }
-            if px < 11.0 {
-                color = 0xff0b0b0b;
-            }
+            if color>>24<10 {color=0;}
             pixels[y * WIDTH + x] = color;
         }
     }
@@ -260,7 +239,7 @@ mod tests {
         let case = ensure(&cover, "Example", &root).unwrap().unwrap();
         let first = fs::read(&case).unwrap();
         let image = library::load_artwork(&case).unwrap();
-        assert_eq!((image.w, image.h), (832, 950));
+        assert_eq!((image.w, image.h), (WIDTH+32, HEIGHT+32));
         assert_eq!(image.pixels[0] >> 24, 0);
         assert_eq!(image.pixels[400 * image.w + 400], 0xff336699);
         assert_eq!(ensure(&cover, "Example", &root).unwrap(), None);

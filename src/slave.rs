@@ -429,7 +429,9 @@ impl SlaveHle {
             ch.pending_cmd = 0;
         }
         if assert_irq {
-            self.irq_deferred = true;
+            // Pointer reports are asynchronous input, not replies to a command
+            // being written. Upstream asserts their request immediately.
+            if ch_idx == 0 {self.irq_pending=true;} else {self.irq_deferred=true;}
         }
     }
 
@@ -472,3 +474,26 @@ opencdi::impl_state!(SlaveHle {
 } skip {
     debug_log,
 });
+
+#[cfg(test)]
+mod pointer_irq_tests {
+    use super::*;
+    #[test]
+    fn pointer_report_interrupts_immediately_and_preserves_a_queued_release() {
+        let mut slave=SlaveHle::new();
+        slave.update_mouse(300,280,1);
+        assert!(slave.irq_pending);
+        slave.update_mouse(300,280,0);
+        assert_ne!((slave.read(0) as u8)&0x38,8);
+        for _ in 0..3{slave.read(0);}
+        assert!(slave.irq_pending);
+        assert_eq!((slave.read(0) as u8)&0x38,8);
+    }
+    #[test]
+    fn command_replies_keep_their_deferred_interrupt() {
+        let mut slave=SlaveHle::new();
+        slave.prepare_readback(2,&[0xf0,0x32,0x31],0xf0,true);
+        assert!(!slave.irq_pending);assert!(slave.irq_deferred);
+        slave.tick(1);assert!(slave.irq_pending);
+    }
+}

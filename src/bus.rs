@@ -492,6 +492,10 @@ impl CdiBus {
 
         self.dvc.dma_requested = false;
         let start = self.dma.channels[1].memory_address_counter;
+        if self.dvc.audio_trace {
+            eprintln!("DVC-DMA frame={} pc={:08x} start={start:08x} words={count} audio={}",
+                self.current_frame,self.current_pc,self.dvc.transfer_for_fma);
+        }
         let b16: Vec<u8> = (0..16.min(count * 2)).map(|off| self.read_byte(start.wrapping_add(off))).collect();
         trace!("PERFORM DVC DMA at frame {}: start=0x{:08X}, count={} (for_fma={}) | bytes[0..16]={:02X?}", 
             self.current_frame, start, count, self.dvc.transfer_for_fma, b16);

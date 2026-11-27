@@ -8,16 +8,16 @@ pub const ROWS: usize = 8;
 pub enum Target { Keyboard, Gamepad, PauseKey, PausePad, ExitKey, ExitPad }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Hit { Binding(usize, Target), Hotkey(Target), Device(InputDeviceMode), Close }
+pub enum Hit { Binding(usize, Target), Hotkey(Target), Device(InputDeviceMode), ToggleDevice(InputDeviceMode), Sensitivity(u16), Close }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action { Close, AssignedKey(usize, Key), AssignedPauseKey(Key), AssignedExitKey(Key), Cancelled, Handled }
 
 #[derive(Debug, Clone)]
-pub struct State { pub row: usize, pub target: Target, pub listening: bool, pub pending_combo: Vec<gilrs::Button>, gamepad_confirm_ready: bool }
+pub struct State { pub row: usize, pub target: Target, pub listening: bool, pub pending_combo: Vec<gilrs::Button>, pub per_disc: bool, gamepad_confirm_ready: bool }
 
 impl Default for State {
-    fn default() -> Self { Self { row: 0, target: Target::Keyboard, listening: false, pending_combo: Vec::new(), gamepad_confirm_ready: false } }
+    fn default() -> Self { Self { row: 0, target: Target::Keyboard, listening: false, pending_combo: Vec::new(), per_disc:false, gamepad_confirm_ready: false } }
 }
 
 impl State {
@@ -33,7 +33,7 @@ impl State {
         match hit {
             Hit::Binding(row, target) => { self.row = row; self.target = target; self.listening = true; self.pending_combo.clear(); None }
             Hit::Hotkey(target) => { self.target = target; self.listening = true; self.pending_combo.clear(); None }
-            Hit::Device(_) => None,
+            Hit::Device(_) | Hit::ToggleDevice(_) | Hit::Sensitivity(_) => None,
             Hit::Close => { self.listening = false; Some(Hit::Close) }
         }
     }
@@ -61,6 +61,12 @@ impl State {
 }
 
 pub fn hit_test(x: usize, y: usize) -> Option<Hit> {
+    if (535..744).contains(&x) && (70..92).contains(&y) {return Some(Hit::Sensitivity((25+(x.saturating_sub(535).min(200)*125/200))as u16));}
+    if (154..177).contains(&y) {
+        for (left,mode) in [(27,InputDeviceMode::Gamepad),(132,InputDeviceMode::Mouse),(237,InputDeviceMode::Peacekeeper)] {
+            if (left..left+100).contains(&x){return Some(Hit::ToggleDevice(mode));}
+        }
+    }
     if (12..124).contains(&x) && (8..34).contains(&y) { return Some(Hit::Close); }
     if (27..127).contains(&x) && (124..151).contains(&y) { return Some(Hit::Device(InputDeviceMode::Gamepad)); }
     if (132..232).contains(&x) && (124..151).contains(&y) { return Some(Hit::Device(InputDeviceMode::Mouse)); }
@@ -169,9 +175,13 @@ pub fn render_native(dst:&mut [u32],width:usize,height:usize,view:(usize,usize,u
     c.rect(0,0,library::W,42,0xFF0C1726);c.rect(0,41,library::W,1,0xFF26374A);
     c.surface(12,8,112,26,7,0xFF263C53,0xFF1B2D42,0xFF3B526B);c.icon(16,22,14,13,0xFFBADAF1);c.text(43,15,"Back",0xFFD9E4EF,1);
     c.text(20,54,"Controller Settings",0xFFF1F5FA,2);
-    c.text(382,60,"All controls enabled together",0xFF91B8D8,1);
+    c.text(382,60,if state.per_disc{"Saved for this disc"}else{"Default gameplay controls"},0xFF91B8D8,1);
+    c.text(382,78,&format!("Mouse speed {}%",bindings.controllers.mouse_sensitivity),0xFFB7C6D5,1);
+    c.rect(535,80,200,3,0xFF344C65);
+    let slider_x=535+(bindings.controllers.mouse_sensitivity.clamp(25,150)-25) as usize*200/125;
+    c.rect(535,80,slider_x-535,3,0xFF5BBDF9);c.surface(slider_x.saturating_sub(4),75,9,12,4,0xFFE5F2FF,0xFFAACDE9,0xFFBEE5FF);
     c.surface(14,92,338,300,12,0xFF182A3E,0xFF122033,0xFF30455E);c.surface(364,92,390,300,12,0xFF182A3E,0xFF122033,0xFF30455E);
-    c.text(28,106,match mode { InputDeviceMode::Mouse => "CD-i Mouse", InputDeviceMode::Gamepad => "CD-i Gamepad", InputDeviceMode::Peacekeeper => "CD-i Peacekeeper" },0xFFEAF0F6,1);
+    c.text(28,106,match mode { InputDeviceMode::Mouse => "Preferred: CD-i Mouse", InputDeviceMode::Gamepad => "Preferred: CD-i Gamepad", InputDeviceMode::Peacekeeper => "Preferred: Peacekeeper" },0xFFEAF0F6,1);
     for (x,device,label) in [
         (27,InputDeviceMode::Gamepad,"Gamepad"),
         (132,InputDeviceMode::Mouse,"Mouse"),
@@ -181,9 +191,13 @@ pub fn render_native(dst:&mut [u32],width:usize,height:usize,view:(usize,usize,u
         c.surface(x,124,100,27,7,if selected{0xFF2D506C}else{0xFF24394F},if selected{0xFF23415B}else{0xFF1B2D41},if selected{0xFF67C2FD}else{0xFF3A516A});
         c.icon(match device{InputDeviceMode::Gamepad=>1,InputDeviceMode::Mouse=>19,InputDeviceMode::Peacekeeper=>18},x+7,130,13,if selected{0xFFB5E4FF}else{0xFFA7BED6});
         c.text(x+25,132,label,0xFFF1F6FA,1);
+        let enabled=match device{InputDeviceMode::Gamepad=>bindings.controllers.gamepad,InputDeviceMode::Mouse=>bindings.controllers.mouse,InputDeviceMode::Peacekeeper=>bindings.controllers.peacekeeper};
+        c.rect(x+6,157,12,12,0xFF2A4057);
+        if enabled{c.text(x+7,158,"X",0xFF74CEFF,1);}
+        c.text(x+25,159,if enabled{"Enabled"}else{"Off"},if enabled{0xFFD6E7F5}else{0xFF8B9BAC},1);
     }
     let art=match mode { InputDeviceMode::Mouse=>mouse_art, InputDeviceMode::Gamepad=>gamepad_art, InputDeviceMode::Peacekeeper=>peacekeeper_art };
-    let art_box=(20,158,326,190);
+    let art_box=(20,179,326,169);
     if let Some(art)=art{c.art_fit(art,art_box.0,art_box.1,art_box.2,art_box.3);}
     if mode==InputDeviceMode::Gamepad{
         // Map ring positions directly from the controller image's source pixels.
@@ -201,6 +215,7 @@ pub fn render_native(dst:&mut [u32],width:usize,height:usize,view:(usize,usize,u
         }
     } else { "Philips CD-i input device" },0xFFB7C6D5,1);
 
+    c.text(382,391,"Wiimote idle: 5 min. Reopen Controller Settings to reconnect.",0xFFB7C6D5,1);
     if mode == InputDeviceMode::Peacekeeper {
         c.text(382,106,"DolphinBar Mode 4",0xFFEAF0F6,1);
         let status = match wiimote {
@@ -330,3 +345,12 @@ mod tests {
         assert!(state.listening);
     }
 }
+    #[test]
+    fn controller_switches_and_sensitivity_have_separate_hit_targets() {
+        for (x,mode) in [(75,InputDeviceMode::Gamepad),(180,InputDeviceMode::Mouse),(280,InputDeviceMode::Peacekeeper)] {
+            assert_eq!(hit_test(x,135),Some(Hit::Device(mode)));
+            assert_eq!(hit_test(x,163),Some(Hit::ToggleDevice(mode)));
+        }
+        assert_eq!(hit_test(535,80),Some(Hit::Sensitivity(25)));
+        assert_eq!(hit_test(735,80),Some(Hit::Sensitivity(150)));
+    }

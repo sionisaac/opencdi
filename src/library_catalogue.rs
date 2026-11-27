@@ -58,6 +58,7 @@ impl Title {
 struct Catalogue {
     titles: Vec<Title>,
     index: HashMap<String, Option<usize>>,
+    bundles: Vec<(usize, Vec<usize>)>,
 }
 
 // Public catalogue snapshot, 10 November 2026. The masks combine its
@@ -67,7 +68,7 @@ static CATALOGUE: LazyLock<Catalogue> = LazyLock::new(|| {
         serde_json::from_str(include_str!("../assets/world-of-cdi-catalogue.json"))
             .expect("valid bundled World of CD-i catalogue");
     let mut index = HashMap::new();
-    let titles = records.into_iter().enumerate().map(|(id, (mask, name, slug, aliases))| {
+    let titles: Vec<_> = records.into_iter().enumerate().map(|(id, (mask, name, slug, aliases))| {
         for title in std::iter::once(&name).chain(&aliases) {
             let key = title_key(title);
             index.entry(key).and_modify(|current| {
@@ -76,7 +77,17 @@ static CATALOGUE: LazyLock<Catalogue> = LazyLock::new(|| {
         }
         Title { mask, name, slug }
     }).collect();
-    Catalogue { titles, index }
+    let bundle_records: Vec<serde_json::Value> = serde_json::from_str(include_str!("../assets/catalogue-bundles.json"))
+        .expect("valid bundled collection relationships");
+    let id = |slug: &str| titles.iter().position(|title| title.slug == slug)
+        .expect("bundle references an existing catalogue title");
+    let bundles = bundle_records.into_iter().map(|bundle| {
+        let members=bundle["includes"].as_array().expect("multipack contents");
+        assert!(!members.is_empty(), "a multipack must include titles");
+        (id(bundle["slug"].as_str().expect("multipack slug")), members.iter()
+            .map(|slug| id(slug.as_str().expect("multipack member slug"))).collect())
+    }).collect();
+    Catalogue { titles, index, bundles }
 });
 
 fn title_key(title: &str) -> String {
@@ -117,10 +128,23 @@ pub const MISSING_ROWS: usize = 10;
 impl Collection {
     pub fn refresh(&mut self, items: &[Item]) {
         let owned: Vec<_> = items.iter().map(|item| {
-            CATALOGUE.index.get(&title_key(&item.title)).copied().flatten()
+            crate::title_aliases::slug(&item.title)
+                .and_then(|slug| CATALOGUE.titles.iter().position(|title| title.slug == slug))
+                .or_else(|| CATALOGUE.index.get(&title_key(&item.title)).copied().flatten())
         }).collect();
         self.masks = owned.iter().map(|id| id.map_or(0, |id| CATALOGUE.titles[id].mask)).collect();
-        let owned: HashSet<_> = owned.into_iter().flatten().collect();
+        for (head,members) in crate::multidisc::groups(&items.iter().map(|item|item.path.clone()).collect::<Vec<_>>()) {
+            let mask=members.iter().map(|&i|self.masks[i]).find(|&m|m!=0).unwrap_or(self.masks[head]);
+            for i in members {self.masks[i]=mask;}
+        }
+        let mut owned: HashSet<_> = owned.into_iter().flatten().collect();
+        // A package is not another disc image. Its contents satisfy the
+        // missing-title checklist without adding a synthetic library item.
+        for (bundle, members) in &CATALOGUE.bundles {
+            if members.iter().all(|member| owned.contains(member)) {
+                owned.insert(*bundle);
+            }
+        }
         for category in Category::TABS {
             let index = category as usize;
             self.counts[index] = self.masks.iter().filter(|&&mask| category.contains(mask)).count();
@@ -159,6 +183,46 @@ impl Collection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn item(title: &str) -> Item {
+        Item { path: format!("{title}.chd").into(), title: title.into(), cover: None, disc: None, logo: None }
+    }
+
+    fn nfl_pack_missing(collection: &Collection) -> bool {
+        (0..collection.missing_count()).any(|i| collection.missing_title(i).unwrap().slug
+            == "nfl-the-ultimate-football-collection-triple-pack")
+    }
+
+    #[test]
+    fn nfl_pack_is_owned_when_all_three_distinct_contents_are_present() {
+        let items = vec![item("NFL Football Trivia Challenge '94-'95 Edition (USA)"),
+            item("NFL Hall of Fame Football (Europe)"), item("NFL 100 Greatest Touchdowns (USA)")];
+        let mut collection=Collection::default();
+        collection.refresh(&items);
+        assert!(!nfl_pack_missing(&collection));
+        assert_eq!(collection.owned_count(),3,"the multipack is not a fourth physical disc");
+        collection.category=Category::Games;
+        assert!(!nfl_pack_missing(&collection),"a multimedia component must still satisfy the Games multipack");
+        for omitted in 0..3 {
+            let partial:Vec<_>=items.iter().enumerate().filter(|(i,_)|*i!=omitted)
+                .map(|(_,it)|item(&it.title)).collect();
+            collection.refresh(&partial);
+            assert!(nfl_pack_missing(&collection),"every included title is required");
+        }
+    }
+
+    #[test]
+    fn nfl_pack_does_not_accept_an_older_trivia_edition_or_duplicate_regions() {
+        let mut collection=Collection::default();
+        collection.refresh(&[item("NFL Football Trivia Challenge (USA)"),
+            item("NFL Hall of Fame Football (USA)"),item("NFL 100 Greatest Touchdowns (Europe)")]);
+        assert!(nfl_pack_missing(&collection));
+        collection.refresh(&[item("NFL Hall of Fame Football (USA)"),
+            item("NFL Hall of Fame Football (Europe)"),item("NFL 100 Greatest Touchdowns (Europe)")]);
+        assert!(nfl_pack_missing(&collection));
+        collection.refresh(&[item("NFL – The Ultimate Football Collection – Triple Pack")]);
+        assert!(!nfl_pack_missing(&collection),"direct title matching must still work");
+    }
 
     #[test]
     fn catalogue_keeps_numbered_editions_and_prototypes_distinct() {

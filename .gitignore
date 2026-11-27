@@ -21,6 +21,7 @@ Invia_a_GitHub.bat
 !assets/disc_missing.png
 
 !assets/boxart_case.png
+!assets/boxart_case_v2.png
 
 !assets/emulation_bezel.png
 !assets/cdi_peacekeeper.png
@@ -29,5 +30,7 @@ Invia_a_GitHub.bat
 !tools/validate_bios_files.py
 
 !tools/validate_490.py
+!tools/import_title_aliases.py
+!tools/run_compatibility.py
 !screenshots/disc-info.png
 !screenshots/disc-info-loading.png

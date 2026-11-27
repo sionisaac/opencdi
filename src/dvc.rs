@@ -560,6 +560,7 @@ pub struct Dvc {
     pub impeg_pio: bool, // IMPEG audio fed by programmed I/O
     pub impeg_hi_valid: bool, // the high byte of the next data-port word has been written
     pub impeg_ivec_zero_logged: bool,
+    pub audio_trace: bool, // host-only diagnostic switch; never persisted in guest states
 
     // Mirrored fields for easy access
     pub fma_cmd: u16,
@@ -654,6 +655,7 @@ impl Dvc {
             impeg_regs: Box::new([0; 0x300]),
             impeg_fw: vec![0; 0x3800],
             impeg_pio: false,
+            audio_trace: std::env::var_os("CDI_DVC_AUDIO_TRACE").is_some(),
             impeg_hi_valid: false,
             impeg_ivec_zero_logged: false,
 
@@ -1010,7 +1012,9 @@ impl Dvc {
         if offset == 0x24 {
             self.set_fma_word(0x24, 0x0004); // HF2 flag ready
         }
-        if offset == 0x10 {
+        // IMPEG polls the low word before the high word. Refresh either half
+        // so the first low-word read after an idle interval is not stale.
+        if offset == 0x10 || (self.impeg && offset == 0x12) {
             self.set_fma_word(0x12, self.dclk as u16);
         }
         self.set_fma_word(0x10, (self.dclk >> 16) as u16);
@@ -1079,6 +1083,9 @@ impl Dvc {
         if r == FMA_IER {
             w = u16::from_be_bytes([self.impeg_regs[0x100 + FMA_IER], self.impeg_regs[0x101 + FMA_IER]]);
         }
+        if off & 1 == 1 && self.audio_trace {
+            eprintln!("IMPEG-AUDIO-READ register={r:02x} value={w:04x}");
+        }
         // The status is acknowledged by reading it, as on VMPEG.
         if r == FMA_ISR && off & 1 == 1 {
             self.acknowledge_fma_isr();
@@ -1093,6 +1100,9 @@ impl Dvc {
             return;
         }
         let w = u16::from_be_bytes([self.impeg_regs[0x100 + (off & !1)], val]);
+        if self.audio_trace {
+            eprintln!("IMPEG-AUDIO-WRITE register={r:02x} value={w:04x}");
+        }
         match r {
             FMA_IER => self.set_fma_word(r, Self::impeg_bits_to(w)),
             FMA_ISR => self.acknowledge_fma_isr(),
@@ -1330,7 +1340,7 @@ impl Dvc {
         let value = self.get_fmv_word(offset);
         if matches!(offset, FMV_SYSCMD | FMV_VIDCMD | FMV_IER)
             && std::env::var_os("CDI_DVC_COMMAND_TRACE").is_some() {
-            eprintln!("DVC-COMMAND impeg={} register={offset:02x} value={value:04x}",self.impeg);
+            eprintln!("DVC-COMMAND impeg={} register={offset:02x} value={value:04x} clock={} playing={} decoded={}",self.impeg,self.dclk,self.video_playing,self.frames_decoded_count);
         }
         match offset {
             FMV_SYSCMD => {
@@ -1877,7 +1887,7 @@ opencdi::impl_state!(Dvc {
     underflow_count, fma_started, fma_tick_accum, fma_pending, fma_last_header, has_valid_frame,
     impeg_regs, impeg_pio, impeg_hi_valid,
 } skip {
-    rom, impeg, impeg_fw, impeg_ivec_zero_logged, cpu_hz, audio_stopped, dsp_att,
+    rom, impeg, impeg_fw, impeg_ivec_zero_logged, cpu_hz, audio_stopped, dsp_att, audio_trace,
 });
 
 opencdi::impl_state!(MpegSystemDemux {
@@ -2335,6 +2345,18 @@ mod impeg_tests {
         assert_eq!(d.fma_stream_fifo.len(), before + 2);
         d.reset();
         assert!(!d.impeg_pio && d.impeg_regs[..IMPEG_ATT].iter().all(|&b| b == 0) && d.impeg_regs[IMPEG_ATT..IMPEG_ATT + 4] == [0x3F; 4]);
+    }
+
+    #[test]
+    fn impeg_audio_clock_low_word_does_not_require_a_prior_high_word_read() {
+        let mut d = Dvc::new();
+        d.impeg = true;
+        d.dclk = 0x1234_5678;
+        let low = u16::from_be_bytes([d.impeg_audio_read(0x12),d.impeg_audio_read(0x13)]);
+        assert_eq!(low,0x5678);
+        d.dclk += 900;
+        let low = u16::from_be_bytes([d.impeg_audio_read(0x12),d.impeg_audio_read(0x13)]);
+        assert_eq!(low,0x59fc);
     }
 
     #[test]

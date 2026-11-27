@@ -218,6 +218,9 @@ pub struct CdRom {
     pub volume_id: String,
     pub volume_set: String,
     pub publisher: String,
+    /// Green Book III.2, bytes 575–702 (one-based): program started on mount.
+    pub application_id: String,
+    pub application_module: Option<String>,
 }
 
 fn parse_msf(s: &str) -> Option<u32> {
@@ -396,6 +399,8 @@ impl CdRom {
                 volume_id: String::new(),
                 volume_set: String::new(),
                 publisher: String::new(),
+                application_id: String::new(),
+                application_module: None,
             };
             cdrom.detect_disc_type();
             return Ok(cdrom);
@@ -448,6 +453,8 @@ impl CdRom {
                 volume_id: String::new(),
                 volume_set: String::new(),
                 publisher: String::new(),
+                application_id: String::new(),
+                application_module: None,
             };
             cdrom.detect_disc_type();
             Ok(cdrom)
@@ -480,6 +487,8 @@ impl CdRom {
                 volume_id: String::new(),
                 volume_set: String::new(),
                 publisher: String::new(),
+                application_id: String::new(),
+                application_module: None,
             };
             cdrom.detect_disc_type();
             Ok(cdrom)
@@ -590,6 +599,8 @@ impl CdRom {
                 volume_id: String::new(),
                 volume_set: String::new(),
                 publisher: String::new(),
+                application_id: String::new(),
+                application_module: None,
             };
 
             cdrom.detect_disc_type();
@@ -609,6 +620,8 @@ impl CdRom {
             self.volume_id = label_text(&label[40..72]);
             self.volume_set = label_text(&label[190..318]);
             self.publisher = label_text(&label[318..446]);
+            self.application_id = label_text(&label[574..702]);
+            self.application_module = self.initial_application_module(&label);
             if sys_id.starts_with(b"CD-RTOS CD-BRIDGE") {
                 info!("CD-ROM: Riconosciuto disco CD-RTOS CD-BRIDGE (Video CD / White Book), disc_type = 0x20");
                 self.disc_type = 0x20;
@@ -620,6 +633,72 @@ impl CdRom {
                 self.disc_type = 0x10;
             }
         }
+    }
+
+    /// A file's OS-9 name need not equal its pathname. Read bounded Form-1
+    /// directory records and the first program sector, without moving the
+    /// emulated drive. Unsupported layouts retain the label-name fallback.
+    fn initial_application_module(&mut self,label:&[u8;2048])->Option<String> {
+        let path=self.application_id.clone();
+        let parts:Vec<_>=path.split('/').filter(|s|!s.is_empty()).collect();
+        if parts.is_empty() || parts.len()>8 || parts.iter().any(|s|matches!(*s,"."|"..")){return None;}
+        let be=|d:&[u8],at:usize|u32::from_be_bytes(d[at..at+4].try_into().unwrap());
+        let mut block=[0;2048];
+        let mut lba=if &label[1..6]==b"CD-I " {
+            if !self.read_data_sector(be(label,148),&mut block){return None;}
+            be(&block,2)
+        }else if &label[1..6]==b"CD001" {be(label,162)}else{return None;};
+        let mut file_size=0;
+        for (index,part) in parts.iter().enumerate() {
+            let (extent,size,directory)=self.application_entry(lba,part,&label[1..6]==b"CD-I ")?;
+            if directory!=(index+1<parts.len()){return None;}
+            lba=extent;file_size=size;
+        }
+        if file_size<51 || !self.read_data_sector(lba,&mut block){return None;}
+        if block[..2]!=[0x4a,0xfc] || block[18]!=1
+            || block[..48].chunks_exact(2).fold(0u16,|p,w|p^u16::from_be_bytes([w[0],w[1]]))!=0xffff {return None;}
+        let size=be(&block,4)as usize;let name=be(&block,12)as usize;
+        if size<51 || size>file_size || name<48 || name>=size-3{return None;}
+        let bytes=block.get(name..(size-3).min(block.len()))?;
+        let mut text=String::new();
+        for &b in bytes.iter().take(128) {
+            if b==0{return (!text.is_empty()).then_some(text);}
+            let ch=b&0x7f;if !(0x20..0x7f).contains(&ch){return None;}
+            text.push(ch as char);if b&0x80!=0{return Some(text);}
+        }
+        None
+    }
+
+    fn application_entry(&mut self,lba:u32,wanted:&str,cdi:bool)->Option<(u32,usize,bool)> {
+        let be=|d:&[u8],at:usize|u32::from_be_bytes(d[at..at+4].try_into().unwrap());
+        let mut block=[0;2048];if !self.read_data_sector(lba,&mut block){return None;}
+        let size=be(&block,14)as usize;if !(34..=65536).contains(&size){return None;}
+        let mut directory=Vec::with_capacity(size);
+        for i in 0..size.div_ceil(2048) {
+            if !self.read_data_sector(lba.checked_add(i as u32)?,&mut block){return None;}
+            directory.extend_from_slice(&block[..(size-directory.len()).min(2048)]);
+        }
+        let mut at=0;
+        while at+34<=directory.len() {
+            let n=directory[at]as usize;
+            if n==0 {at=(at/2048+1)*2048;continue;}
+            if n<34 || at+n>directory.len() || at%2048+n>2048{return None;}
+            let d=&directory[at..at+n];let len=d[32]as usize;
+            if 33+len>n{return None;}
+            let name=String::from_utf8_lossy(&d[33..33+len]);
+            if name.split(';').next()?.eq_ignore_ascii_case(wanted) {
+                if d[26]!=0 || d[27]!=0{return None;}
+                let directory=if cdi {
+                    // Green Book III.3: directory is attribute bit 15 after
+                    // the padded name and owner ID, not ISO-9660 flag bit 1.
+                    let at=(33+len).next_multiple_of(2)+4;
+                    u16::from_be_bytes(d.get(at..at+2)?.try_into().ok()?)&0x8000!=0
+                }else{d[25]&2!=0};
+                return Some((be(d,6).checked_add(u32::from(d[1]))?,be(d,14)as usize,directory));
+            }
+            at+=n;
+        }
+        None
     }
 
     /// Read a 2048-byte data payload in CPU-independent byte order. Raw reads
@@ -853,6 +932,8 @@ mod tests {
         d[190..195].copy_from_slice(b"Album");
         d[318..327].copy_from_slice(b"Publisher");
         d[446..454].copy_from_slice(b"Preparer");
+        d[574..702].fill(b' ');
+        d[574..587].copy_from_slice(b"CMDS/cdi_main");
         d
     }
 
@@ -883,6 +964,7 @@ mod tests {
                     let mut cd=CdRom::open(&fixture.path).unwrap();
                     assert_eq!((&*cd.volume_id,&*cd.volume_set,&*cd.publisher),("Volume","Album","Publisher"),
                         "mode={mode} scrambled={scrambled} swapped={swapped}");
+                    assert_eq!(cd.application_id,"CMDS/cdi_main");
                     let mut actual=[0;2048];
                     assert!(cd.read_data_sector(16,&mut actual));
                     assert_eq!(actual,payload);
@@ -892,6 +974,48 @@ mod tests {
                     drop(cd);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn initial_application_uses_the_module_name_inside_a_differently_named_file() {
+        fn entry(name:&[u8],lba:u32,size:u32,dir:bool)->Vec<u8> {
+            let extra=(33+name.len()).next_multiple_of(2);let mut d=vec![0u8;extra+10];
+            d[0]=d.len()as u8;d[6..10].copy_from_slice(&lba.to_be_bytes());
+            d[14..18].copy_from_slice(&size.to_be_bytes());d[32]=name.len()as u8;
+            d[33..33+name.len()].copy_from_slice(name);
+            d[extra+4..extra+6].copy_from_slice(&(if dir{0x8000u16}else{5}).to_be_bytes());d
+        }
+        for prefix in ["","CMDS/"] {
+            let mut image=vec![0u8;24*2048];let mut volume=label();
+            let path=format!("{prefix}cdi_loader");volume[574..702].fill(b' ');
+            volume[574..574+path.len()].copy_from_slice(path.as_bytes());
+            volume[148..152].copy_from_slice(&20u32.to_be_bytes());
+            image[16*2048..17*2048].copy_from_slice(&volume);
+            image[20*2048+2..20*2048+6].copy_from_slice(&21u32.to_be_bytes());
+            let file=entry(b"cdi_loader",23,128,false);
+            let file_dir_size=44+file.len();
+            let mut file_dir=entry(&[0],if prefix.is_empty(){21}else{22},file_dir_size as u32,true);
+            file_dir.extend(&file);
+            if prefix.is_empty(){image[21*2048..21*2048+file_dir.len()].copy_from_slice(&file_dir);}
+            else{
+                let child=entry(b"CMDS",22,file_dir_size as u32,true);
+                let mut root=entry(&[0],21,(44+child.len())as u32,true);root.extend(child);
+                image[21*2048..21*2048+root.len()].copy_from_slice(&root);
+                image[22*2048..22*2048+file_dir.len()].copy_from_slice(&file_dir);
+            }
+            let module=&mut image[23*2048..24*2048];module[..2].copy_from_slice(&[0x4a,0xfc]);
+            module[4..8].copy_from_slice(&128u32.to_be_bytes());module[18]=1;
+            module[12..16].copy_from_slice(&48u32.to_be_bytes());
+            module[48..65].copy_from_slice(b"cdi_laby_starter\0");
+            let parity=module[..46].chunks_exact(2).fold(0xffffu16,|p,w|p^u16::from_be_bytes([w[0],w[1]]));
+            module[46..48].copy_from_slice(&parity.to_be_bytes());
+            let fixture=Fixture::new(&image,"iso");let cd=CdRom::open(&fixture.path).unwrap();
+            assert_eq!(cd.application_id,path);
+            assert_eq!(cd.application_module.as_deref(),Some("cdi_laby_starter"));
+            image[23*2048+46]^=1;
+            let bad=Fixture::new(&image,"iso");let cd=CdRom::open(&bad.path).unwrap();
+            assert!(cd.application_module.is_none(),"malformed header became boot evidence");
         }
     }
 

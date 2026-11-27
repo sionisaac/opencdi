@@ -7,7 +7,6 @@ use opencdi::frontend::DisplayMode;
 
 pub const W: usize = 768;
 pub const H: usize = 560;
-const MAX_ITEMS: usize = 512;
 pub const TOOLBAR_HEIGHT: usize = 42;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -352,7 +351,6 @@ pub fn scan_paths(roots: &[PathBuf]) -> Vec<PathBuf> {
         .filter_map(|p| p.file_stem()).map(|s| s.to_string_lossy().to_lowercase()).collect();
     paths.retain(|p| !(ext(p) == "bin" && p.file_stem().map(|s| cue_stems.contains(&s.to_string_lossy().to_lowercase())).unwrap_or(false)));
     paths.sort_by_cached_key(|p| (p.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default(), p.clone()));
-    paths.truncate(MAX_ITEMS);
     paths
 }
 
@@ -408,6 +406,7 @@ pub struct DiscDetails {
 
 #[derive(Default)]
 pub struct BootScene {
+    pub compact_disc: bool,
     pixels: Vec<u32>,
     size: (usize, usize),
     view: (usize, usize, usize, usize),
@@ -443,8 +442,9 @@ impl BootScene {
         }
         dst.copy_from_slice(&self.pixels);
         let cx = view.0 + 520 * view.2 / W;
-        let cy = view.1 + 398 * view.3 / H;
-        let size = (176 * view.2 / W).min(176 * view.3 / H).max(1);
+        let cy = view.1 + (if self.compact_disc {372}else{398}) * view.3 / H;
+        let diameter=if self.compact_disc {136}else{176};
+        let size = (diameter * view.2 / W).min(diameter * view.3 / H).max(1);
         blit_rotated_into(dst, width, height, disc.unwrap_or(&MISSING_DISC), cx as i32, cy as i32, size as i32, frame as f32 * 0.055);
     }
 }
@@ -464,10 +464,9 @@ pub fn disc_title(path: &Path) -> String {
 fn ext(p: &Path) -> String { p.extension().unwrap_or_default().to_string_lossy().to_ascii_lowercase() }
 
 fn scan_dir(dir: &Path, depth: usize, seen: &mut HashSet<PathBuf>, out: &mut Vec<PathBuf>) {
-    if depth > 32 || out.len() >= MAX_ITEMS { return; }
+    if depth > 32 { return; }
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for entry in rd.flatten() {
-        if out.len() >= MAX_ITEMS { break; }
         let path = entry.path();
         let Ok(ft) = entry.file_type() else { continue };
         if ft.is_dir() {
@@ -517,6 +516,8 @@ pub fn load_cover_artwork(disc: &Path, root: &Path) -> Option<Artwork> {
 pub fn load_disc_artwork(disc: &Path, root: &Path) -> Option<Artwork> {
     let kind = crate::launchbox::ArtworkKind::Disc;
     crate::screenscraper::preferred_gallery_image(root, kind, &disc_title(disc))
+        .filter(|image| crate::multidisc::identify(disc).is_none_or(|requested|
+            crate::multidisc::identify(image).is_some_and(|found|found.number==requested.number)))
         .and_then(|path| load_artwork(&path))
         .or_else(|| art_in_root(disc, root, false).and_then(|p| load_artwork(&p)))
         .map(|image| crate::disc_art::normalize(&image))
@@ -635,6 +636,7 @@ pub fn render(dst: &mut [u32], items: &[Item], selected: usize, art_size: u8) {
 
 #[derive(Default)]
 pub struct Search {
+    pub disc_groups: std::collections::HashMap<usize,Vec<usize>>,
     pub active_bios: Option<(String,String)>,
     pub pointer: Option<(i32, i32)>,
     pub query: String,
@@ -652,14 +654,19 @@ fn search_key(text: &str) -> String {
 impl Search {
     pub fn rebuild(&mut self, items: &[Item]) {
         self.matches.clear();
-        if self.is_unfiltered() { return; }
+        self.disc_groups=crate::multidisc::groups(&items.iter().map(|item|item.path.clone()).collect::<Vec<_>>());
+        let hidden:HashSet<_>=self.disc_groups.values().flat_map(|g|g.iter().skip(1).copied()).collect();
         let terms: Vec<_> = self.query.split_whitespace().map(search_key).filter(|term| !term.is_empty()).collect();
         self.matches.extend(items.iter().enumerate().filter_map(|(index, item)| {
+            if hidden.contains(&index) { return None; }
             if !self.collection.includes(index) { return None; }
             if terms.is_empty() { return Some(index); }
-            let title = search_key(&item.title);
-            let file = search_key(&item.path.file_name().unwrap_or_default().to_string_lossy());
-            terms.iter().all(|term| title.contains(term) || file.contains(term)).then_some(index)
+            let members=self.disc_groups.get(&index).cloned().unwrap_or_else(||vec![index]);
+            members.into_iter().any(|i|{
+                let title=search_key(&items[i].title);
+                let file=search_key(&items[i].path.file_name().unwrap_or_default().to_string_lossy());
+                terms.iter().all(|term| title.contains(term)||file.contains(term))
+            }).then_some(index)
         }));
     }
 
@@ -668,15 +675,16 @@ impl Search {
     }
 
     pub fn len(&self, items: &[Item]) -> usize {
-        if self.is_unfiltered() { items.len() } else { self.matches.len() }
+        if self.is_unfiltered() && self.disc_groups.is_empty() { items.len() } else { self.matches.len() }
     }
 
     pub fn get<'a>(&self, items: &'a [Item], index: usize) -> Option<&'a Item> {
-        items.get(if self.is_unfiltered() { index } else { *self.matches.get(index)? })
+        items.get(if self.is_unfiltered() && self.disc_groups.is_empty() { index } else { *self.matches.get(index)? })
     }
 
     pub fn position(&self, items: &[Item], path: &Path) -> Option<usize> {
-        (0..self.len(items)).find(|&index| self.get(items, index).is_some_and(|item| item.path == path))
+        (0..self.len(items)).find(|&index| self.get(items, index).is_some_and(|item| item.path == path
+            || self.disc_groups.iter().any(|(head,members)|items[*head].path==item.path && members.iter().any(|&i|items[i].path==path))))
     }
 
     pub fn insert(&mut self, text: &str) -> bool {
@@ -864,12 +872,18 @@ pub fn render_native(dst: &mut [u32], width: usize, height: usize, view: (usize,
             let x=l.left+col*(l.cell_w+l.gap); let y=l.top+row*(l.cell_h+l.gap);
             let art_x=x+4; let art_y=y+2; let art_w=l.cell_w.saturating_sub(8); let art_h=l.cell_h.saturating_sub(31);
             c.cover_fit(item.cover.as_ref().unwrap_or(&MISSING_COVER), art_x, art_y, art_w, art_h);
+            if let Some(group)=search.disc_groups.iter().find_map(|(&head,members)|(items[head].path==item.path).then_some(members)) {
+                c.surface(art_x,art_y,42,16,5,0xFF284964,0xFF172B3E,0xFF5F9ABC);
+                c.text(art_x+3,art_y+3,&format!("{} discs",group.len()),0xFFE5F2FF,1);
+            }
             let active = i == selected;
             if let Some(logo) = &item.logo {
                 c.art_fit(logo, x + 3, y + l.cell_h - 28, l.cell_w - 6, 22);
             } else {
                 let title_cap = (l.cell_w.saturating_sub(6) / 6).max(1);
-                let (one, two) = wrap_title(&item.title, title_cap);
+                let grouped=crate::multidisc::identify(&item.path).map(|d|d.title);
+                let title=if search.disc_groups.keys().any(|&i|items[i].path==item.path){grouped.as_deref().unwrap_or(&item.title)}else{&item.title};
+                let (one, two) = wrap_title(title, title_cap);
                 let color = if active { 0xFF80C4FF } else { 0xFFE8EEF5 };
                 for (line, offset) in [(&one, 26), (&two, 14)] {
                     let inset = l.cell_w.saturating_sub(line.chars().count() * 6) / 2;
@@ -1162,6 +1176,37 @@ pub fn preview_hit(x: i32, y: i32) -> Option<PreviewAction> {
         })
 }
 
+pub fn disc_picker_hit(x:i32,y:i32,count:usize,selected:usize)->Option<usize>{
+    if count<2 || !(452..494).contains(&y) || !(290..744).contains(&x){return None;}
+    if count<=4 {Some(((x as usize-290)*count/454).min(count-1))}
+    else if x<338 {Some((selected+count-1)%count)}
+    else if x>=696 {Some((selected+1)%count)}else{None}
+}
+
+pub fn render_disc_picker(dst:&mut[u32],width:usize,height:usize,view:(usize,usize,usize,usize),paths:&[PathBuf],selected:usize){
+    if paths.len()<2 {return;}
+    let mut c=NativeCanvas::overlay(dst,width,height,view);
+    c.text(292,439,"Choose disc",0xFFA9D8FA,1);
+    let count=paths.len();
+    if count<=4 {
+        let cell=454/count;
+        for (i,path) in paths.iter().enumerate(){
+            let x=290+i*cell;let active=i==selected;
+            c.surface(x,452,cell-5,42,8,if active{0xFF2A506E}else{0xFF20374C},0xFF172B3E,if active{0xFF64BBF5}else{0xFF38536A});
+            let disc=crate::multidisc::identify(path);
+            let number=disc.as_ref().map_or(i as u32+1,|d|d.number);
+            c.icon(4,x+8,463,18,0xFFBDE5FF);
+            c.text(x+33,460,&format!("Disc {number}"),0xFFE5F2FF,1);
+            if let Some(d)=disc.filter(|d|!d.label.is_empty()){c.text(x+33,475,&short_title(&d.label,(cell-40)/6),0xFF9EB8CD,1);}
+        }
+    }else{
+        c.surface(290,452,454,42,8,0xFF223D54,0xFF172B3E,0xFF4F85AB);
+        c.text(305,465,"<",0xFFBDE5FF,2);c.text(713,465,">",0xFFBDE5FF,2);
+        let label=crate::multidisc::identify(&paths[selected]).map(|d|format!("Disc {}  {}",d.number,d.label)).unwrap_or_default();
+        c.centered_text(517,466,&format!("{}   ({}/{count})",short_title(&label,36),selected+1),0xFFE5F2FF,1);
+    }
+}
+
 pub fn toolbar_hit(x: usize, y: usize, popup: Option<ToolbarPopup>, optical_disc: Option<char>) -> Option<ToolbarAction> {
     if popup == Some(ToolbarPopup::Settings) && toolbar_popup_hit(x, y, popup) {
         let row = y.checked_sub(SETTINGS_Y + SETTINGS_HEADER + 6)? / SETTINGS_ROW;
@@ -1443,6 +1488,16 @@ mod library_tests {
         assert_eq!(scene.pixels.len(), output.len());
         assert_eq!(scene.title, "Changed");
     }
+    #[test]
+    fn multidisc_search_keeps_one_entry_and_can_find_the_second_disc(){
+        let items:Vec<_>=["Example (Europe) (Disc 1) (The Game)","Example (Europe) (Disc 2) (The Making Of)","Example (USA) (Disc 1)","Example (USA) (Disc 2)"].iter().map(|title|Item{path:format!("{title}.chd").into(),title:(*title).into(),cover:None,disc:None,logo:None}).collect();
+        let mut search=Search::default();search.collection.refresh(&items);search.rebuild(&items);
+        assert_eq!(search.len(&items),2);assert_eq!(search.collection.owned_count(),4);
+        assert_eq!(search.position(&items,&items[1].path),Some(0));
+        search.query="Making Of".into();search.rebuild(&items);assert_eq!(search.len(&items),1);assert_eq!(search.get(&items,0).unwrap().path,items[0].path);
+        assert_eq!(disc_picker_hit(310,470,2,0),Some(0));assert_eq!(disc_picker_hit(620,470,2,0),Some(1));
+        assert_eq!(disc_picker_hit(300,530,2,0),None);assert_eq!(disc_picker_hit(710,470,6,5),Some(0));
+    }
 
     #[test]
     fn category_search_and_collection_controls_leave_the_grid_and_slider_available() {
@@ -1571,6 +1626,42 @@ mod library_tests {
         assert!(scan_paths(std::slice::from_ref(&root)).is_empty());
         std::fs::remove_dir(discs).unwrap();
         std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn library_scan_keeps_titles_beyond_512_across_roots_and_subfolders() {
+        let root = std::env::temp_dir().join(format!("opencdi-large-library-{}", std::process::id()));
+        let nested = root.join("Discs");
+        std::fs::create_dir_all(&nested).unwrap();
+        for index in 0..600 {
+            let folder = if index < 300 { &root } else { &nested };
+            std::fs::write(folder.join(format!("Title {index:04}.chd")), []).unwrap();
+        }
+        let last = nested.join("Zelda's Adventure.chd");
+        std::fs::write(&last, []).unwrap();
+        // Overlapping roots must not duplicate entries or consume an item budget.
+        let paths = scan_paths(&[root.clone(), nested.clone()]);
+        assert_eq!(paths.len(), 601);
+        assert_eq!(paths.last(), Some(&last));
+        for path in paths { std::fs::remove_file(path).unwrap(); }
+        std::fs::remove_dir(nested).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "Requires OPENCDI_TEST_LIBRARY pointing to the user's disc folder; read-only scan"]
+    fn live_library_scan_includes_alphabetical_tail() {
+        let root = PathBuf::from(std::env::var_os("OPENCDI_TEST_LIBRARY").expect("disc folder"));
+        let paths = scan_paths(&[root]);
+        assert!(paths.len() > 512, "expected a collection larger than the former limit");
+        for title in ["Zelda - The Wand of Gamelon (USA)", "Zelda's Adventure (Europe)",
+            "Zenith (Europe)", "Zombie Dinos from Planet Zeltoid (USA)"] {
+            assert!(paths.iter().any(|p| p.file_stem().is_some_and(|s| s == title)), "missing {title}");
+        }
+        let game=paths.iter().position(|p| p.file_stem().is_some_and(|s| s=="7th Guest, The (USA) (Disc 1) (The Game)")).expect("7th Guest game disc");
+        let music=paths.iter().position(|p| p.file_stem().is_some_and(|s| s=="7th Guest, The (USA) (Disc 2) (The Music)")).expect("7th Guest music disc");
+        assert_eq!(crate::multidisc::groups(&paths).get(&game),Some(&vec![game,music]));
+        println!("Read-only collection scan: {} disc images; reported alphabetical-tail titles present", paths.len());
     }
 
     #[test]

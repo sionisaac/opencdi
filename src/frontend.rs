@@ -412,7 +412,7 @@ pub fn string_to_key(s: &str) -> Option<Key> {
     }
 }
 
-fn peacekeeper_disc(disc: &Path) -> bool {
+pub fn peacekeeper_disc(disc: &Path) -> bool {
     let stem = disc.file_stem().unwrap_or_default().to_string_lossy();
     let title: String = stem.split(['(', '[']).next().unwrap_or("")
         .chars().filter(char::is_ascii_alphanumeric).flat_map(char::to_lowercase).collect();
@@ -428,6 +428,7 @@ fn peacekeeper_disc(disc: &Path) -> bool {
 
 #[derive(Debug, Clone)]
 pub struct KeyBindings {
+    pub controllers: crate::host_input::ControllerOptions,
     peacekeeper_preset_applied: bool,
     pub ui_shortcuts: UiShortcuts,
     pub profile: InputProfile,
@@ -450,6 +451,7 @@ pub struct KeyBindings {
 impl KeyBindings {
     pub fn new() -> Self {
         let mut bindings = Self {
+            controllers: crate::host_input::ControllerOptions::default(),
             peacekeeper_preset_applied: false,
             ui_shortcuts: UiShortcuts::load(),
             profile: InputProfile::Standard,
@@ -500,6 +502,7 @@ impl KeyBindings {
         for line in text.lines() {
             let Some((name, value)) = line.split_once('=') else { continue; };
             let name = name.trim().to_ascii_lowercase(); let value = value.trim();
+            self.controllers.load_setting(&name,value);
             match name.as_str() {
                 "profile" => self.apply_profile(match value.to_ascii_lowercase().as_str() { "wasd" => InputProfile::Wasd, "numpad" => InputProfile::Numpad, "custom" => InputProfile::Custom, _ => InputProfile::Standard }),
                 "up" => if let Some(k)=string_to_key(value){self.up=k}, "down"=>if let Some(k)=string_to_key(value){self.down=k},
@@ -530,7 +533,7 @@ impl KeyBindings {
             key_to_string(self.up),key_to_string(self.down),key_to_string(self.left),key_to_string(self.right),key_to_string(self.btn1),key_to_string(self.btn2),key_to_string(self.btn3),
             pad_button_to_string(self.pad_up),pad_button_to_string(self.pad_down),pad_button_to_string(self.pad_left),pad_button_to_string(self.pad_right),pad_button_to_string(self.pad_btn1),pad_button_to_string(self.pad_btn2),pad_button_to_string(self.pad_btn3),
             self.ui_shortcuts.input_device.setting());
-        let content = format!("{content}peacekeeper_preset={}\n", u8::from(self.peacekeeper_preset_applied));
+        let content = format!("{content}peacekeeper_preset={}\n{}", u8::from(self.peacekeeper_preset_applied),self.controllers.settings());
         let _=std::fs::write(path,content);
     }
 
@@ -641,6 +644,7 @@ impl KeyBindings {
             self.ui_shortcuts.artwork_size,
             self.ui_shortcuts.input_device.setting(),
         );
+        let content = format!("{content}{}",self.controllers.settings());
         let _ = std::fs::write(settings_file_path(), content);
     }
 
@@ -654,6 +658,7 @@ impl KeyBindings {
                 }
                 let parts: Vec<&str> = trimmed.split('=').map(|s| s.trim()).collect();
                 if parts.len() == 2 {
+                    self.controllers.load_setting(&parts[0].trim().to_ascii_lowercase(),parts[1].trim());
                     match parts[0].to_lowercase().as_str() {
                         "profile" => match parts[1].to_lowercase().as_str() {
                             "wasd" => self.apply_profile(InputProfile::Wasd),
@@ -843,6 +848,23 @@ mod disc_config_tests {
         std::fs::remove_file(path).unwrap();
         let keys: Vec<_> = saved.lines().map(|line| line.split_once('=').unwrap().0).collect();
         assert_eq!(keys, ["profile", "up", "down", "left", "right", "btn1", "btn2", "btn3",
-            "pad_up", "pad_down", "pad_left", "pad_right", "pad_btn1", "pad_btn2", "pad_btn3", "input_device", "peacekeeper_preset"]);
+            "pad_up", "pad_down", "pad_left", "pad_right", "pad_btn1", "pad_btn2", "pad_btn3", "input_device", "peacekeeper_preset",
+            "control_gamepad","control_mouse","control_peacekeeper","mouse_sensitivity"]);
+    }
+
+    #[test]
+    fn each_discs_controller_combination_and_sensitivity_round_trip_independently() {
+        let path=std::env::temp_dir().join(format!("opencdi-controller-options-{}.ini",std::process::id()));
+        for mask in 0..8 {
+            let mut bindings=KeyBindings::new();
+            bindings.controllers=crate::host_input::ControllerOptions{gamepad:mask&1!=0,mouse:mask&2!=0,peacekeeper:mask&4!=0,mouse_sensitivity:75};
+            bindings.save_disc_config(&path);
+            let mut restored=KeyBindings::new();restored.load_disc_config(&path);
+            assert_eq!(restored.controllers,bindings.controllers);
+        }
+        std::fs::write(&path,"control_mouse=invalid\nmouse_sensitivity=999\n").unwrap();
+        let mut restored=KeyBindings::new();restored.controllers=crate::host_input::ControllerOptions::default();restored.load_disc_config(&path);
+        assert!(restored.controllers.mouse);assert_eq!(restored.controllers.mouse_sensitivity,150);
+        std::fs::remove_file(path).unwrap();
     }
 }

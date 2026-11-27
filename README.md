@@ -18,6 +18,13 @@ See [Quick Start for Windows](docs/QUICK_START_WINDOWS.md) for setup, controls, 
 
 See the [interface screenshot gallery](screenshots/README.md) for the library, controller settings, new disc-info screen, Settings menu, and About dialog.
 
+The [disc-title alias guide](docs/title-aliases.md) explains regional and multi-disc
+TOSEC, No-Intro and Redump title matching, and how to import later spreadsheet edits.
+
+Numbered disc sets share a library entry and offer a disc picker in the info
+screen. See [multi-disc titles and refreshed box art](docs/multidisc.md) for
+controls, shared NVRAM migration and the new case perspective.
+
 ![New disc info screen with transparent artwork and floating controls](screenshots/disc-info.png)
 
 ## Build from source

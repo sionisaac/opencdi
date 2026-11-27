@@ -248,10 +248,21 @@ impl Ciap {
                 self.set(REG_APCR, value);
                 let queued = self.reg(REG_BMAN) & 0x03 != 0;
                 match value {
-                    0x0140 if !self.audio_playing => {
+                    0x0140 => {
+                        // START applies to the newly queued stream even if a
+                        // previous stream's completion timer is still running.
+                        // Ignoring it can strand SM_Out and the game's UI loop.
                         let first = self.audio_next & 1;
                         let next = [first, first ^ 1].into_iter()
                             .find(|&i| self.reg(REG_BMAN) & (1 << i) != 0);
+                        if let Some(i) = next {
+                            // APTR must identify this stream's playing buffer.
+                            // The BIOS refills the opposite buffer; a pointer
+                            // left over from the preceding stream makes that
+                            // refill toggle off the newly queued buffer.
+                            self.audio_next = i;
+                            self.set(REG_APTR, (AUDIO_BUFS[i] / 2) as u16);
+                        }
                         self.audio_playing = true;
                         // DONE is a completion notification, including for the
                         // first buffer. A one-sector initial delay reports it
@@ -268,7 +279,6 @@ impl Ciap {
                     }
                     // 0x20 with a buffer queued: the event follows once the queue has played out.
                     0x0020 => self.event_armed = true,
-                    0x0140 => {}
                     0x0006 | 0x0040 | 0x0101 | 0x0142 | 0x0200 => {
                         if self.loud.first(0x8_0000 | value as u32) {
                             eprintln!("CIAP APCR {:04X} accepted, no effect modelled pc~{:06X}", value, pc);
@@ -455,6 +465,20 @@ impl Ciap {
         }
         // Every sector, audio included, also goes to the data buffer.
         let taken = self.data_buffer().map(|at| self.ram[at..at + DATA_LEN].copy_from_slice(&raw[12..12 + DATA_LEN]));
+        if let Some(at) = self.data_buffer() {
+            // The 490 pause handler compares both buffer headers against the
+            // last delivered MSF to find the restart position. Keep the next
+            // header available without delivering its payload or interrupt:
+            // leaving the previous header here rewinds SS_Cont by two sectors.
+            let other = if at == 0x1200 { 0x1BC2 } else { 0x1200 };
+            let mut ahead = [0u8; CD_SECTOR_RAW_SIZE];
+            if cd.read_sector(lba + 1, &mut ahead) {
+                self.repair(lba + 1, &mut ahead);
+                if header_valid(lba + 1, &ahead) {
+                    self.ram[other..other + 4].copy_from_slice(&ahead[12..16]);
+                }
+            }
+        }
         let mut flags = if taken.is_some() { ISR_DATA } else { 0 };
         if submode & 0x10 != 0 {
             flags |= ISR_TRIGGER;
@@ -517,7 +541,10 @@ impl Ciap {
     fn selected(&self, file: u8, channel: u8, submode: u8) -> bool {
         let mask = self.reg(REG_TCM1) as u32 | (self.reg(REG_ACM2) as u32) << 16;
         let tacs = submode & 0x24 == 0x24 && self.reg(REG_TACS) & (1 << (channel & 15)) != 0;
-        file as u16 == self.reg(REG_FILE) & 0xFF && (submode & 0x0E == 0 || mask & (1 << (channel & 31)) != 0 || tacs)
+        // EOF and trigger notifications are file-selected, not channel-selected
+        // (Green Book VII.4). EOR still requires channel selection. Dropping
+        // an EOF on a padding channel leaves SS_Play running into the next file.
+        file as u16 == self.reg(REG_FILE) & 0xFF && (submode & 0x90 != 0 || submode & 0x0E == 0 || mask & (1 << (channel & 31)) != 0 || tacs)
     }
 
     // Selection on, Form 2 audio submode, channel in TACS.
@@ -563,11 +590,12 @@ impl Ciap {
         }
     }
 
-    // Commands: 0x94, 0xC4, 0x44 and 0x80 start delivery, 0x100 stops it; Q reporting with 0x10, 0x44 and 0x94, not with 0xC4.
+    // Streaming reads also maintain the Q locator. The 490 driver uses that
+    // position to complete asynchronous seeks before starting its next play.
     fn command(&mut self, v: u16, pc: u32) {
         match v {
             0x0094 => (self.running, self.q_mode) = (true, true),
-            0x00C4 => (self.running, self.q_mode) = (true, false),
+            0x00C4 => (self.running, self.q_mode) = (true, true),
             0x0100 => (self.running, self.q_mode, self.asel, self.selecting) = (false, false, false, false),
             0x0044 => (self.running, self.q_mode) = (true, true),
             0x0080 => self.running = true,
@@ -597,6 +625,34 @@ opencdi::impl_state!(Ciap { ram, regs, running, q_mode, lba, drive_active, audio
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn next_header_is_available_without_early_payload_or_completion() {
+        use super::*;
+        let path=std::env::temp_dir().join(format!("opencdi-ciap-ahead-{}.bin",std::process::id()));
+        let mut sectors=Vec::new();
+        for frame in 0..2 {
+            let mut raw=[0u8;CD_SECTOR_RAW_SIZE];raw[1..11].fill(0xff);
+            raw[12..16].copy_from_slice(&[0,2,frame,2]);
+            raw[16..20].copy_from_slice(&[1,0,0x48,0]);raw[20..24].copy_from_slice(&[1,0,0x48,0]);
+            raw[24..].fill(0xa0+frame);sectors.extend_from_slice(&raw);
+        }
+        std::fs::write(&path,&sectors).unwrap();
+        let mut disc=Some(CdRom::open(&path).unwrap());let mut c=Ciap::default();
+        let mut audio=CdiAudio::new();let period=crate::mcd212::VideoMode::Pal.cycles_per_sector();
+        c.ram[0x1BC2..0x1BC2+DATA_LEN].fill(0x5a);
+        c.write_reg(REG_CCR,0xc4,0);c.drive(super::super::ikat::DriveEvent::Seek(0));
+        c.tick(period*2,period,&mut disc,&mut audio);
+        assert_eq!(&c.ram[0x1200..0x1200+DATA_LEN],&sectors[12..CD_SECTOR_RAW_SIZE]);
+        assert_eq!(&c.ram[0x1BC2..0x1BC2+4],&[0,2,1,2]);
+        assert!(c.ram[0x1BC2+4..0x1BC2+DATA_LEN].iter().all(|b|*b==0x5a));
+        assert_eq!((c.lba,c.sectors,c.q_reports),(1,1,1),"prefetch must not count as delivery");
+        assert_eq!(c.read_reg(REG_ISR,0),ISR_DATA|4);
+        c.write_reg(REG_BMAN,0x0c,0);
+        c.tick(period,period,&mut disc,&mut audio);
+        assert_eq!(&c.ram[0x1BC2..0x1BC2+DATA_LEN],&sectors[CD_SECTOR_RAW_SIZE+12..]);
+        assert_eq!((c.lba,c.sectors,c.q_reports),(2,2,2));
+        drop(disc);std::fs::remove_file(path).unwrap();
+    }
     #[test]
     fn first_audio_buffer_completes_only_after_its_coding_duration() {
         use super::*;
@@ -638,6 +694,25 @@ mod tests {
         }
     }
     use super::*;
+
+    #[test]
+    fn streaming_read_keeps_valid_q_position_alongside_the_data_sector() {
+        let path=std::env::temp_dir().join(format!("opencdi-ciap-q-{}.bin",std::process::id()));
+        let mut raw=[0u8;CD_SECTOR_RAW_SIZE];raw[1..11].fill(0xff);
+        raw[12..16].copy_from_slice(&[0,2,0,2]);
+        raw[16..20].copy_from_slice(&[1,0,0x64,0]);raw[20..24].copy_from_slice(&[1,0,0x64,0]);
+        std::fs::write(&path,raw).unwrap();
+        let mut disc=Some(CdRom::open(&path).unwrap());let mut c=Ciap::default();
+        let period=crate::mcd212::VideoMode::Pal.cycles_per_sector();
+        c.write_reg(REG_IER,4,0);c.write_reg(REG_CCR,0xc4,0);
+        c.drive(super::super::ikat::DriveEvent::Seek(0));
+        c.tick(period*2,period,&mut disc,&mut CdiAudio::new());
+        assert_eq!(&c.ram[0x1200..0x1200+DATA_LEN],&raw[12..],"Q reporting must not change raw data");
+        assert_eq!(&c.ram[0x1b24..0x1b24+10],&[0x41,1,1,0,0,0,0,0,2,0],"streaming seek needs current track/index/MSF");
+        assert_eq!(c.peek_reg(REG_ISR)&5,5);
+        assert!(c.irq(),"a requested Q notification must reach the board");
+        drop(disc);std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn vector_level_and_clear_on_read() {
@@ -765,6 +840,59 @@ mod tests {
     }
 
     #[test]
+    fn restarting_cpu_audio_replaces_the_previous_stream_completion_timer() {
+        let mut c=Ciap::default();let mut audio=CdiAudio::new();
+        let period=crate::mcd212::VideoMode::Pal.cycles_per_sector();
+        c.write_reg(REG_ASHDW,0x1008,0); // 16 sector periods
+        c.write_reg(REG_BMAN,1,0);c.write_reg(REG_APCR,0x140,0);
+        c.tick(period*3,period,&mut None,&mut audio);
+        assert_eq!(c.audio_wait,13);
+        c.write_reg(REG_BMAN,1,0); // CPU removes the old buffer
+        c.write_reg(REG_ASHDW,0x0808,0); // new stream: four periods
+        c.write_reg(REG_BMAN,2,0);c.write_reg(REG_APCR,0x140,0);
+        assert_eq!(c.audio_wait,4,"a new START must not inherit the previous stream's timer");
+        c.tick(period*3,period,&mut None,&mut audio);
+        assert_eq!(c.audio_buffers,0,"replacement must not finish early");
+        c.tick(period,period,&mut None,&mut audio);
+        assert_eq!((c.audio_buffers,c.peek_reg(REG_BMAN)&3),(1,0));
+        assert_ne!(c.peek_reg(REG_ISR)&ISR_AUDIO_DONE,0);
+    }
+
+    #[test]
+    fn audio_restart_pointer_keeps_the_bios_refill_out_of_the_playing_buffer() {
+        let period = crate::mcd212::VideoMode::Pal.cycles_per_sector();
+        for playing in 0..2 {
+            let mut c = Ciap::default();
+            let mut audio = CdiAudio::new();
+            c.write_reg(REG_ASHDW, 0x0808, 0); // Four sector periods per buffer.
+            c.write_reg(REG_BMAN, 1 << playing, 0);
+            c.write_reg(REG_APCR, 0x140, 0);
+            c.tick(period * 8, period, &mut None, &mut audio);
+            assert!(!c.audio_playing);
+            let stale_pointer = (AUDIO_BUFS[playing ^ 1] / 2) as u16;
+            assert_eq!(c.peek_reg(REG_APTR), stale_pointer);
+            c.read_reg(REG_ISR, 0);
+
+            // The next SM_Out begins in the same buffer as the previous one.
+            c.write_reg(REG_BMAN, 1 << playing, 0);
+            c.write_reg(REG_APCR, 0x140, 0);
+            assert_eq!(c.peek_reg(REG_APTR), (AUDIO_BUFS[playing] / 2) as u16);
+            // Follow the BIOS's real refill rule: queue opposite APTR.
+            let refill = if c.peek_reg(REG_APTR) < 0x480 { 1 } else { 0 };
+            c.write_reg(REG_BMAN, 1 << refill, 0);
+            assert_eq!(c.peek_reg(REG_BMAN) & 3, 3);
+            let completed = c.audio_buffers;
+            c.tick(period * 4, period, &mut None, &mut audio);
+            assert_eq!(c.audio_buffers, completed + 1);
+            assert_eq!(c.peek_reg(REG_BMAN) & 3, 1 << refill);
+            assert_eq!(c.peek_reg(REG_APTR), (AUDIO_BUFS[refill] / 2) as u16);
+            c.tick(period * 4, period, &mut None, &mut audio);
+            assert_eq!(c.audio_buffers, completed + 2);
+            assert_eq!(c.peek_reg(REG_BMAN) & 3, 0);
+        }
+    }
+
+    #[test]
     fn attenuation_registers_set_the_output_gains() {
         let mut c = Ciap::default();
         assert_eq!(c.attenuation(), None);
@@ -850,6 +978,40 @@ mod tests {
     }
 
     #[test]
+    fn boundary_interrupts_bypass_only_the_channel_filter() {
+        let path = std::env::temp_dir().join(format!("opencdi-ciap-boundaries-{}.bin", std::process::id()));
+        let cases = [(2, 0xC9, 0), (1, 0x49, 0),
+                     (1, 0x58, ISR_DATA | ISR_TRIGGER),
+                     (1, 0xC9, ISR_DATA | ISR_EOF), (1, 0x48, 0)];
+        let mut bytes = Vec::new();
+        for (frame, &(file, submode, _)) in cases.iter().enumerate() {
+            let mut raw = [0u8; CD_SECTOR_RAW_SIZE];
+            raw[1..11].fill(0xff);
+            raw[12..16].copy_from_slice(&[0, 2, frame as u8, 2]);
+            raw[16..20].copy_from_slice(&[file, 31, submode, 0]);
+            raw[20..24].copy_from_slice(&[file, 31, submode, 0]);
+            bytes.extend_from_slice(&raw);
+        }
+        std::fs::write(&path, bytes).unwrap();
+        let mut disc = CdRom::open(&path).unwrap();
+        let mut c = Ciap::default();
+        c.write_reg(REG_FILE, 1, 0);
+        c.write_reg(REG_TCM1, 1, 0);
+        c.write_reg(REG_IER, ISR_DATA | ISR_TRIGGER | ISR_EOF, 0);
+        c.write_reg(REG_CCR, 8, 0);
+        c.selecting = true;
+        let mut audio = CdiAudio::new();
+        for &(_, _, expected) in &cases {
+            c.sector(&mut disc, &mut audio);
+            assert_eq!(c.irq(), expected != 0);
+            assert_eq!(c.read_reg(REG_ISR, 0), expected);
+        }
+        assert_eq!((c.sectors, c.skipped), (2, 3));
+        drop(disc);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn selection_needs_the_file_and_for_typed_sectors_the_channel() {
         let mut c = Ciap::default();
         c.write_reg(REG_FILE, 1, 0);
@@ -858,6 +1020,12 @@ mod tests {
         assert!(c.selected(1, 15, 0x64) && c.selected(1, 15, 0x65) && !c.selected(0, 15, 0x64));
         // Another channel's end of record is not selected; a sector without type bits needs only the file.
         assert!(!c.selected(1, 12, 0x65) && c.selected(1, 12, 0x60));
+        // Boundary notifications must survive the channel mask, but never the
+        // file filter. The EOF sector used by Atlantis is on channel 31.
+        for submode in [0xC9, 0x58] {
+            assert!(c.selected(1, 31, submode));
+            assert!(!c.selected(0, 31, submode));
+        }
         // Audio on a TACS channel outside the data mask still reaches the audio path.
         c.write_reg(REG_TACS, 0x1000, 0);
         assert!(c.selected(1, 12, 0x64) && !c.selected(1, 12, 0x48));

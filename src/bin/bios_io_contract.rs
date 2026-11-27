@@ -57,6 +57,24 @@ fn mono4_cases(m: &mut Machine, mode: VideoMode, path: u32, checks: &mut usize) 
     m.bus.mono4.as_deref_mut().unwrap().ikat.update_pointer(401,307,0);
     for _ in 0..3 { m.run_frame(); }
     check(m,path,121,80 + scale_y(307)-scale_y(300),0,checks);
+    // Games such as Tetris consume motion then recenter with PT_Pos. A new
+    // host coordinate must remain a small relative movement, not undo PT_Pos.
+    for (x,buttons) in [(404,0),(407,1),(410,0)] {
+        assert!(call(m,0x8e,&[path,0x59,3,0],0));
+        opencdi::boot::send_game_controller(&mut m.bus,x,307,buttons,(0,0));
+        for _ in 0..3{m.run_frame();}
+        check(m,path,3,0,buttons,checks);
+    }
+    opencdi::boot::send_game_controller(&mut m.bus,767,307,0,(0,0));
+    for _ in 0..3{m.run_frame();}
+    assert!(call(m,0x8e,&[path,0x59,3,0],0));
+    opencdi::boot::send_game_controller(&mut m.bus,767,307,0,(3,0));
+    for _ in 0..3{m.run_frame();}
+    check(m,path,3,0,0,checks);
+    assert!(call(m,0x8e,&[path,0x59,3,0],0));
+    opencdi::boot::send_game_controller(&mut m.bus,767,307,0,(0,0));
+    for _ in 0..3{m.run_frame();}
+    check(m,path,0,0,0,checks);
     assert!(!call(m,0x8d,&[0xffff,0x59,0],0)); *checks += 1;
     assert!(call(m,0x8f,&[path],0));
     assert!(!call(m,0x8d,&[path,0x59,0],0)); *checks += 1;

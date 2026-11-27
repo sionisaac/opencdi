@@ -128,7 +128,10 @@ pub fn fetch_missing_artwork(
             exact.sort(); exact.dedup();
             // The 1991 music disc is separate from the Golden Oldies arcade games.
             if exact.is_empty() && key != "goldenoldiesjukebox" {
-                let mut scored: Vec<(f32, &GameRecord)> = records.games.iter().filter(|g| !g.id.is_empty()).map(|g| (title_similarity(&key, &normalize_title(&g.title)), g)).collect();
+                let edition = crate::title_aliases::edition(&target.title);
+                let mut scored: Vec<(f32, &GameRecord)> = records.games.iter()
+                    .filter(|g| !g.id.is_empty() && crate::title_aliases::edition(&g.title) == edition)
+                    .map(|g| (title_similarity(&key, &normalize_title(&g.title)), g)).collect();
                 scored.sort_by(|a, b| b.0.total_cmp(&a.0));
                 if let Some((score, game)) = scored.first().copied() {
                     let next = scored.get(1).map(|v| v.0).unwrap_or(0.0);
@@ -304,17 +307,34 @@ fn metadata_is_fresh(path: &Path) -> bool {
 }
 
 pub(crate) fn normalize_title(s: &str) -> String {
+    let canonical = crate::title_aliases::canonical(s).unwrap_or(s);
+    let mut normalized = normalize_title_raw(canonical);
+    let edition = crate::title_aliases::edition(canonical);
+    if !edition.is_empty() { normalized.push('|'); normalized.push_str(&edition); }
+    normalized
+}
+
+pub(crate) fn normalize_title_raw(s: &str) -> String {
     let s = s.trim();
     let s = s.rsplit_once('.').filter(|(_, ext)| matches!(ext.to_ascii_lowercase().as_str(), "chd" | "cue" | "iso" | "bin")).map(|(stem, _)| stem).unwrap_or(s);
     let mut normalized = String::new();
     let mut chars = s.chars().peekable();
+    let mut tosec_metadata = false;
     while let Some(ch) = chars.next() {
         if ch == '(' || ch == '[' {
             let closing = if ch == '(' { ')' } else { ']' };
             let mut tag = String::new();
             while let Some(c) = chars.next() { if c == closing { break; } tag.push(c); }
             let tag_l = tag.to_ascii_lowercase();
-            let is_dump_tag = matches!(tag_l.trim(), "sweden" | "netherlands") || ["usa", "eur", "europe", "european", "japan", "japanese", "world", "disc", "disk", "cd", "dvc", "track", "rev", "revision", "version", "beta", "proto", "demo", "pal", "ntsc", "en,", "fr,", "de,"]
+            // TOSEC's date introduces publisher/country/language metadata.
+            // Its publisher is not part of the software title.
+            let date = tag_l.len() >= 4 && tag_l.as_bytes()[..4].iter().all(u8::is_ascii_digit)
+                && tag_l.bytes().all(|c| c.is_ascii_digit() || matches!(c, b'-' | b'x'));
+            if date { tosec_metadata = true; }
+            let is_region = matches!(tag_l.trim(), "sweden" | "netherlands" | "france" | "germany" | "italy" | "spain"
+                | "portugal" | "united kingdom" | "uk" | "australia" | "canada" | "brazil" | "korea"
+                | "us" | "gb" | "eu" | "jp" | "de" | "fr" | "nl" | "es" | "it" | "se" | "pt" | "at");
+            let is_dump_tag = tosec_metadata || is_region || ["usa", "eur", "europe", "european", "japan", "japanese", "world", "disc", "disk", "cd", "dvc", "track", "rev", "revision", "version", "beta", "proto", "demo", "pal", "ntsc", "en,", "fr,", "de,"]
                 .iter().any(|needle| tag_l.contains(needle));
             if !is_dump_tag { normalized.extend(tag.chars().filter(|c| c.is_alphanumeric()).map(|c| c.to_ascii_lowercase())); }
         } else if ch.is_alphanumeric() { normalized.push(ch.to_ascii_lowercase()); }

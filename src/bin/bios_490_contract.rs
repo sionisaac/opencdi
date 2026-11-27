@@ -23,20 +23,22 @@ fn call(m: &mut Machine, code_at: u32, code: u16, d: &[u32], a0: u32) -> bool {
 }
 fn main() {
     let a: Vec<_> = std::env::args_os().skip(1).collect();
-    assert!((3..=5).contains(&a.len()) && a[3..].iter().all(|s| s == "--ntsc" || s == "--buffers"),
-        "usage: bios_490_contract bios impeg Third-Degree-disc [--ntsc] [--buffers]");
+    assert!((3..=5).contains(&a.len()) && a[3..].iter().all(|s| s == "--ntsc" || s == "--buffers" || s == "--seek" || s == "--resume"),
+        "usage: bios_490_contract bios dvc Third-Degree-disc [--ntsc] [--buffers | --seek | --resume]");
     let mode = if a[3..].iter().any(|s| s == "--ntsc") { VideoMode::Ntsc } else { VideoMode::Pal };
     let mut m = Machine::new();
     m.bus.nvram.persist = false;
-    assert!(m.load_bios(&a[0]).unwrap().known.is_some_and(|b| b.file == "cdi490a.rom"));
+    assert!(m.load_bios(&a[0]).unwrap().known.is_some_and(|b| matches!(b.file,"cdi490a.rom"|"cdi220b.rom")));
     m.load_dvc(&a[1]).unwrap(); m.load_disc(&a[2]).unwrap();
     assert_eq!(m.bus.cdrom.as_ref().unwrap().volume_id,"Third Degree");
     m.set_video_mode(mode); m.reset();
     let mut clicks = 0;
     let mut ready = false;
     for frame in 0..3000 {
-        if let Some((x,y,b)) = opencdi::boot::shell_play_click(&m.bus,0,&mut clicks) {
-            m.bus.mono4.as_deref_mut().unwrap().ikat.update_pointer(x,y,b);
+        let state=m.bus.peek_long(0xd01202).filter(|s|*s>=2)
+            .unwrap_or_else(||m.bus.peek_long(0x5172).unwrap_or(0));
+        if let Some((x,y,b)) = opencdi::boot::shell_play_click(&m.bus,state,&mut clicks) {
+            opencdi::boot::send_shell_pointer(&mut m.bus,x,y,b);
         }
         m.run_frame();
         if frame > 500 && m.cpu.s_flag == 0 && (0x200000..0x280000).contains(&m.cpu.pc) {
@@ -55,6 +57,8 @@ fn main() {
     assert!(m.cpu.dar[0] >= 0x10000 && base & 1 == 0);
     write(&mut m,borrowed,&original);
     println!("ALLOC mode={mode:?} base={base:08x} bytes={}",m.cpu.dar[0]);
+    if a[3..].iter().any(|s| s == "--resume") { resume(&mut m,base,mode); return; }
+    if a[3..].iter().any(|s| s == "--seek") { seeks(&mut m,base,mode); return; }
     if a[3..].iter().any(|s| s == "--buffers") { buffers(&mut m,base,mode); return; }
     let mut checks = 1;
     // Fixed fixture hashes independently obtained by disc_data_audit, not from
@@ -87,6 +91,92 @@ fn main() {
     }
     assert!(!call(&mut m,base,0x89,&[0xffff,1],base+0x2000)); checks += 1;
     println!("BIOS_490_FILE_CONTRACT mode={mode:?} checks={checks} passed={checks}");
+}
+
+// Compare actual buffered payloads across SS_Pause/SS_Cont, rather than accepting
+// the system call's return as evidence that the disc stream resumed correctly.
+fn resume(m: &mut Machine, base:u32, mode:VideoMode) {
+    if let Some(board)=m.bus.mono4.as_deref_mut(){board.ciap.trace=true;}
+    let mut expected=Vec::new();
+    for lba in 2305..2560 {
+        let mut raw=[0;opencdi::cdrom::CD_SECTOR_RAW_SIZE];
+        assert!(m.bus.cdrom.as_mut().unwrap().read_sector(lba,&mut raw));
+        if raw[0..2]==[0xff,0] {for p in raw.chunks_exact_mut(2){p.swap(0,1);}}
+        if raw[15]==2 && raw[17]==15 && raw[18]&2!=0 {
+            expected.push((lba,raw[24..2348].to_vec()));
+        }
+    }
+    assert!(expected.len()>8);
+    write(m,base+0x1000,b"/cd/bumper.rtf\0");
+    assert!(call(m,base,0x84,&[1],base+0x1000));
+    let path=m.cpu.dar[0]&0xffff;
+    write(m,base+0x3000,&vec![0;0x400]);
+    write(m,base+0x3004,&1000u32.to_be_bytes());
+    write(m,base+0x3008,&(1u32<<15).to_be_bytes());
+    write(m,base+0x300e,&(base+0x3100).to_be_bytes());
+    write(m,base+0x313c,&(base+0x3200).to_be_bytes());
+    for i in 0..8 {
+        let pcl=base+0x3200+i*0x20;
+        write(m,pcl+6,&(base+0x3200+(i+1)%8*0x20).to_be_bytes());
+        write(m,pcl+10,&(base+0x4000+i*0x1000).to_be_bytes());
+        write(m,pcl+14,&1u32.to_be_bytes());
+    }
+    assert!(call(m,base,0x8e,&[path,0x2d],base+0x3000));
+    for _ in 0..600 {
+        if m.bus.peek_byte(base+0x3200).unwrap()&1!=0 && m.cpu.pc==base+4 && m.cpu.s_flag==0 {break;}
+        m.run_frame();
+    }
+    assert_eq!(m.cpu.pc,base+4,"must not replace an unfinished interrupt handler");
+    assert!(call(m,base,0x8e,&[path,0x33],0),"pause stream");
+    let mut consumed=0;
+    let mut drain=|m:&mut Machine,stage:&str| {
+        for _ in 0..8 {
+            let slot=consumed%8;let pcl=base+0x3200+slot as u32*0x20;
+            if m.bus.peek_byte(pcl).unwrap()&1==0 {break;}
+            let buf=base+0x4000+slot as u32*0x1000;
+            let payload=read(m,buf,2324);
+            let matched=expected.iter().position(|(_,bytes)|*bytes==payload);
+            println!("RESUME stage={stage} index={consumed} expected_lba={} actual_lba={:?} pcb={:04x}",expected[consumed].0,matched.map(|i|expected[i].0),m.bus.peek_word(base+0x3000).unwrap());
+            assert!(payload==expected[consumed].1,"sector repeated or skipped across pause/continue");
+            write(m,pcl,&[0,0]);
+            consumed+=1;
+        }
+    };
+    drain(m,"paused");
+    assert!(call(m,base,0x8d,&[path,5],0));
+    let paused_position=m.cpu.dar[2];
+    println!("PAUSED position={paused_position} supervisor={} pc={:08x}",m.cpu.s_flag,m.cpu.pc);
+    for _ in 0..15 {m.run_frame();}
+    assert!(call(m,base,0x8d,&[path,5],0));
+    assert_eq!(m.cpu.dar[2],paused_position,"paused file position advanced");
+    assert!(call(m,base,0x8e,&[path,0x37],0),"continue stream");
+    for _ in 0..30 {m.run_frame();drain(m,"resumed");}
+    drop(drain);
+    assert!(consumed>=3,"no useful payload after continue");
+    assert!(call(m,base,0x8e,&[path,0x31],0));
+    assert!(call(m,base,0x8f,&[path],0));
+    println!("BIOS_RESUME_CONTRACT mode={mode:?} sectors={consumed} PASS");
+}
+
+fn seeks(m:&mut Machine,base:u32,mode:VideoMode) {
+    write(m,base+0x1000,b"/cd/bumper.rtf\0");
+    assert!(call(m,base,0x84,&[1],base+0x1000),"open seek fixture");
+    let path=m.cpu.dar[0]&0xffff;
+    for offset in [0,2048,0] {
+        write(m,base+0x3000,&[0;4]);
+        assert!(call(m,base,0x8e,&[path,0x30,offset],base+0x3000),"SS_Seek request");
+        for _ in 0..600 {
+            if m.bus.peek_word(base+0x3000).unwrap()&1!=0 {break;}
+            m.run_frame();
+        }
+        let status=m.bus.peek_word(base+0x3000).unwrap();
+        assert_eq!(status&0x8001,1,"Green Book ASY_Stat must complete successfully");
+        assert!(call(m,base,0x8d,&[path,5],0));
+        assert_eq!(m.cpu.dar[2],offset,"seek file position");
+        println!("SEEK mode={mode:?} offset={offset} status={status:04x} PASS");
+    }
+    assert!(call(m,base,0x8f,&[path],0));
+    println!("BIOS_490_SEEK_CONTRACT mode={mode:?} PASS");
 }
 
 fn buffers(m: &mut Machine, base: u32, mode: VideoMode) {

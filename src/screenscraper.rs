@@ -22,6 +22,7 @@ pub(crate) fn encode(value: &str) -> String {
 }
 
 pub(crate) fn search_name(title: &str) -> String {
+    let title = crate::title_aliases::canonical(title).unwrap_or(title);
     let plain = title.split(['(', '[']).next().unwrap_or(title).trim();
     if normalize_title(title) == "the7thguest" { return "The 7th Guest".into(); }
     if let Some((name, article)) = plain.rsplit_once(',') {
@@ -35,13 +36,17 @@ pub(crate) fn search_name(title: &str) -> String {
 
 fn relaxed_key(title: &str) -> String {
     let title = search_name(title).to_lowercase().replace([char::from(39), '’'], "");
-    title.split(|c: char| !c.is_alphanumeric()).filter_map(|word| match word {
+    let mut key: String = title.split(|c: char| !c.is_alphanumeric()).filter_map(|word| match word {
         "" | "the" | "a" | "an" => None,
         "ii" => Some("2"),
         "iii" => Some("3"),
         "iv" => Some("4"),
         _ => Some(word),
-    }).collect()
+    }).collect();
+    // A relaxed spelling match must not turn an unrecognised beta into retail.
+    let edition = crate::title_aliases::edition(&title);
+    if !edition.is_empty() { key.push('|'); key.push_str(&edition); }
+    key
 }
 
 type TitleIndex = HashMap<String, HashSet<u64>>;

@@ -139,13 +139,51 @@ impl Ikat {
             (x & 0x3F) as u8,
             (y & 0x3F) as u8 | 0x80,
         ];
-        self.respond(1, &r);
+        self.respond_pointer(r);
     }
 
     fn send_relative(&mut self, btn: u8, dx: i32, dy: i32) {
         let (dx, dy) = ((dx as i8) as u8, (dy as i8) as u8);
         let r = [0x40 | btn | ((dy >> 6) & 3) << 2 | (dx >> 6) & 3, dx & 0x3F, dy & 0x3F, 0];
-        self.respond(1, &r);
+        self.respond_pointer(r);
+    }
+
+    /// Host motion is asynchronous to the BIOS's byte reads. Keep complete
+    /// reports behind the partly consumed one, preserving press/release edges.
+    /// The existing serial FIFO is saved with the machine: no state-format change.
+    fn respond_pointer(&mut self, mut report:[u8;4]) {
+        if self.trace {eprintln!("IKAT pointer => {}",hex(&report));}
+        let queue=&mut self.ports[1].reply;
+        if queue.len()>=4 {
+            let at=queue.len()-4;
+            let last:[u8;4]=std::array::from_fn(|i|queue[at+i]);
+            if last[0]&0x30==report[0]&0x30 {
+                // A complete unread absolute position can be replaced by the
+                // latest position, but never a button edge or partial report.
+                if report[3]&0x80!=0 {
+                    for i in 0..4 {queue[at+i]=report[i];}return;
+                }
+                if last[3]==0 && report[3]==0 {
+                    let delta=|p:[u8;4]|(((p[0]&3)<<6|p[1])as i8 as i32,
+                        (((p[0]>>2)&3)<<6|p[2])as i8 as i32);
+                    let (ax,ay)=delta(last);let (bx,by)=delta(report);
+                    let (x,y)=(ax+bx,ay+by);
+                    if (-127..=127).contains(&x)&&(-127..=127).contains(&y){
+                        let (x,y)=(x as i8 as u8,y as i8 as u8);
+                        report=[0x40|(report[0]&0x30)|((y>>6)&3)<<2|(x>>6)&3,x&63,y&63,0];
+                        for i in 0..4 {queue[at+i]=report[i];}return;
+                    }
+                }
+            }
+        }
+        // A guest that stops reading cannot accumulate unbounded host events.
+        // On overflow discard the oldest whole pending packet, never the tail
+        // of the packet already being read. The newest button state survives.
+        if queue.len()>=256 {
+            let partial=queue.len()%4;
+            for _ in 0..4 {queue.remove(partial);}
+        }
+        queue.extend(report);
     }
 
     /// A move the host position could not follow (held against its edge); the title's own position may be elsewhere, so it still goes out as a relative report.
@@ -213,6 +251,7 @@ impl Ikat {
                 let p = ((reg - 0x09) >> 1) as usize;
                 let irq = self.irq();
                 let v = self.ports[p].reply.pop_front().unwrap_or(0xFF);
+                if self.trace && p == 1 { eprintln!("IKAT READ B {v:02X} pc~{pc:06X}"); }
                 self.trace_irq(irq);
                 v
             }
@@ -464,6 +503,7 @@ mod tests {
         assert_eq!(r, [0x48, 0x18, 0x01, 0x81]);
         k.write(0x1B, 0x88, 0);
         assert_eq!(k.pending(), 0x08);
+        (0..4).for_each(|_|{k.read(0x0B,0);});
         k.update_pointer(0, 0, 1);
         let r: Vec<u8> = (0..4).map(|_| k.read(0x0B, 0)).collect();
         assert_eq!(r, [0x60, 0x10, 0x00, 0x80]);
@@ -504,6 +544,64 @@ mod tests {
         let y = (((report[1] & 15) as u16) << 6) | (report[3] & 63) as u16;
         assert_eq!(report[0] & 0x30, 0x20);
         assert_eq!((x as u32 * 767 / 1023, y as u32 * 559 / 1023), (385, 281));
+    }
+
+    fn pointer_test_controller()->Ikat {
+        let mut k=Ikat::default();k.write(REG_IMR,8,0);
+        (0..4).for_each(|_|{k.read(0x0B,0);});k
+    }
+
+    #[test]
+    fn pointer_update_cannot_replace_a_partly_read_report(){
+        let mut reference=pointer_test_controller();
+        reference.update_absolute_pointer(100,120,0);
+        let first:Vec<_>=(0..4).map(|_|reference.read(0x0B,0)).collect();
+        reference.update_absolute_pointer(200,250,1);
+        let second:Vec<_>=(0..4).map(|_|reference.read(0x0B,0)).collect();
+        for consumed in 1..4 {
+            let mut k=pointer_test_controller();k.update_absolute_pointer(100,120,0);
+            let mut received:Vec<_>=(0..consumed).map(|_|k.read(0x0B,0)).collect();
+            k.update_absolute_pointer(200,250,1);
+            received.extend((consumed..8).map(|_|k.read(0x0B,0)));
+            assert_eq!(received,[first.clone(),second.clone()].concat(),"update after byte {consumed}");
+        }
+    }
+
+    #[test]
+    fn short_press_is_not_erased_by_release_before_the_bios_reads(){
+        let mut k=pointer_test_controller();
+        k.update_absolute_pointer(384,280,1);
+        k.update_absolute_pointer(384,280,0);
+        let press:Vec<_>=(0..4).map(|_|k.read(0x0B,0)).collect();
+        let release:Vec<_>=(0..4).map(|_|k.read(0x0B,0)).collect();
+        assert_eq!(press[0]&0x30,0x20);
+        assert_eq!(release[0]&0x30,0);
+        assert_eq!(k.pending()&8,0);
+    }
+
+    #[test]
+    fn queued_motion_coalesces_without_losing_relative_distance_or_button_edges(){
+        let mut k=pointer_test_controller();
+        k.update_pointer(385,282,0);k.update_pointer(387,285,0);
+        let movement:Vec<_>=(0..4).map(|_|k.read(0x0B,0)).collect();
+        assert_eq!(movement,[0x40,3,5,0]);
+        for button in [1,0,1,0]{k.update_absolute_pointer(387,285,button);}
+        let reports:Vec<_>=(0..16).map(|_|k.read(0x0B,0)).collect();
+        assert_eq!(reports.chunks_exact(4).map(|p|p[0]&0x30).collect::<Vec<_>>(),[0x20,0,0x20,0]);
+        assert_eq!(k.pending()&8,0);
+    }
+
+    #[test]
+    fn slow_guest_gets_latest_motion_without_an_unbounded_backlog(){
+        let mut k=pointer_test_controller();k.update_absolute_pointer(10,10,0);
+        let first=k.read(0x0B,0);
+        for x in 11..700{k.update_absolute_pointer(x,200,0);}
+        assert_eq!(first,0x40);
+        assert_eq!(k.ports[1].reply.len(),7,"partial report plus latest complete report");
+        for _ in 0..3{k.read(0x0B,0);}
+        let latest:Vec<_>=(0..4).map(|_|k.read(0x0B,0)).collect();
+        let x=((latest[0]&15) as u32*64+latest[2] as u32)*767/1023;
+        assert_eq!(x,699);
     }
 
     #[test]

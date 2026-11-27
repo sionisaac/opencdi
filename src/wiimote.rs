@@ -8,6 +8,30 @@ pub struct Sample {
     pub aim: Option<(f64, f64)>,
 }
 
+const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// Reports arrive continuously even on a stationary remote. Track deliberate
+/// input rather than report traffic, retaining an anchor across IR dropouts.
+struct IdleActivity {
+    last_active: Instant,
+    buttons: u16,
+    aim_anchor: Option<(f64, f64)>,
+}
+impl IdleActivity {
+    fn new(now: Instant) -> Self { Self {last_active:now,buttons:0,aim_anchor:None} }
+    fn observe(&mut self, sample: Sample, now: Instant) {
+        let button_activity = sample.buttons != 0 || sample.buttons != self.buttons;
+        self.buttons = sample.buttons;
+        let aim_activity = sample.aim.filter(|(x,y)|x.is_finite() && y.is_finite()).is_some_and(|p| {
+            if self.aim_anchor.is_none_or(|a|(p.0-a.0).abs().max((p.1-a.1).abs()) >= 8.0) {
+                self.aim_anchor = Some(p); true
+            } else { false }
+        });
+        if button_activity || aim_activity {self.last_active=now;}
+    }
+    fn expired(&self, now: Instant) -> bool { now.saturating_duration_since(self.last_active) >= IDLE_TIMEOUT }
+}
+
 pub const B: u16 = 0x0004;
 pub const A: u16 = 0x0008;
 pub const HOME: u16 = 0x0080;
@@ -31,6 +55,43 @@ pub fn correct_game_aim(title: &str, cursor_control: u32, x: i32, y: i32) -> (i3
     if chaos && shooting_cursor {
         ((x - 14).clamp(0,767), (y - 14).clamp(0,559))
     } else { (x,y) }
+}
+
+/// Preserve existing pointing controls except the confirmed Thunder/Chaos Peacekeeper trigger layouts.
+pub fn pointing_buttons(title: &str, peacekeeper: bool, a: bool, b: bool) -> u8 {
+    let title:String=title.split(['(', '[']).next().unwrap_or("").chars()
+        .filter(char::is_ascii_alphanumeric).flat_map(char::to_lowercase).collect();
+    let swap=peacekeeper && matches!(title.as_str(),
+        "thunderinparadise"|"thunderinparadiseinteractive"|"caraibesoffshore"|"chaoscontrol");
+    if swap {u8::from(b) | (u8::from(a)<<1)}
+    else {u8::from(a) | (u8::from(b)<<1)}
+}
+
+/// Host-only aiming aid. Never changes emulated coordinates or the guest picture.
+pub fn draw_crosshair(pixels: &mut [u32], width: usize, height: usize,
+    rect: (usize,usize,usize,usize), x: f64, y: f64) {
+    let (left,top,w,h)=rect;
+    if !x.is_finite() || !y.is_finite() || x < left as f64 || y < top as f64
+        || x >= left.saturating_add(w) as f64 || y >= top.saturating_add(h) as f64 { return; }
+    let scale=(h as f64/560.0).clamp(0.75,3.0);
+    let radius=(8.0*scale).round() as i32;
+    let arm=(15.0*scale).round() as i32;
+    let cx=x.round() as i32; let cy=y.round() as i32;
+    for dy in -arm-2..=arm+2 { for dx in -arm-2..=arm+2 {
+        let px=cx+dx; let py=cy+dy;
+        if px<left as i32 || py<top as i32 || px>=left.saturating_add(w).min(width) as i32
+            || py>=top.saturating_add(h).min(height) as i32 {continue;}
+        let distance=dx*dx+dy*dy;
+        let ring=distance>=(radius-1).pow(2) && distance<=(radius+1).pow(2);
+        let axis=(dx.abs()<=1 && dy.abs()>=3 && dy.abs()<=arm)
+            || (dy.abs()<=1 && dx.abs()>=3 && dx.abs()<=arm);
+        let outline=(distance>=(radius-2).max(0).pow(2) && distance<=(radius+2).pow(2))
+            || (dx.abs()<=2 && dy.abs()>=2 && dy.abs()<=arm+1)
+            || (dy.abs()<=2 && dx.abs()>=2 && dx.abs()<=arm+1);
+        if let Some(pixel)=pixels.get_mut(py as usize*width+px as usize) {
+            if ring || axis {*pixel=0x00EFFFFF;} else if outline {*pixel=0x00000000;}
+        }
+    }}
 }
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -142,6 +203,7 @@ pub struct Wiimote {
     state: Arc<Mutex<Option<(Instant, Sample)>>>,
     pointer_target: Arc<Mutex<Option<(isize, Calibration, Instant)>>>,
     stop: Arc<AtomicBool>,
+    idle: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -150,23 +212,29 @@ impl Wiimote {
         let state = Arc::new(Mutex::new(None));
         let pointer_target = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
+        let idle = Arc::new(AtomicBool::new(false));
         #[cfg(windows)]
         let worker = {
             let state = state.clone();
             let stop = stop.clone();
             let pointer_target = pointer_target.clone();
-            Some(std::thread::spawn(move || native::run(state, stop, pointer_target)))
+            let idle = idle.clone();
+            Some(std::thread::spawn(move || native::run(state, stop, pointer_target, idle)))
         };
         #[cfg(not(windows))]
         let worker = None;
-        Self { state, pointer_target, stop, worker }
+        Self { state, pointer_target, stop, idle, worker }
     }
+    /// Explicit user action only: never reopen an idle handle just to poll it.
+    pub fn reconnect(&self) { self.idle.store(false, Ordering::Relaxed); }
+    pub fn is_idle(&self) -> bool { self.idle.load(Ordering::Relaxed) }
     pub fn set_pointer_target(&self, window: Option<isize>, calibration: Calibration) {
         if let Ok(mut target) = self.pointer_target.lock() {
             *target = window.map(|window| (window, calibration, Instant::now()));
         }
     }
     pub fn sample(&self) -> Option<Sample> {
+        if self.is_idle() { return None; }
         self.state.lock().ok()?.as_ref().filter(|(time, _)| time.elapsed() < Duration::from_millis(250)).map(|(_, sample)| *sample)
     }
 }
@@ -311,14 +379,32 @@ mod native {
             None
         }
     }
-    pub fn run(state: Arc<Mutex<Option<(Instant, Sample)>>>, stop: Arc<AtomicBool>, pointer_target: Arc<Mutex<Option<(isize, Calibration, Instant)>>>) {
+    pub fn run(state: Arc<Mutex<Option<(Instant, Sample)>>>, stop: Arc<AtomicBool>, pointer_target: Arc<Mutex<Option<(isize, Calibration, Instant)>>>, idle: Arc<AtomicBool>) {
+        let mut activity = IdleActivity::new(Instant::now());
         while !stop.load(Ordering::Relaxed) {
+            if idle.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(100));
+                activity = IdleActivity::new(Instant::now());
+                continue;
+            }
+            if activity.expired(Instant::now()) {
+                idle.store(true, Ordering::Relaxed);
+                if let Ok(mut state) = state.lock() { *state = None; }
+                continue;
+            }
             if let Some(device) = discover() {
                 let mut last_report = Instant::now();
                 while !stop.load(Ordering::Relaxed) && last_report.elapsed() < Duration::from_secs(2) {
+                    if activity.expired(Instant::now()) {
+                        // Drop disables IR/reporting and closes both handles.
+                        // Stay latched until the user opens Controller Settings.
+                        idle.store(true, Ordering::Relaxed);
+                        break;
+                    }
                     match device.read() {
                         Ok(Some(sample)) => {
                             last_report = Instant::now();
+                            activity.observe(sample, last_report);
                             move_pointer(sample, &pointer_target);
                             if let Ok(mut state) = state.lock() { *state = Some((last_report, sample)); }
                         }
@@ -339,6 +425,65 @@ mod native {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stationary_reports_and_ir_jitter_do_not_prevent_five_minute_idle() {
+        let start=Instant::now();let mut idle=IdleActivity::new(start);
+        idle.observe(Sample {buttons:0,aim:Some((500.,300.))},start);
+        for seconds in 1..=300 {
+            let aim=if seconds%3==0 {None} else {Some((500.+(seconds%4) as f64,300.))};
+            idle.observe(Sample {buttons:0,aim},start+Duration::from_secs(seconds));
+        }
+        assert!(!idle.expired(start+Duration::from_secs(299)));
+        assert!(idle.expired(start+Duration::from_secs(300)));
+    }
+    #[test]
+    fn real_aim_motion_button_edges_and_held_directions_keep_remote_active() {
+        let start=Instant::now();let mut idle=IdleActivity::new(start);
+        idle.observe(Sample {buttons:0,aim:Some((500.,300.))},start);
+        idle.observe(Sample {buttons:0,aim:Some((510.,300.))},start+Duration::from_secs(299));
+        assert!(!idle.expired(start+Duration::from_secs(300)));
+        for seconds in 300..=900 {
+            idle.observe(Sample {buttons:LEFT,aim:None},start+Duration::from_secs(seconds));
+            assert!(!idle.expired(start+Duration::from_secs(seconds)));
+        }
+        idle.observe(Sample {buttons:0,aim:None},start+Duration::from_secs(901));
+        assert!(!idle.expired(start+Duration::from_secs(1200)));
+        assert!(idle.expired(start+Duration::from_secs(1201)));
+    }
+    #[test]
+    fn trigger_swap_is_limited_to_thunder_and_chaos_peacekeeper_pointing() {
+        for title in ["Thunder in Paradise (USA)","Thunder in Paradise Interactive (Europe)","Caraibes Offshore (France)","Chaos Control (Europe)","Chaos Control (USA)"] {
+            assert_eq!(pointing_buttons(title,true,false,true),1);
+            assert_eq!(pointing_buttons(title,true,true,false),2);
+            assert_eq!(pointing_buttons(title,true,true,true),3);
+            assert_eq!(pointing_buttons(title,true,false,false),0);
+            assert_eq!(pointing_buttons(title,false,true,false),1);
+            assert_eq!(pointing_buttons(title,false,false,true),2);
+        }
+        for title in ["Mad Dog McCree","Mad Dog II - The Lost Gold","Crime Patrol","Drug Wars - Crime Patrol II","Who Shot Johnny Rock?","The Last Bounty Hunter","Burn-Cycle","CD Shoot"] {
+            assert_eq!(pointing_buttons(title,true,true,false),1,"{title}");
+            assert_eq!(pointing_buttons(title,true,false,true),2,"{title}");
+        }
+    }
+
+    #[test]
+    fn crosshair_is_hollow_and_clips_to_picture() {
+        let bg=0x123456; let mut pixels=vec![bg;100*80];
+        draw_crosshair(&mut pixels,100,80,(20,10,60,50),20.0,10.0);
+        assert_eq!(pixels[10*100+20],bg,"keep the exact target visible");
+        assert!(pixels.iter().any(|p|*p==0x00EFFFFF));
+        for y in 0..80 { for x in 0..100 {
+            if !(20..80).contains(&x) || !(10..60).contains(&y) {
+                assert_eq!(pixels[y*100+x],bg,"crosshair escaped game viewport");
+            }
+        }}
+        let before=pixels.clone();
+        for (x,y) in [(19.0,10.0),(80.0,10.0),(20.0,60.0),(f64::NAN,20.0)] {
+            draw_crosshair(&mut pixels,100,80,(20,10,60,50),x,y);
+        }
+        assert_eq!(pixels,before,"invalid/off-screen aim must not draw a clamped target");
+    }
+
     #[test]
     fn chaos_correction_is_limited_to_the_shooting_reticle() {
         let shooting = 0x00b8000a;

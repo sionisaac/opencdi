@@ -109,6 +109,11 @@ impl Os9Trace {
             self.seq, self.frame, self.line, trap, code, cpu.ppc, module, sup as u8
         );
         push_regs(&mut line, cpu, true);
+        if let Some(system)=bus.peek_long(0)
+            && let Some(process)=bus.peek_long(system.wrapping_add(0x4c))
+            && let Some(pid)=bus.peek_word(process) {
+            let _=write!(line," pid={pid}");
+        }
         if trap == 0 && NAME_CALLS.contains(&code) {
             let _ = write!(line, " str=\"{}\"", read_text(bus, cpu.a(0), 64));
         }
